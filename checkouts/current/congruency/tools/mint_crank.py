@@ -10,12 +10,14 @@ the fixes/*.py "ratchet link" discipline into one operation.
     python3 checkouts/current/congruency/tools/mint_crank.py --patch /path/to/turn_xyz.py [--name xyz] [-m MSG]
     # capture mode — mint a docs/config crank from the CURRENT working tree (no patch to run):
     python3 checkouts/current/congruency/tools/mint_crank.py --no-patch --keep-state [--no-verify] -m MSG
+    # db-less crank — no database touched at all (make_state skipped; no database.tar.xz):
+    python3 checkouts/current/congruency/tools/mint_crank.py --no-patch --no-state [--no-verify] -m MSG
 
 Steps (each records a BUG EVENT on ANY unexpected outcome — exception OR expected!=actual —
 then fail-fast):
     precondition  on `main`; tracked-clean (patch mode) OR a non-empty working tree (--no-patch)
     inject/run    patch mode only: copy the python patch -> fixes/<name>.py (must compile), run it (exit 0)
-    state         make_state.py -> in-tree database.tar.xz  (skipped by --keep-state when state is unchanged)
+    state         make_state.py -> in-tree database.tar.xz  (skipped by --keep-state; --no-state omits state entirely)
     shadow gate   run install.json `shadows` (pure-python; the Mac-native regression gate)  (0 failed)
     capture       add -A + commit + version-4.0xx tag on `main` (installer + source + db + install.json in the commit);
                   install.json is re-emitted with the durable fields (preserve_db/migrate/shadows) CARRIED FORWARD
@@ -333,7 +335,10 @@ def main():
     ap.add_argument("--name", default=None, help="injected filename under fixes/ (default: patch basename)")
     ap.add_argument("--keep-state", action="store_true",
                     help="keep the existing in-tree database.tar.xz (skip make_state — for changes that don't touch state, "
-                         "and on hosts without the state source_db / php)")
+                         "and on hosts without the state source_db / php). Tolerant: proceeds even if none is present.")
+    ap.add_argument("--no-state", action="store_true",
+                    help="crank WITHOUT a database: skip state entirely — no make_state, no database.tar.xz produced OR "
+                         "required. A crank is code + config; state is not a git blob.")
     ap.add_argument("--no-verify", action="store_true", help="skip the PHP verify suite (the shadow gate still runs)")
     ap.add_argument("-m", "--message", default=None, help="commit/release message")
     a = ap.parse_args()
@@ -377,8 +382,13 @@ def main():
     if patch_mode:
         dest = do("inject", lambda: step_inject(a.patch, name))
         do("run patch", lambda: step_run(dest))
-    if a.keep_state:
-        print("\n== state (in-tree db) ==\n   keep-state: reusing existing checkouts/current/state/database.tar.xz")
+    if a.no_state:
+        print("\n== state ==\n   no-state: cranking WITHOUT a database (make_state skipped; no database.tar.xz)")
+    elif a.keep_state:
+        art = os.path.join(ROOT, "checkouts", "current", "state", "database.tar.xz")
+        print("\n== state (in-tree db) ==\n   keep-state: %s"
+              % ("reusing existing database.tar.xz" if os.path.isfile(art)
+                 else "no database.tar.xz present — proceeding without one"))
     else:
         do("state (in-tree db)", step_state)                # produce db BEFORE capture...
     do("shadow gate", step_shadows)                         # Mac-native regression gate before landing
@@ -387,7 +397,7 @@ def main():
 
     if T:
         T.emit("mint", status="ok", branch=current, version=cap.get("version"))
-    print("\n== crank minted on %s: %s (commit + tag in place; state + verify green) ==" % (current, cap.get("tag")))
+    print("\n== crank minted on %s: %s (commit + tag in place; shadow gate green) ==" % (current, cap.get("tag")))
     return 0
 
 
