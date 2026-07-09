@@ -162,6 +162,16 @@ def _provision_from_download(dl, dest):
     return "downloaded (%s) from %s" % (how, dl["url"])
 
 
+def _php_ok(path):
+    """True iff `path` is a php that RUNS on this host. Catches OSError (Errno 8 Exec format error)
+    so a wrong-arch leftover — e.g. a linux php left by the old amd64 container on an arm Mac — is
+    treated as unusable and REPLACED with the native build, not raised as a crash."""
+    try:
+        return subprocess.run([path, "-v"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
 def main():
     reg = load_registry()
     root = reg["__root__"]
@@ -170,8 +180,9 @@ def main():
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
     # idempotent (bug #4): a WORKING php already at dest -> skip re-acquisition (the
-    # network-fetch fallback below still runs on a genuinely fresh clone).
-    if os.path.isfile(dest) and subprocess.run([dest, "-v"], capture_output=True).returncode == 0:
+    # network-fetch fallback below still runs on a genuinely fresh clone, or when the existing
+    # binary is the wrong arch — a linux php on an arm Mac -> _php_ok False -> re-provision native).
+    if os.path.isfile(dest) and _php_ok(dest):
         how = "already provisioned (%s)" % os.path.relpath(dest, mono)
     else:
         cfg = reg.get("php_provision", {}) or {}
