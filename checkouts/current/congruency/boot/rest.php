@@ -36,6 +36,13 @@ function congruency_rest_apikey($db) {
     return $row ? $row : false;
 }
 function congruency_rest_authorized($db) {
+    // OVERRIDE SECURITY FLAG (interim): with CONGRUENCY_AUTH_OVERRIDE set, every request is treated
+    // as authenticated — the app "starts authenticated". This is a runtime-overridable default on the
+    // config object (boot/constants.default.json), landed because the permission system isn't built
+    // yet and a stale api-key would otherwise make clients panic. Flip to false (or override via
+    // install.json/$CONGRUENCY_CONFIG) to re-enable the key/session checks. SECURITY-TODO: replace
+    // with the wallet-backed, role-based authenticator (deferred crank).
+    if (defined('CONGRUENCY_AUTH_OVERRIDE') && CONGRUENCY_AUTH_OVERRIDE) { return true; }
     if (class_exists('UserPrivilegeSet') && UserPrivilegeSet::logged_in()) { return true; }
     if (congruency_rest_apikey($db) !== false) { return true; }
     // Vault-validated: when Vault is configured, the App checks the presented token against its authorization

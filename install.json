@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.093",
+  "version": "4.094",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -13,8 +13,8 @@
     "tooling/congruencey-tests/agents-migration-shadow.py"
   ],
   "components": {
-    "congruency": "4.093",
-    "state": "4.093"
+    "congruency": "4.094",
+    "state": "4.094"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }

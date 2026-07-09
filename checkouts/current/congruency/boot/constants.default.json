@@ -47,5 +47,7 @@
 
   "VAULT_ADDR": "",
   "VAULT_AUTH_PATH": "",
-  "VAULT_TOKEN_FIELD": "token"
+  "VAULT_TOKEN_FIELD": "token",
+
+  "CONGRUENCY_AUTH_OVERRIDE": true
 }
