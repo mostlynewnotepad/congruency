@@ -2,7 +2,57 @@
 
 Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
+> Repo home moved to `origin` = `gitlab.com:testmonkeyalpha-group/jazz-forge/congruency`
+> (`upstream` = `github.com:dudezilla/rebase`) as of 4.089.
+
 ---
+
+## version-4.091 — docs + self-hosting crank tool (Mac-native, lockstep)
+
+Docs updated for 4.089/4.090 (README install steps + minting section; this file). Adapted the
+in-base crank tool `checkouts/current/congruency/tools/mint_crank.py` so it mints natively here
+and can never regress the config object:
+
+- **lockstep + carry-forward** — `write_install_config` now emits `preserve_db`/`migrate`/`shadows`
+  and CARRIES THEM FORWARD from the existing `install.json` (fixes a latent bug: it previously
+  emitted a fixed subset and would drop those fields on the next mint).
+- **capture mode** — `--no-patch` mints from the current working tree (docs/config cranks that
+  aren't a runnable patch); `--keep-state` reuses the in-tree `database.tar.xz` (no `make_state`,
+  which needs the `source_db`/php absent on macOS).
+- **Mac-native shadow gate** — mint runs the pure-python `shadows` from `install.json` before
+  capture; the PHP `verify` suite auto-skips when php isn't provisioned (or `--no-verify`), so a
+  crank is still gated where the linux php can't exec.
+
+This crank was itself minted with the adapted tool (`--no-patch --keep-state --no-verify`).
+
+## version-4.090 — agent provenance (agents registry + register/trail/roster routes)
+
+Follow the rabbit trail from an agent's prompt to every action it took. Tool/intent events already
+land in `memories` keyed on `session` (= agent id); this adds the missing registry + REST surface.
+
+- `migrations/0001_agents.sql`: `agents(agent_id,parent,prompt,tools,status,ts)` + three
+  `api_routes` rows — `agent.register` [POST/token], `agent.trail` [GET/public]
+  (`SELECT … memories WHERE session=:agent_id`), `agent.roster` [GET/public].
+- `setup.py:do_migrate` — forward-only, ADDITIVE migration runner (CREATE IF NOT EXISTS /
+  INSERT OR REPLACE), tracked in `schema_migrations`, run on every install after `do_state`. So the
+  live db is upgraded in place and a fresh seed tarball need not carry the newest schema.
+- Shadow `tooling/congruencey-tests/agents-migration-shadow.py` (8/8): migration is additive
+  (pre-existing rows survive), routes land, the real route SQL registers + trails an agent,
+  re-running is a no-op. The gate (agent_tools_suite) forwards `{session,tool,intent}` here.
+
+## version-4.089 — DB-remembering install (do_state preserves the live db)
+
+`do_state` used to unconditionally extract the seed `database.tar.xz` over
+`state/congruency.sqlite` — a `setup.py install` against a tree whose state dir is (or is
+bind-mounted from) the live db would erase every ticket/memory/api_key.
+
+- `do_state(version, preserve_db)`: if a live `congruency.sqlite` is already present, verify + keep
+  it instead of re-extracting the seed (mirrors `serve.py:ensure_db`). `preserve_db` defaults on in
+  the config object + `resolve_config`, so the installer remembers our db even for pre-4.089 tags.
+- Dropped `state/congruency.sqlite` from `RUNTIME_PATHS` so `uninstall` can't purge it.
+- **Shadow gate** added to the ratchet: `install.json` names `shadows` run before state install
+  (non-zero aborts). `tooling/congruencey-tests/db-preserve-shadow.py` (6/6) pins that `preserve_db`
+  keeps the db, that off still wipes (guard is load-bearing), that fresh installs still seed.
 
 ## version-4.080 — `congruency/` layout repath + db installed in-crank
 

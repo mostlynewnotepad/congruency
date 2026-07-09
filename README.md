@@ -4,7 +4,12 @@ Steven Peterson's 2006 PHP CMS ("congruency"), resurrected on PHP 8 and folded i
 ratchet-managed package. **One branch, `main`**, carries everything: the installer
 (`setup.py`) at the root **and** the CMS source + tooling under `checkouts/current/`. A crank is
 a **commit + `version-*` tag**, not a branch. Each crank is one self-contained tree — installer +
-source + database + configuration object — so there is no separate `state` branch.
+source + database + configuration object — so there is no separate `state` branch. **The crank
+state and the crank tool both live in the base**: the database rides in each version commit as
+`database.tar.xz`, and the minter is `checkouts/current/congruency/tools/mint_crank.py` (below).
+
+> Home: `origin` = `git@gitlab.com:testmonkeyalpha-group/jazz-forge/congruency.git`
+> (`upstream` = the original `github.com:dudezilla/rebase`).
 
 Layout under `checkouts/current/`:
 
@@ -28,8 +33,16 @@ config-object-driven (an orchestrator drives the lifecycle via that one object).
 records telemetry and files a Variant-A bug report on any unexpected outcome:
 1. **checkout** the tag `version-X` (detached — materializes the crank);
 2. **provision php** — `checkouts/current/congruency/tools/provision_php.py` (static PHP 8; idempotent);
-3. **install state** — extract the `database.tar.xz` that rides in the version commit → `checkouts/current/state/congruency.sqlite`;
-4. **verify** — `tooling/congruencey-tests/verify` (stand-up + bug-catalog + branch-coverage).
+3. **shadow gate** — run the `shadows` named in `install.json` (pure-python regression suites; a non-zero exit aborts the install);
+4. **install state** — extract the `database.tar.xz` that rides in the version commit → `checkouts/current/state/congruency.sqlite`. **The install REMEMBERS an existing db**: when `preserve_db` is set (default) and a live `congruency.sqlite` is already present, the seed tarball is NOT extracted over it (so `install` is as non-destructive as `up`); a fresh install still seeds. State is never listed for `uninstall` purge;
+5. **migrate** — apply forward-only, additive SQL from `migrations/*.sql` to the state db (idempotent, tracked in `schema_migrations`); runs on every install, so the live db is upgraded in place and a fresh seed need not carry the newest schema;
+6. **verify** — `tooling/congruencey-tests/verify` (stand-up + bug-catalog + branch-coverage).
+
+The DB-remembering install (`preserve_db`), the migration runner (`migrate`), and the shadow gate
+(`shadows`) are all fields on the `install.json` configuration object. **Agent provenance** rides
+in the migrations: an `agents` registry plus data-driven routes `agent.register` (POST, record a
+spawn's prompt + tools), `agent.trail` (GET, replay every tool+intent an agent id recorded), and
+`agent.roster` (GET) — so you can follow the rabbit trail from a prompt to the actions it caused.
 
 Overrides (the configuration object always wins by default):
 ```
@@ -52,15 +65,30 @@ It's **config-object-driven**: the port comes from `install.json`, not the Docke
 `database.tar.xz` must be in the build context (`.dockerignore` keeps only runtime artifacts out).
 
 ## How work happens (minting a crank)
+The crank tool lives in the base — `checkouts/current/congruency/tools/mint_crank.py` — and mints
+in two modes:
 ```
+# patch mode: one Python patch IS the change (precondition: on main, tracked-clean, php provisioned)
 python3 checkouts/current/congruency/tools/mint_crank.py --patch P.py --name x
+
+# capture mode: mint a docs/config crank from the CURRENT working tree (no patch to run)
+python3 checkouts/current/congruency/tools/mint_crank.py --no-patch --keep-state [--no-verify] -m "…"
 ```
-Each crank is one Python patch, captured **in place** (commit + `version-*` tag), **test-first**
-(predictions → `logs/predictions.jsonl`; a refuted prediction is a bug). Before the commit, mint
-produces the crank's state and its `install.json`, so the version commit carries **both** the
-`database.tar.xz` and the install config. `make_state.py` snapshots the unified database named by
-`checkouts/current/state/STATE.json` `source_db`, falling back to the currently-installed db (never
-re-fabricating a stub); the tarball is written in-tree and folded into the version commit.
+Each crank is captured **in place** (commit + `version-*` tag). Before the commit, mint produces
+the crank's state and re-emits its `install.json`, so the version commit carries **both** the
+`database.tar.xz` and the install config. Mint steps: precondition → (inject+run patch, patch mode)
+→ state → **shadow gate** → capture → verify.
+
+- **`--keep-state`** reuses the existing in-tree `database.tar.xz` (skip `make_state` — for changes
+  that don't touch state, and on hosts without the `source_db`/php `make_state` needs). Otherwise
+  `make_state.py` snapshots the unified database named by `STATE.json` `source_db`, falling back to
+  the installed db (never re-fabricating a stub).
+- **Shadow gate** runs the pure-python `shadows` from `install.json` — the Mac-native regression
+  gate, so a crank is gated even where the full PHP `verify` suite can't run. `--no-verify` (or an
+  unprovisioned php) skips only the PHP suite, never the shadow gate.
+- **install.json is carried forward**: mint re-stamps the version but preserves the durable fields
+  (`preserve_db`, `migrate`, `shadows`) from the previous config object — the object is the source
+  of truth, so a mint can't silently regress them.
 
 ## Telemetry & bugs
 Every step emits to `jazz_telemetry` when available; any unexpected outcome writes a Variant-A bug

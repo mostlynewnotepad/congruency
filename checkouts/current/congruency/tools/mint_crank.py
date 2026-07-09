@@ -6,19 +6,22 @@ A crank stroke = INJECT one author-supplied Python patch on the single `main` br
 defines the next version. No branch-per-crank: a crank is a commit + tag IN PLACE. This formalises
 the fixes/*.py "ratchet link" discipline into one operation.
 
-    # precondition: on the `main` branch, tracked-clean, php provisioned
+    # patch mode (precondition: on `main`, tracked-clean, php provisioned):
     python3 checkouts/current/congruency/tools/mint_crank.py --patch /path/to/turn_xyz.py [--name xyz] [-m MSG]
+    # capture mode — mint a docs/config crank from the CURRENT working tree (no patch to run):
+    python3 checkouts/current/congruency/tools/mint_crank.py --no-patch --keep-state [--no-verify] -m MSG
 
 Steps (each records a BUG EVENT on ANY unexpected outcome — exception OR expected!=actual —
 then fail-fast):
-    precondition  on `main`, tracked-clean (no fork)
-    inject        copy the python patch -> checkouts/current/congruency/fixes/<name>.py  (must compile)
-    run           python3 <injected>                                          (exit 0)
-    state         make_state.py -> in-tree checkouts/current/state/database.tar.xz (rides in the crank)
-    capture       add -A + commit + version-4.0xx tag on `main` (installer + source + db + install.json in the commit)
-    verify        tooling/congruencey-tests/verify                            (0 failed)
+    precondition  on `main`; tracked-clean (patch mode) OR a non-empty working tree (--no-patch)
+    inject/run    patch mode only: copy the python patch -> fixes/<name>.py (must compile), run it (exit 0)
+    state         make_state.py -> in-tree database.tar.xz  (skipped by --keep-state when state is unchanged)
+    shadow gate   run install.json `shadows` (pure-python; the Mac-native regression gate)  (0 failed)
+    capture       add -A + commit + version-4.0xx tag on `main` (installer + source + db + install.json in the commit);
+                  install.json is re-emitted with the durable fields (preserve_db/migrate/shadows) CARRIED FORWARD
+    verify        tooling/congruencey-tests/verify  (0 failed) — auto-skips when php isn't provisioned / --no-verify
 
-Push is a SEPARATE release step (ticket #6) — the mint stays local. python only, registry-gated.
+Push is a SEPARATE release step — the mint stays local. python only, registry-gated.
 """
 import argparse
 import os
@@ -120,12 +123,17 @@ def run_py(path, *args, timeout=300):
 # --------------------------------------------------------------------------- #
 # steps                                                                       #
 # --------------------------------------------------------------------------- #
-def step_precondition(current):
+def step_precondition(current, require_clean=True):
     # A crank is a commit + tag IN PLACE on the single `main` branch (no fork, no side branch).
     if current != "main":
         raise Unexpected("mint must run on the `main` branch, not %r" % current)
-    if [l for l in git("status", "--porcelain").stdout.splitlines() if not l.startswith("??")]:
+    dirty = [l for l in git("status", "--porcelain").stdout.splitlines() if not l.startswith("??")]
+    if require_clean and dirty:
+        # patch mode: the injected patch IS the change, so the tree must start clean.
         raise Unexpected("tree has uncommitted tracked changes; refusing to mint")
+    if not require_clean and not git("status", "--porcelain").stdout.strip():
+        # --no-patch capture mode: the change is already in the working tree (docs/config crank).
+        raise Unexpected("--no-patch capture: nothing changed in the working tree to capture")
     return current
 
 
@@ -151,14 +159,30 @@ def step_run(dest):
     return {"stdout_tail": (r.stdout or "").strip().splitlines()[-3:]}
 
 
+DEFAULT_SHADOWS = ["tooling/congruencey-tests/db-preserve-shadow.py",
+                   "tooling/congruencey-tests/agents-migration-shadow.py"]
+
+
 def write_install_config(root, version, no_verify=False, return_to_main=False, host="0.0.0.0", port=8899, hash_track=True):
     """Emit the version's configuration object (install.json) at the repo root so it is committed
     INTO the version tag.
 
     Instrumentation counterpart to setup.py: extracts the version stamp + lifecycle params ahead
     of time so `python3 setup.py` needs no hand-typed args. Kept in lockstep with setup.py's
-    canonical_config() — same schema."""
+    canonical_config() — same schema.
+
+    The durable install fields (preserve_db, migrate, shadows) are CARRIED FORWARD from the
+    existing root install.json, so a mint never silently drops what the last crank declared — the
+    config object is the source of truth, mint only re-stamps the version. (Bug: this used to emit
+    a fixed subset and would regress preserve_db/migrate/shadows on the next mint.)"""
     import json
+    prev = {}
+    prevp = os.path.join(root, "install.json")
+    if os.path.isfile(prevp):
+        try:
+            prev = json.load(open(prevp))
+        except Exception:  # noqa: BLE001
+            prev = {}
     cfg = {
         "component": "ratchet",
         "version": version,
@@ -167,6 +191,9 @@ def write_install_config(root, version, no_verify=False, return_to_main=False, h
         "host": host,
         "port": int(port),
         "hash_track": bool(hash_track),
+        "preserve_db": bool(prev.get("preserve_db", True)),      # the installer remembers our db
+        "migrate": bool(prev.get("migrate", True)),              # apply forward-only additive migrations
+        "shadows": list(prev.get("shadows", DEFAULT_SHADOWS)),   # install-gating regression suites
         "components": {name: version for name, _ in COMPONENTS},
         "generated_by": "mint_crank.py (instrumentation)",
     }
@@ -250,7 +277,42 @@ def step_state():
     return {"artifact": "checkouts/current/state/database.tar.xz", "bytes": os.path.getsize(artifact)}
 
 
-def step_verify():
+def step_shadows():
+    """Mac-native gate: run the pure-python shadow suites named by install.json. They exercise
+    setup.py's DB-preserving install + the agent migration WITHOUT needing PHP, so the mint is
+    gated even on a host where the full PHP verify suite can't run. A non-zero exit aborts the
+    mint (a broken crank never lands)."""
+    import json
+    cfgp = os.path.join(ROOT, "install.json")
+    shadows = []
+    if os.path.isfile(cfgp):
+        try:
+            shadows = json.load(open(cfgp)).get("shadows", [])
+        except Exception:  # noqa: BLE001
+            shadows = []
+    ran = []
+    for rel in shadows:
+        path = os.path.join(ROOT, rel)
+        if not os.path.isfile(path):
+            raise Unexpected("shadow suite not found: %s" % rel)
+        r = subprocess.run([sys.executable, path], cwd=ROOT, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0:
+            raise Unexpected("shadow FAILED (%s): %s" % (rel, (r.stdout + r.stderr).strip()[-400:]))
+        ran.append(rel)
+    return {"shadows": ran or ["(none declared)"]}
+
+
+def _php_provisioned():
+    return os.path.isfile(os.path.join(ROOT, "tooling", "congruencey-harness", "php", "php"))
+
+
+def step_verify(skip=False):
+    """The full PHP verify suite (stand-up + bug-catalog + branch-coverage). Auto-skips when PHP
+    isn't provisioned (e.g. natively on macOS arm64, where the linux php can't exec) — the shadow
+    gate is the native verification there. --no-verify forces the skip."""
+    if skip or not _php_provisioned():
+        reason = "forced (--no-verify)" if skip else "php not provisioned — shadow gate is the native gate"
+        return {"skipped": True, "reason": reason}
     r = subprocess.run([os.path.join(ROOT, "tooling", "congruencey-tests", "verify")],
                        cwd=ROOT, capture_output=True, text=True, timeout=300)
     m = re.search(r"(\d+)\s+suites passed,\s+(\d+)\s+failed", r.stdout)
@@ -263,15 +325,26 @@ def step_verify():
 # driver                                                                      #
 # --------------------------------------------------------------------------- #
 def main():
-    ap = argparse.ArgumentParser(description="mint a crank from one python patch")
-    ap.add_argument("--patch", required=True, help="path to the python patch script (the turn)")
+    ap = argparse.ArgumentParser(description="mint a crank: inject+run one python patch, OR (--no-patch) "
+                                             "capture the current working-tree change. Commit + version tag in place.")
+    ap.add_argument("--patch", default=None, help="path to the python patch script (the turn)")
+    ap.add_argument("--no-patch", action="store_true",
+                    help="capture the current working-tree change directly (docs/config crank — no patch to inject/run)")
     ap.add_argument("--name", default=None, help="injected filename under fixes/ (default: patch basename)")
+    ap.add_argument("--keep-state", action="store_true",
+                    help="keep the existing in-tree database.tar.xz (skip make_state — for changes that don't touch state, "
+                         "and on hosts without the state source_db / php)")
+    ap.add_argument("--no-verify", action="store_true", help="skip the PHP verify suite (the shadow gate still runs)")
     ap.add_argument("-m", "--message", default=None, help="commit/release message")
     a = ap.parse_args()
 
+    patch_mode = bool(a.patch) and not a.no_patch
+    if not patch_mode and not a.no_patch:
+        ap.error("give --patch <file> (patch mode) or --no-patch (capture the working tree)")
+
     reg = load_registry()
     T, open_ticket = telemetry_handles(reg)
-    name = a.name or os.path.splitext(os.path.basename(a.patch))[0]
+    name = a.name or (os.path.splitext(os.path.basename(a.patch))[0] if a.patch else "capture")
     message = a.message or ("crank: %s" % name)
     current = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
 
@@ -299,13 +372,18 @@ def main():
             print("   FAIL: %s\n   bug report -> %s" % (exc, p), file=sys.stderr)
             raise
 
-    print("mint crank: on %s, patch=%s" % (current, a.patch))
-    do("precondition", lambda: step_precondition(current))
-    dest = do("inject", lambda: step_inject(a.patch, name))
-    do("run patch", lambda: step_run(dest))
-    do("state (in-tree db)", step_state)                    # produce db BEFORE capture...
+    print("mint crank: on %s, %s" % (current, ("patch=%s" % a.patch) if patch_mode else "capture working tree (--no-patch)"))
+    do("precondition", lambda: step_precondition(current, require_clean=patch_mode))
+    if patch_mode:
+        dest = do("inject", lambda: step_inject(a.patch, name))
+        do("run patch", lambda: step_run(dest))
+    if a.keep_state:
+        print("\n== state (in-tree db) ==\n   keep-state: reusing existing checkouts/current/state/database.tar.xz")
+    else:
+        do("state (in-tree db)", step_state)                # produce db BEFORE capture...
+    do("shadow gate", step_shadows)                         # Mac-native regression gate before landing
     cap = do("capture (commit + tag)", lambda: step_capture(message))   # ...so it rides in the version commit
-    do("verify", lambda: step_verify())
+    do("verify", lambda: step_verify(skip=a.no_verify))
 
     if T:
         T.emit("mint", status="ok", branch=current, version=cap.get("version"))
