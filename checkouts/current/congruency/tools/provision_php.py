@@ -6,8 +6,11 @@ php binary into <mono>/<paths.php> (default tooling/congruencey-harness/php/php)
 available source, in order:
 
   1. a local source path listed in registry php_provision.sources (or the legacy defaults);
-  2. otherwise a NETWORK FETCH of a static php-cli build (php_provision.download.url),
-     extracted in-python — no shell script.
+  2. otherwise a NETWORK FETCH of a static php-cli build, extracted in-python — no shell script.
+     The build is chosen for THIS host's os+arch (see platform_download): macOS arm64 gets a
+     native arm64 php, so congruency runs on Apple Silicon with NO x86 emulation. A registry
+     `php_provision.download.url` is honored only if it matches the host platform; otherwise it
+     is a version hint and the native build wins. `download.version` picks a build without a URL.
 
 The recipe is committed; the binary is git-ignored. It verifies the result with `php -v`.
 
@@ -16,6 +19,8 @@ exception.
 """
 import json
 import os
+import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -32,11 +37,40 @@ DEFAULT_SOURCES = [
     "/home/notificationsforsteven/congruencey-harness/php/php",
     "/home/notificationsforsteven/b01/tooling/congruencey-harness/php/php",
 ]
-DEFAULT_DOWNLOAD = {
-    "url": "https://dl.static-php.dev/static-php-cli/common/php-8.4.23-cli-linux-x86_64.tar.gz",
-    "member": "php",
-}
-UA = "Mozilla/5.0 (X11; Linux x86_64) provision_php"
+PHP_VERSION = "8.4.23"     # static-php-cli build to fetch when none is provisioned/pinned
+STATIC_PHP = "https://dl.static-php.dev/static-php-cli/common/php-%s-cli-%s-%s.tar.gz"
+UA = "Mozilla/5.0 provision_php"
+
+
+def _platform_slug():
+    """(os, arch) slugs for the static-php-cli asset naming — the NATIVE build for THIS host, so
+    macOS arm64 gets a real arm64 php (no x86 emulation), linux gets linux, an Intel Mac gets
+    macos-x86_64, etc."""
+    sysname = {"darwin": "macos", "linux": "linux"}.get(platform.system().lower(), "linux")
+    m = platform.machine().lower()
+    arch = "aarch64" if m in ("arm64", "aarch64") else "x86_64"
+    return sysname, arch
+
+
+def _version_from_url(url):
+    m = re.search(r"php-([0-9]+\.[0-9]+\.[0-9]+)-cli", url or "")
+    return m.group(1) if m else None
+
+
+def platform_download(cfg):
+    """Resolve the static-php download for THIS os+arch. A registry `download.url` is honored only
+    when it already matches the host platform; otherwise (e.g. a linux url on macOS) it is treated
+    as a version hint and the native build is chosen instead — so a linux-pinned registry never
+    forces x86 emulation on an arm Mac. Set `download.version` to pick a build without a URL."""
+    dl = dict(cfg.get("download") or {})
+    member = dl.get("member", "php")
+    sysname, arch = _platform_slug()
+    slug = "%s-%s" % (sysname, arch)
+    pinned = dl.get("url")
+    if pinned and ("-%s." % slug) in pinned:
+        return {"url": pinned, "member": member, "platform": slug}
+    ver = dl.get("version") or _version_from_url(pinned) or PHP_VERSION
+    return {"url": STATIC_PHP % (ver, sysname, arch), "member": member, "platform": slug}
 
 
 def find_registry(start=HERE):
@@ -149,7 +183,7 @@ def main():
         elif src:
             how = "already in place (%s)" % src
         else:
-            how = _provision_from_download(cfg.get("download", DEFAULT_DOWNLOAD), dest)
+            how = _provision_from_download(platform_download(cfg), dest)
         os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     ver = subprocess.run([dest, "-v"], capture_output=True, text=True)

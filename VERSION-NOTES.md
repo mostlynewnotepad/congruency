@@ -7,6 +7,23 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.092 — native macOS arm64 (no x86 emulation): arch-aware php provisioner
+
+congruency previously required a `linux/amd64` container on Apple Silicon only because
+`provision_php.py` hardcoded a `linux-x86_64` static php (→ `Exec format error` native, hence the
+emulation). Now the provisioner is arch-aware:
+
+- `provision_php.platform_download()` maps the host's `platform.system()/machine()` to the
+  static-php-cli asset — macOS arm64 → `php-<v>-cli-macos-aarch64.tar.gz`, a native arm64 php with
+  `pdo_sqlite`. Linux/Intel-mac resolve to their own builds.
+- A registry `php_provision.download.url` is honored ONLY if it matches the host platform;
+  otherwise it's treated as a version hint and the native build is chosen — so a linux-pinned
+  registry never forces x86 emulation on an arm Mac. `download.version` picks a build url-free.
+- `registry.json` de-pinned (version-only).
+
+Verified: `setup.py up` serves the CMS + REST + `agent.*` routes from a Mach-O **arm64** `php`,
+no Rosetta/QEMU. The docker launcher stays as a convenience; native is now the arm-Mac default.
+
 ## version-4.091 — docs + self-hosting crank tool (Mac-native, lockstep)
 
 Docs updated for 4.089/4.090 (README install steps + minting section; this file). Adapted the

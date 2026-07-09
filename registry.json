@@ -8,9 +8,10 @@
   },
   "bug_reports": "logs/bug_reports.jsonl",
   "php_provision": {
+    "_comment": "No pinned url: provision_php.platform_download picks the static-php-cli build for THIS host's os+arch, so macOS arm64 runs a native arm64 php (no x86 emulation). Set download.url only to force a specific asset.",
     "sources": [],
     "download": {
-      "url": "https://dl.static-php.dev/static-php-cli/common/php-8.4.23-cli-linux-x86_64.tar.gz",
+      "version": "8.4.23",
       "member": "php"
     }
   }

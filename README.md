@@ -64,6 +64,20 @@ It's **config-object-driven**: the port comes from `install.json`, not the Docke
 (`docker run … python3 setup.py up --foreground --port 9000` to override). `.git` and the in-crank
 `database.tar.xz` must be in the build context (`.dockerignore` keeps only runtime artifacts out).
 
+## Native (Apple Silicon / no x86 emulation)
+congruency runs natively on macOS arm64 — the container is only a convenience, not a requirement.
+`provision_php.py` picks the static-php-cli build for the **host's** os+arch (macOS arm64 → a
+native arm64 php with `pdo_sqlite`), so there is no Rosetta/QEMU/amd64 emulation:
+```
+python3 checkouts/current/congruency/tools/provision_php.py   # fetches the native php for this host
+python3 setup.py up --port 8901                               # serves on :8901 via native php
+```
+The registry no longer pins a linux asset; a `php_provision.download.url` is honored only when it
+matches the host platform, otherwise it's treated as a version hint and the native build wins (so a
+linux-pinned registry never forces emulation on an arm Mac). Set `download.version` to choose a
+build. Verified end-to-end here: catalog page, REST/`?api=`, and the `agent.*` routes all serve
+from a Mach-O arm64 `php`.
+
 ## How work happens (minting a crank)
 The crank tool lives in the base — `checkouts/current/congruency/tools/mint_crank.py` — and mints
 in two modes:
