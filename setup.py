@@ -198,11 +198,12 @@ def committed_config(version):
 
 
 def canonical_config(version, no_verify=False, return_to_main=False, host="0.0.0.0", port=8899,
-                     hash_track=True, preserve_db=True, shadows=None):
+                     hash_track=True, preserve_db=True, migrate=True, shadows=None):
     """THE configuration object: version stamp + lifecycle params. Kept in lockstep with
     mint_crank.write_install_config — same schema so an orchestrator drives either path.
 
     preserve_db: the installer remembers an existing live db instead of wiping it (default on).
+    migrate: apply forward-only additive migrations to the state db after install (default on).
     shadows: install-gating regression suites (run before state install; non-zero aborts)."""
     return {
         "component": "ratchet",
@@ -213,7 +214,9 @@ def canonical_config(version, no_verify=False, return_to_main=False, host="0.0.0
         "port": int(port),
         "hash_track": bool(hash_track),
         "preserve_db": bool(preserve_db),
-        "shadows": list(shadows) if shadows else ["tooling/congruencey-tests/db-preserve-shadow.py"],
+        "migrate": bool(migrate),
+        "shadows": list(shadows) if shadows else ["tooling/congruencey-tests/db-preserve-shadow.py",
+                                                  "tooling/congruencey-tests/agents-migration-shadow.py"],
         "components": {c["name"]: version for c in COMPONENTS},   # per-component version index
         "generated_by": "setup.py emit-config",
     }
@@ -387,6 +390,42 @@ def do_state(version, preserve_db=False):
     return {"tables": _verify_tables(sqlite_path, expect), "preserved": False}
 
 
+def _migrations_dir():
+    return os.path.join(HERE, "migrations")
+
+
+def do_migrate(db_path=None):
+    """Apply pending, forward-only SQL migrations to the state db (idempotently). ADDITIVE ONLY
+    (CREATE IF NOT EXISTS / INSERT OR REPLACE) so it NEVER wipes data — safe on the preserved live
+    db and on a freshly seeded one alike. Because it runs on EVERY install, a fresh seed tarball
+    need not carry the newest schema; the migrations are the forward-only source of truth. Applied
+    files are recorded in schema_migrations so re-runs are no-ops."""
+    import sqlite3
+    mdir = _migrations_dir()
+    db = db_path or _state_sqlite()
+    if not os.path.isfile(db):
+        raise RuntimeError("no state db to migrate at %s (install state first)" % db)
+    files = sorted(f for f in os.listdir(mdir) if f.endswith(".sql")) if os.path.isdir(mdir) else []
+    con = sqlite3.connect(db)
+    applied = []
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, ts INTEGER)")
+        done = {r[0] for r in con.execute("SELECT name FROM schema_migrations")}
+        for f in files:
+            if f in done:
+                continue
+            with open(os.path.join(mdir, f)) as fh:
+                con.executescript(fh.read())
+            con.execute("INSERT OR REPLACE INTO schema_migrations (name, ts) VALUES (?, ?)", (f, int(time.time())))
+            con.commit()
+            applied.append(f)
+    finally:
+        con.close()
+    if applied:
+        print("   migrate: applied %s" % ", ".join(applied))
+    return {"applied": applied, "total": len(files)}
+
+
 def do_verify():
     return run([os.path.join(HERE, "tooling", "congruencey-tests", "verify")], "verify")
 
@@ -540,6 +579,8 @@ def do_install(cfg, srcname):
     if cfg.get("shadows"):
         step("shadow gate", lambda: do_shadows(cfg))
     step("install state", lambda: do_state(version, preserve_db=cfg.get("preserve_db", True)))
+    if cfg.get("migrate", True):
+        step("migrate", do_migrate)
     if not cfg.get("no_verify"):
         step("verify", do_verify)
     if cfg.get("return_to_main"):

@@ -1,18 +1,20 @@
 {
   "component": "ratchet",
-  "version": "4.089",
+  "version": "4.090",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
   "port": 8899,
   "hash_track": true,
   "preserve_db": true,
+  "migrate": true,
   "shadows": [
-    "tooling/congruencey-tests/db-preserve-shadow.py"
+    "tooling/congruencey-tests/db-preserve-shadow.py",
+    "tooling/congruencey-tests/agents-migration-shadow.py"
   ],
   "components": {
-    "congruency": "4.089",
-    "state": "4.089"
+    "congruency": "4.090",
+    "state": "4.090"
   },
   "generated_by": "setup.py emit-config"
 }
