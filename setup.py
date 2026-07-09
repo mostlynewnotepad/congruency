@@ -45,10 +45,11 @@ COMPONENTS = [
 ]
 SERVE = os.path.join("checkouts", "current", "congruency", "tools", "serve.py")
 PIDFILE = os.path.join("logs", "serve.pid")
-# runtime artifacts materialized during install/up (all gitignored) — purged on uninstall:
+# runtime artifacts materialized during install/up (all gitignored) — purged on uninstall.
+# NOTE: checkouts/current/state/congruency.sqlite is DELIBERATELY NOT here — the live db is
+# remembered, never purged (see do_state's preserve_db guard). Uninstall must never wipe state.
 RUNTIME_PATHS = [
     "tooling/congruencey-harness/php",
-    "checkouts/current/state/congruency.sqlite",
     "checkouts/current/congruency/fixes/index.json",
     "logs/hashes.json",                                # the hash-track sidecar (stale after purge)
 ]
@@ -196,9 +197,13 @@ def committed_config(version):
         return None
 
 
-def canonical_config(version, no_verify=False, return_to_main=False, host="0.0.0.0", port=8899, hash_track=True):
+def canonical_config(version, no_verify=False, return_to_main=False, host="0.0.0.0", port=8899,
+                     hash_track=True, preserve_db=True, shadows=None):
     """THE configuration object: version stamp + lifecycle params. Kept in lockstep with
-    mint_crank.write_install_config — same schema so an orchestrator drives either path."""
+    mint_crank.write_install_config — same schema so an orchestrator drives either path.
+
+    preserve_db: the installer remembers an existing live db instead of wiping it (default on).
+    shadows: install-gating regression suites (run before state install; non-zero aborts)."""
     return {
         "component": "ratchet",
         "version": version,
@@ -207,6 +212,8 @@ def canonical_config(version, no_verify=False, return_to_main=False, host="0.0.0
         "host": host,
         "port": int(port),
         "hash_track": bool(hash_track),
+        "preserve_db": bool(preserve_db),
+        "shadows": list(shadows) if shadows else ["tooling/congruencey-tests/db-preserve-shadow.py"],
         "components": {c["name"]: version for c in COMPONENTS},   # per-component version index
         "generated_by": "setup.py emit-config",
     }
@@ -256,6 +263,7 @@ def resolve_config(a):
     cfg.setdefault("return_to_main", False)
     cfg.setdefault("host", "0.0.0.0")
     cfg.setdefault("port", 8899)
+    cfg.setdefault("preserve_db", True)   # the installer remembers our db even for pre-4.089 tags
     if not cfg.get("version"):
         raise RuntimeError("configuration object has no 'version' and none could be resolved")
     return cfg, srcname
@@ -341,18 +349,10 @@ def _state_spec():
     return json.load(open(p)) if os.path.isfile(p) else {}
 
 
-def do_state(version):
-    """Materialize state from the db that RIDES IN the version commit (no state branch): the
-    checkout put checkouts/current/state/database.tar.xz in the tree; extract it (gitignored)."""
-    expect = set(_state_spec().get("expect_tables", []))
-    state_dir = os.path.join(HERE, "checkouts", "current", "state")
-    tarball = os.path.join(state_dir, "database.tar.xz")
-    if not os.path.isfile(tarball):
-        raise RuntimeError("version %s carries no in-tree database.tar.xz (state rides in the crank)" % version)
-    with tarfile.open(tarball, "r:xz") as t:
-        t.extractall(state_dir, filter="data")
+def _verify_tables(sqlite_path, expect):
+    """Read the table set of an sqlite db and assert the expected tables are present."""
     import sqlite3
-    con = sqlite3.connect(os.path.join(state_dir, "congruency.sqlite"))
+    con = sqlite3.connect(sqlite_path)
     try:
         tables = {x[0] for x in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     finally:
@@ -360,11 +360,52 @@ def do_state(version):
     missing = expect - tables
     if missing:
         raise RuntimeError("installed state missing tables: %s" % sorted(missing))
-    return {"tables": sorted(tables)}
+    return sorted(tables)
+
+
+def do_state(version, preserve_db=False):
+    """Materialize state from the db that RIDES IN the version commit (no state branch): the
+    checkout put checkouts/current/state/database.tar.xz in the tree; extract it (gitignored).
+
+    preserve_db (the "remember our db" guard): if a live congruency.sqlite already sits in the
+    state dir, DO NOT re-extract the seed tarball over it — that would wipe every ticket/memory/
+    api_key. Instead verify the existing db and keep it. This mirrors serve.py:ensure_db's
+    idempotency, so `install` is as non-destructive as `up` already is. A truly fresh install
+    (no db present) still extracts the seed."""
+    expect = set(_state_spec().get("expect_tables", []))
+    state_dir = os.path.join(HERE, "checkouts", "current", "state")
+    sqlite_path = os.path.join(state_dir, "congruency.sqlite")
+    if preserve_db and os.path.isfile(sqlite_path):
+        tables = _verify_tables(sqlite_path, expect)
+        print("   preserve_db: kept existing live db (%d tables) — seed tarball NOT extracted" % len(tables))
+        return {"tables": tables, "preserved": True}
+    tarball = os.path.join(state_dir, "database.tar.xz")
+    if not os.path.isfile(tarball):
+        raise RuntimeError("version %s carries no in-tree database.tar.xz (state rides in the crank)" % version)
+    with tarfile.open(tarball, "r:xz") as t:
+        t.extractall(state_dir, filter="data")
+    return {"tables": _verify_tables(sqlite_path, expect), "preserved": False}
 
 
 def do_verify():
     return run([os.path.join(HERE, "tooling", "congruencey-tests", "verify")], "verify")
+
+
+def do_shadows(cfg):
+    """Shadow gate: run each regression suite named by the config object BEFORE state install.
+    A non-zero exit from any shadow aborts the install (a broken crank never lands). Each shadow
+    isolates itself (tempfile dirs) and must never touch the live db. Returns the suites run."""
+    ran = []
+    for rel in cfg.get("shadows", []):
+        path = os.path.join(HERE, rel)
+        if not os.path.isfile(path):
+            raise RuntimeError("shadow suite not found: %s" % rel)
+        r = sh(["python3", path])
+        if r.returncode != 0:
+            raise RuntimeError("shadow FAILED (%s) — refusing to install:\n%s"
+                               % (rel, (r.stdout + r.stderr).strip()[-800:]))
+        ran.append(rel)
+    return {"shadows": ran}
 
 
 # --------------------------------------------------------------------------- #
@@ -496,7 +537,9 @@ def do_install(cfg, srcname):
     print("setup install: %s -> %s\n   config: %s" % (start, tag, srcname))
     step("checkout %s" % tag, lambda: do_checkout_version(version))
     step("provision php", do_provision_php)
-    step("install state", lambda: do_state(version))
+    if cfg.get("shadows"):
+        step("shadow gate", lambda: do_shadows(cfg))
+    step("install state", lambda: do_state(version, preserve_db=cfg.get("preserve_db", True)))
     if not cfg.get("no_verify"):
         step("verify", do_verify)
     if cfg.get("return_to_main"):
