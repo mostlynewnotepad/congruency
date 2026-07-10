@@ -79,6 +79,13 @@ if (!class_exists("GraphNode")) {
                             . self::esc(substr((string)$r['digest'], 0, 12)) . "</code></div>";
                     }
                     return $o;
+                case 'mandate':
+                    $cl = $db->query("SELECT clause FROM mandates WHERE ticket_id=" . $id . " ORDER BY seq")
+                             ->fetchAll(PDO::FETCH_COLUMN);
+                    if (!$cl) { return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>"; }
+                    $o = "<ol style='margin:.2rem 0 0 1.1rem;padding:0'>";
+                    foreach ($cl as $c) { $o .= "<li>" . self::esc($c) . "</li>"; }
+                    return $o . "</ol>";
                 default:
                     // mandate / manifestations / guarantees / journey / artifacts / children
                     return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>";
