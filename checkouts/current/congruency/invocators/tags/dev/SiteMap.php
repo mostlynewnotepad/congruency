@@ -34,8 +34,8 @@ if (!class_exists("SiteMap")) {
                                'catalog' => 1, 'about' => 1, 'config' => 1, 'categoryDone' => 1, 'annotateDone' => 1);
                 $label = array('pages' => 'Pages', 'tags' => 'Tags', 'bugs' => 'Bugs',
                                'source' => 'Source', 'docs' => 'Docs', 'annotations' => 'Annotations',
-                               'database' => 'Database', 'graphs' => 'Graphs', 'tree' => 'Source', 'repodocs' => 'Repo Docs', 'api' => 'API', 'search' => 'Search', 'forge' => 'Forge', 'omni' => 'Omni-git');
-                $order = array('pages', 'tags', 'bugs', 'forms', 'tickets', 'graphs', 'tree', 'forge', 'omni', 'memories', 'source', 'docs', 'repodocs', 'api', 'search', 'annotations', 'database');
+                               'database' => 'Database', 'graphs' => 'Graphs', 'tree' => 'Source', 'repodocs' => 'Repo Docs', 'api' => 'API', 'search' => 'Search', 'forge' => 'Forge', 'omni' => 'Omni-git', 'shadowforge' => 'Shadow Forge');
+                $order = array('pages', 'tags', 'bugs', 'forms', 'tickets', 'graphs', 'tree', 'forge', 'omni', 'shadowforge', 'memories', 'source', 'docs', 'repodocs', 'api', 'search', 'annotations', 'database');
 
                 $ids = array();
                 foreach ($order as $id) { if (isset($have[$id]) && !isset($block[$id])) { $ids[] = $id; unset($have[$id]); } }

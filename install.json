@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.116",
+  "version": "4.117",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -27,11 +27,12 @@
     "tooling/congruencey-tests/route-params-declared-shadow.py",
     "tooling/congruencey-tests/bound-param-injection-shadow.py",
     "tooling/congruencey-tests/route-sql-compiles-shadow.py",
-    "tooling/congruencey-tests/api-routes-integrity-shadow.py"
+    "tooling/congruencey-tests/api-routes-integrity-shadow.py",
+    "tooling/congruencey-tests/shadowforge-view-shadow.py"
   ],
   "components": {
-    "congruency": "4.116",
-    "state": "4.116"
+    "congruency": "4.117",
+    "state": "4.117"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
