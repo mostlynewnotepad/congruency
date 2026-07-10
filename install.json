@@ -10,7 +10,8 @@
   "migrate": true,
   "shadows": [
     "tooling/congruencey-tests/db-preserve-shadow.py",
-    "tooling/congruencey-tests/agents-migration-shadow.py"
+    "tooling/congruencey-tests/agents-migration-shadow.py",
+    "tooling/congruencey-tests/crank-confinement-shadow.py"
   ],
   "components": {
     "congruency": "4.095",

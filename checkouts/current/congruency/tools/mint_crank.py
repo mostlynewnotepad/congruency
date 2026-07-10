@@ -154,10 +154,24 @@ def step_inject(patch, name):
     return dest
 
 
+# ── crank confinement (RUNTIME, not by reading source) ───────────────────────
+# A patch RUNS as a real subprocess with full host rights, so a rogue/agent-authored patch could
+# escape — write ~/.claude, read the wallet seed, exfiltrate, shell out. Inspecting the patch's SOURCE
+# is theater: the model builds the call/path dynamically and walks around any static check. Instead we
+# run the patch through audit_guard.py, which installs a sys.addaudithook that fires on the ACTUAL
+# operation (open/socket/subprocess/exec/ctypes) — refusing shell-out, network, and out-of-repo/
+# sensitive writes however the source spelled them. (A crank edits THIS repo; it never needs a shell,
+# the network, or the home dir.) Airtight confinement is still the VM; this is the in-process control.
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_guard.py")
+
+
 def step_run(dest):
-    r = run_py(dest)
+    env = {**os.environ, "CRANK_REPO": ROOT, "PYTHONDONTWRITEBYTECODE": "1"}
+    r = subprocess.run([sys.executable, GUARD, dest], cwd=ROOT, capture_output=True, text=True,
+                       timeout=300, env=env)
     if r.returncode != 0:
-        raise Unexpected("patch exited %s: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-400:]))
+        raise Unexpected("patch refused/failed under the crank audit-veto (rc=%s): %s"
+                         % (r.returncode, (r.stderr or r.stdout).strip()[-400:]))
     return {"stdout_tail": (r.stdout or "").strip().splitlines()[-3:]}
 
 
