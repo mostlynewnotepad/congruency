@@ -112,6 +112,18 @@ if (!class_exists("GraphNode")) {
                     $head = "<div style='font-size:.8rem;color:#555;margin-bottom:.3rem'>" . $covered . "/" . count($cl) . " clauses verified</div>";
                     if (isset($by[0])) { $rows .= "<div style='margin-top:.4rem;font-size:.75rem;color:#888'>" . count($by[0]) . " guarantee(s) not bound to a clause</div>"; }
                     return $head . $rows;
+                case 'journey':
+                    $ev = $db->query("SELECT kind, text FROM journey WHERE ticket_id=" . $id . " ORDER BY id")
+                             ->fetchAll(PDO::FETCH_ASSOC);
+                    if (!$ev) { return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>"; }
+                    $col = array('success' => '#1a7a3a', 'blunder' => '#b00020', 'pivot' => '#b06a2a', 'note' => '#555');
+                    $o = "";
+                    foreach ($ev as $e) {
+                        $c  = isset($col[$e['kind']]) ? $col[$e['kind']] : '#555';
+                        $mk = $e['kind'] === 'blunder' ? '✗' : ($e['kind'] === 'success' ? '✓' : '•');
+                        $o .= "<div style='color:" . $c . "'>" . $mk . " <b>" . self::esc($e['kind']) . "</b> &mdash; " . self::esc($e['text']) . "</div>";
+                    }
+                    return $o;
                 case 'children':
                     $ch = $db->query("SELECT e.child_id, e.kind, t.title, t.status FROM ticket_edges e "
                                    . "JOIN tickets t ON t.id = e.child_id WHERE e.parent_id=" . $id . " ORDER BY e.child_id DESC")
