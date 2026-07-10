@@ -34,8 +34,8 @@ if (!class_exists("SiteMap")) {
                                'catalog' => 1, 'about' => 1, 'config' => 1, 'categoryDone' => 1, 'annotateDone' => 1);
                 $label = array('pages' => 'Pages', 'tags' => 'Tags', 'bugs' => 'bug report',
                                'source' => 'Source', 'docs' => 'Docs', 'annotations' => 'Annotations',
-                               'database' => 'Database', 'graphs' => 'Graphs', 'tree' => 'Source');
-                $order = array('pages', 'tags', 'bugs', 'forms', 'tickets', 'graphs', 'tree', 'memories', 'source', 'docs', 'annotations', 'database');
+                               'database' => 'Database', 'graphs' => 'Graphs', 'tree' => 'Source', 'repodocs' => 'Repo Docs');
+                $order = array('pages', 'tags', 'bugs', 'forms', 'tickets', 'graphs', 'tree', 'memories', 'source', 'docs', 'repodocs', 'annotations', 'database');
 
                 $ids = array();
                 foreach ($order as $id) { if (isset($have[$id]) && !isset($block[$id])) { $ids[] = $id; unset($have[$id]); } }
