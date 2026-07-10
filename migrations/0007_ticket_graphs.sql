@@ -4,6 +4,18 @@
 -- and a Documents row 'graphs' binds the slug to that template. SiteMap.php adds 'graphs' to the nav
 -- order (source change, committed alongside). High, fixed ids (90) so INSERT OR REPLACE is idempotent
 -- and never collides with the seeded templates. Additive.
+--
+-- Self-contained: guard the base CMS tables with CREATE IF NOT EXISTS so this migration applies to a
+-- bare db too (a fresh seed / the migration-isolation shadow), not only one that already has them.
+
+CREATE TABLE IF NOT EXISTS Document_Templates (TemplateID INTEGER PRIMARY KEY, Content TEXT);
+CREATE TABLE IF NOT EXISTS Documents (
+  DocumentID  TEXT PRIMARY KEY,
+  TemplateID  INTEGER,
+  Title       TEXT,
+  Description TEXT,
+  ContentID   INTEGER
+);
 
 INSERT OR REPLACE INTO Document_Templates (TemplateID, Content) VALUES (90,
 '<!DOCTYPE html>
