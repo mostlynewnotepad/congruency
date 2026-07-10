@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.118",
+  "version": "4.119",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -29,11 +29,12 @@
     "tooling/congruencey-tests/route-sql-compiles-shadow.py",
     "tooling/congruencey-tests/api-routes-integrity-shadow.py",
     "tooling/congruencey-tests/shadowforge-view-shadow.py",
-    "tooling/congruencey-tests/fatal-monitor-shadow.py"
+    "tooling/congruencey-tests/fatal-monitor-shadow.py",
+    "tooling/congruencey-tests/semantic-stream-shadow.py"
   ],
   "components": {
-    "congruency": "4.118",
-    "state": "4.118"
+    "congruency": "4.119",
+    "state": "4.119"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }

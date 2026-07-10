@@ -39,6 +39,12 @@ if (!class_exists("SemanticSearch")) {
 
         public function get_document() {
             try {
+                // defense-in-depth: nudge a small working limit up a little; the REAL fix is
+                // the streaming, bounded-memory semanticHits below -- do not rely on this bump.
+                $mlRaw = (string) ini_get('memory_limit');
+                $mlMb  = (int) $mlRaw;
+                if (strtoupper(substr($mlRaw, -1)) === 'G') { $mlMb *= 1024; }
+                if ($mlMb > 0 && $mlMb < 256) { @ini_set('memory_limit', '256M'); }
                 $q    = isset($_GET['q'])    ? (string) $_GET['q']    : '';
                 $axis = isset($_GET['axis']) ? (string) $_GET['axis'] : 'meaning';
                 if (!in_array($axis, array('meaning', 'keyword', 'both'), true)) { $axis = 'meaning'; }
@@ -142,32 +148,34 @@ if (!class_exists("SemanticSearch")) {
             return "<p style='color:#888'>Vector store &mdash; " . implode("; ", $parts) . "</p>\n";
         }
 
-        /* semantic axis: pull the stored chunk vectors (repo-scoped when set) and cosine-rank them
-           through the pure rank(). Each hit tagged axis=meaning; the raw vector is dropped. */
+        /* semantic axis: STREAM the stored chunk vectors (repo-scoped when set) one row at a
+           time, cosine-scoring each against $qv and keeping only a bounded top-12 -- O(k)
+           memory, the full set is never materialized. Each hit tagged axis=meaning; each
+           vector is decoded, scored, then dropped. */
         private static function semanticHits($db, array $qv, $repo) {
             if ($repo !== '') {
                 $st = $db->prepare("SELECT repo, path, section, text, vector FROM embeddings WHERE repo=?");
                 $st->execute(array($repo));
-                $raw = $st->fetchAll(PDO::FETCH_ASSOC);
             } else {
-                $raw = $db->query("SELECT repo, path, section, text, vector FROM embeddings")->fetchAll(PDO::FETCH_ASSOC);
+                $st = $db->query("SELECT repo, path, section, text, vector FROM embeddings");
             }
-            $rows = array();
-            foreach ($raw as $r) {
+            $k = 12;
+            $top = array();
+            while (($r = $st->fetch(PDO::FETCH_ASSOC)) !== false) {
                 $vec = json_decode((string) $r['vector'], true);
                 if (!is_array($vec)) { continue; }
-                $rows[] = array('repo' => $r['repo'], 'path' => $r['path'], 'section' => $r['section'],
-                                'text' => $r['text'], 'vector' => $vec);
+                $score = self::cosine($qv, $vec);
+                unset($vec);
+                $n = count($top);
+                if ($n >= $k && $score <= $top[$n - 1]['score']) { continue; }
+                $hit = array('repo' => $r['repo'], 'path' => $r['path'], 'section' => $r['section'],
+                             'text' => $r['text'], 'score' => $score, 'axis' => 'meaning');
+                $i = $n;
+                while ($i > 0 && $top[$i - 1]['score'] < $score) { $i--; }
+                array_splice($top, $i, 0, array($hit));
+                if (count($top) > $k) { array_pop($top); }
             }
-            if (!$rows) { return array(); }
-            $hits = self::rank($qv, $rows, 12);
-            $clean = array();
-            foreach ($hits as $h) {
-                unset($h['vector']);
-                $h['axis'] = 'meaning';
-                $clean[] = $h;
-            }
-            return $clean;
+            return $top;
         }
 
         /* keyword axis: robust LIKE full-text over repo_docs (repo/kind scoped), ranked by a simple
@@ -344,4 +352,17 @@ if (php_sapi_name() === 'cli' && (isset($argv[1]) ? $argv[1] : '') === '__merge_
     echo json_encode(SemanticSearch::merge($sem, $kw, $k));
     exit;
 }
+if (php_sapi_name() === 'cli' && (isset($argv[1]) ? $argv[1] : '') === '__semantic_selftest') {
+    $in = json_decode(file_get_contents('php://stdin'), true);
+    $qv = (isset($in['qv']) && is_array($in['qv'])) ? $in['qv'] : array();
+    $repo = isset($in['repo']) ? (string) $in['repo'] : '';
+    $dbPath = isset($in['db']) ? (string) $in['db'] : '';
+    $db = new PDO('sqlite:' . $dbPath);
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $ref = new ReflectionMethod('SemanticSearch', 'semanticHits');
+    $ref->setAccessible(true);
+    echo json_encode($ref->invoke(null, $db, $qv, $repo));
+    exit;
+}
+
 ?>
