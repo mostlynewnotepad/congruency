@@ -5,23 +5,29 @@ Congruency is free software, licensed under the GNU GPLv2 or later.
 See the LICENSE file in the project root for full license terms.
 */
 /*
- * SemanticSearch — the native vector-store browser: semantic search over the
- * documentation corpus (repo_docs), served on ?page=search.
+ * SemanticSearch — multi-axis search over the documentation corpus (repo_docs +
+ * the vector store), served on ?page=search.
  *
- * Invoked as <<<SemanticSearch>>>. Reads ?q= (the query) and optional ?repo=
- * (a repo filter). ALWAYS renders a GET search form + a search.stats coverage
- * line. When q is set it embeds "search_query: <q>" via the local Ollama
- * nomic-embed-text endpoint (OpenAI-compatible /v1/embeddings), L2-normalizes
- * it, pulls the stored chunk vectors from `embeddings` (0019_vector_store.sql)
- * and cosine-ranks them through the pure static rank() method, rendering the
- * top 8 hits as links into ?page=repodocs.
+ * Invoked as <<<SemanticSearch>>>. Reads ?q= (query), ?axis= (meaning|keyword|
+ * both; default meaning), ?repo= (repo facet) and ?kind= (type facet). ALWAYS
+ * renders a GET form (text box + axis selector + repo/kind selects, selection
+ * preserved) and a search.stats coverage line.
+ *   axis=meaning  embeds "search_query: <q>" via the local Ollama nomic-embed-
+ *                 text endpoint, L2-normalizes it and cosine-ranks the stored
+ *                 chunk vectors (embeddings) through the pure static rank().
+ *   axis=keyword  runs a robust LIKE full-text query over repo_docs (repo/kind
+ *                 scoped), ranked by a simple term-frequency relevance score.
+ *   axis=both     runs BOTH and merges via the pure static merge(): deduped by
+ *                 (repo,path), scores combined so a doc found by BOTH axes
+ *                 outranks one found by only one.
  *
  * SECURITY: ALL data-derived output is htmlspecialchars()'d before it flows
- * back through execute_all_tags, so a doc chunk containing a literal <<<Tag>>>
- * or <script> stays inert (escape-first, same invariant as RepoDocs). The
- * embedder is best-effort: any curl/parse failure degrades to an "offline"
- * notice and never crashes the page. rank()/cosine() are pure + static so the
- * shadow can prove the ranking math with no embedding service (__rank_selftest).
+ * back through execute_all_tags, so a doc body containing a literal <<<Tag>>>
+ * or <script> stays inert (escape-first). The embedder is best-effort: any
+ * curl/parse failure degrades to an "offline" notice and never crashes the
+ * page. rank()/cosine()/keywordScore()/merge() are pure + static so the shadow
+ * can prove the ranking + merge math with no services (__rank_selftest /
+ * __merge_selftest).
  */
 if (!interface_exists('Tag_Interface')) { interface Tag_Interface { public function get_document(); } }
 if (!class_exists("SemanticSearch")) {
@@ -33,47 +39,56 @@ if (!class_exists("SemanticSearch")) {
 
         public function get_document() {
             try {
-                $q = isset($_GET['q']) ? (string) $_GET['q'] : '';
+                $q    = isset($_GET['q'])    ? (string) $_GET['q']    : '';
+                $axis = isset($_GET['axis']) ? (string) $_GET['axis'] : 'meaning';
+                if (!in_array($axis, array('meaning', 'keyword', 'both'), true)) { $axis = 'meaning'; }
                 $repo = isset($_GET['repo']) ? (string) $_GET['repo'] : '';
-                $out = $this->form($q, $repo);
-                if (!defined('CONGRUENCY_SQLITE')) { return $out . "<p>SemanticSearch: no DB.</p>"; }
+                $kind = isset($_GET['kind']) ? (string) $_GET['kind'] : '';
+
+                if (!defined('CONGRUENCY_SQLITE')) {
+                    return $this->form(array(), $q, $axis, $repo, $kind) . "<p>SemanticSearch: no DB.</p>";
+                }
                 $db = new PDO('sqlite:' . CONGRUENCY_SQLITE);
                 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+                $out  = $this->form(self::repos($db), $q, $axis, $repo, $kind);
                 $out .= $this->stats($db);
                 if ($q === '') { return $out; }
 
-                $qv = self::embed($q);
-                if ($qv === null) {
-                    return $out . "<p class='cy-form-error'>embedding service offline (start Ollama + <code>ollama pull nomic-embed-text</code>)</p>";
+                $semantic = array();
+                $keyword  = array();
+                $notes    = array();
+
+                if ($axis === 'meaning' || $axis === 'both') {
+                    $qv = self::embed($q);
+                    if ($qv === null) {
+                        $notes[] = "embedding service offline (start Ollama + <code>ollama pull nomic-embed-text</code>)";
+                    } else {
+                        $semantic = self::semanticHits($db, $qv, $repo);
+                    }
+                }
+                if ($axis === 'keyword' || $axis === 'both') {
+                    $keyword = self::keywordHits($db, $q, $repo, $kind);
                 }
 
-                if ($repo !== '') {
-                    $st = $db->prepare("SELECT repo, path, section, text, vector FROM embeddings WHERE repo=?");
-                    $st->execute(array($repo));
-                    $raw = $st->fetchAll(PDO::FETCH_ASSOC);
-                } else {
-                    $raw = $db->query("SELECT repo, path, section, text, vector FROM embeddings")->fetchAll(PDO::FETCH_ASSOC);
-                }
-                $rows = array();
-                foreach ($raw as $r) {
-                    $vec = json_decode((string) $r['vector'], true);
-                    if (!is_array($vec)) { continue; }
-                    $rows[] = array('repo' => $r['repo'], 'path' => $r['path'], 'section' => $r['section'],
-                                    'text' => $r['text'], 'vector' => $vec);
-                }
-                if (!$rows) {
-                    return $out . "<p>No embeddings stored yet &mdash; ingest chunks through the <code>search.record</code> route.</p>";
-                }
+                if ($axis === 'meaning')     { $hits = $semantic; }
+                elseif ($axis === 'keyword') { $hits = $keyword; }
+                else                         { $hits = self::merge($semantic, $keyword, 12); }
 
-                $hits = self::rank($qv, $rows, 8);
+                foreach ($notes as $n) { $out .= "<p class='cy-form-error'>" . $n . "</p>\n"; }
+                if (!$hits) {
+                    return $out . "<p>No matches &mdash; try another axis or a broader query.</p>\n";
+                }
                 $out .= "<ol class='srclist'>\n";
                 foreach ($hits as $h) {
-                    $snippet = substr((string) $h['text'], 0, 160);
-                    $out .= "<li><code>" . self::esc(sprintf('%.3f', $h['score'])) . "</code> "
+                    $snippet = substr((string) (isset($h['text']) ? $h['text'] : ''), 0, 240);
+                    $ax = isset($h['axis']) ? $h['axis'] : $axis;
+                    $out .= "<li><span class='cy-axis'>[" . self::esc($ax) . "]</span> "
+                          . "<code>" . self::esc(sprintf('%.3f', isset($h['score']) ? $h['score'] : 0)) . "</code> "
                           . "<a href='?page=repodocs&repo=" . self::esc(urlencode((string) $h['repo']))
                           . "&doc=" . self::esc(urlencode((string) $h['path'])) . "'>"
                           . self::esc($h['repo']) . " / " . self::esc($h['path']) . "</a> "
-                          . "<span style='color:#888'>" . self::esc($h['section']) . "</span>"
+                          . "<span style='color:#888'>" . self::esc(isset($h['section']) ? $h['section'] : '') . "</span>"
                           . "<br><span>" . self::esc($snippet) . "</span></li>\n";
                 }
                 return $out . "</ol>\n";
@@ -82,11 +97,35 @@ if (!class_exists("SemanticSearch")) {
             }
         }
 
-        private function form($q, $repo) {
-            $out = "<form method='get' action=''>\n";
+        private static function repos($db) {
+            try {
+                $rows = $db->query("SELECT DISTINCT repo FROM repo_docs ORDER BY repo")->fetchAll(PDO::FETCH_COLUMN);
+                return is_array($rows) ? $rows : array();
+            } catch (\Throwable $e) { return array(); }
+        }
+
+        private function form($repos, $q, $axis, $repo, $kind) {
+            $out  = "<form method='get' action=''>\n";
             $out .= "<input type='hidden' name='page' value='search'>\n";
-            if ($repo !== '') { $out .= "<input type='hidden' name='repo' value='" . self::esc($repo) . "'>\n"; }
-            $out .= "<input type='text' name='q' value='" . self::esc($q) . "' size='48' placeholder='search the docs by meaning...'>\n";
+            $out .= "<input type='text' name='q' value='" . self::esc($q) . "' size='40' placeholder='search the docs...'>\n";
+            $out .= "<select name='axis'>\n";
+            foreach (array('meaning', 'keyword', 'both') as $v) {
+                $sel = ($axis === $v) ? " selected" : "";
+                $out .= "<option value='" . self::esc($v) . "'" . $sel . ">" . self::esc($v) . "</option>\n";
+            }
+            $out .= "</select>\n";
+            $out .= "<select name='repo'>\n<option value=''>(all repos)</option>\n";
+            foreach ($repos as $r) {
+                $sel = ($repo === (string) $r) ? " selected" : "";
+                $out .= "<option value='" . self::esc($r) . "'" . $sel . ">" . self::esc($r) . "</option>\n";
+            }
+            $out .= "</select>\n";
+            $out .= "<select name='kind'>\n";
+            foreach (array('' => '(any type)', 'md' => 'md', 'text' => 'text') as $v => $lab) {
+                $sel = ($kind === (string) $v) ? " selected" : "";
+                $out .= "<option value='" . self::esc($v) . "'" . $sel . ">" . self::esc($lab) . "</option>\n";
+            }
+            $out .= "</select>\n";
             $out .= "<button type='submit'>Search</button>\n</form>\n";
             return $out;
         }
@@ -101,6 +140,114 @@ if (!class_exists("SemanticSearch")) {
                 $parts[] = self::esc($r['model']) . ": " . self::esc($r['chunks']) . " chunks / " . self::esc($r['docs']) . " docs";
             }
             return "<p style='color:#888'>Vector store &mdash; " . implode("; ", $parts) . "</p>\n";
+        }
+
+        /* semantic axis: pull the stored chunk vectors (repo-scoped when set) and cosine-rank them
+           through the pure rank(). Each hit tagged axis=meaning; the raw vector is dropped. */
+        private static function semanticHits($db, array $qv, $repo) {
+            if ($repo !== '') {
+                $st = $db->prepare("SELECT repo, path, section, text, vector FROM embeddings WHERE repo=?");
+                $st->execute(array($repo));
+                $raw = $st->fetchAll(PDO::FETCH_ASSOC);
+            } else {
+                $raw = $db->query("SELECT repo, path, section, text, vector FROM embeddings")->fetchAll(PDO::FETCH_ASSOC);
+            }
+            $rows = array();
+            foreach ($raw as $r) {
+                $vec = json_decode((string) $r['vector'], true);
+                if (!is_array($vec)) { continue; }
+                $rows[] = array('repo' => $r['repo'], 'path' => $r['path'], 'section' => $r['section'],
+                                'text' => $r['text'], 'vector' => $vec);
+            }
+            if (!$rows) { return array(); }
+            $hits = self::rank($qv, $rows, 12);
+            $clean = array();
+            foreach ($hits as $h) {
+                unset($h['vector']);
+                $h['axis'] = 'meaning';
+                $clean[] = $h;
+            }
+            return $clean;
+        }
+
+        /* keyword axis: robust LIKE full-text over repo_docs (repo/kind scoped), ranked by a simple
+           term-frequency + earliness relevance score. Each hit tagged axis=keyword. */
+        private static function keywordHits($db, $q, $repo, $kind) {
+            if ($q === '') { return array(); }
+            $sql = "SELECT repo, path, kind, body FROM repo_docs WHERE body LIKE :like";
+            $args = array(':like' => '%' . $q . '%');
+            if ($repo !== '') { $sql .= " AND repo=:repo"; $args[':repo'] = $repo; }
+            if ($kind !== '') { $sql .= " AND kind=:kind"; $args[':kind'] = $kind; }
+            $sql .= " ORDER BY repo, path LIMIT 40";
+            $st = $db->prepare($sql);
+            $st->execute($args);
+            $raw = $st->fetchAll(PDO::FETCH_ASSOC);
+            $hits = array();
+            foreach ($raw as $r) {
+                $body = (string) $r['body'];
+                $hits[] = array('repo' => $r['repo'], 'path' => $r['path'], 'section' => $r['kind'],
+                                'text' => substr($body, 0, 240), 'score' => self::keywordScore($body, $q),
+                                'axis' => 'keyword');
+            }
+            usort($hits, function ($a, $b) {
+                if ($a['score'] == $b['score']) { return 0; }
+                return ($a['score'] < $b['score']) ? 1 : -1;
+            });
+            return $hits;
+        }
+
+        /* PURE keyword relevance: term frequency (dominant) + earliness of the first match, both from
+           a case-folded body. Positive when the term occurs; 0 otherwise. No DB, no network. */
+        public static function keywordScore($body, $q): float {
+            $bl = strtolower((string) $body);
+            $ql = strtolower((string) $q);
+            if ($ql === '') { return 0.0; }
+            $count = substr_count($bl, $ql);
+            if ($count === 0) { return 0.0; }
+            $pos = strpos($bl, $ql);
+            $len = strlen($bl);
+            $earliness = ($len > 0) ? (1.0 - ($pos / $len)) : 1.0;
+            return (float) $count + $earliness;
+        }
+
+        /* PURE merge of the two axes: dedupe by (repo,path), COMBINE scores (semantic + keyword), and
+           order so a doc found by BOTH axes always outranks one found by only one, then by combined
+           score DESC. Returns the top-$k. No DB, no network — the shadow drives this (__merge_selftest). */
+        public static function merge(array $semanticHits, array $keywordHits, int $k): array {
+            $acc = array();
+            $ingest = function ($hit, $axis) use (&$acc) {
+                $repo = isset($hit['repo']) ? (string) $hit['repo'] : '';
+                $path = isset($hit['path']) ? (string) $hit['path'] : '';
+                $score = isset($hit['score']) ? (float) $hit['score'] : 0.0;
+                $key = $repo . "\0" . $path;
+                if (!isset($acc[$key])) {
+                    $acc[$key] = array('repo' => $repo, 'path' => $path, 'section' => '', 'text' => '',
+                                       'semantic' => 0.0, 'keyword' => 0.0,
+                                       'from_semantic' => false, 'from_keyword' => false);
+                }
+                if (isset($hit['section']) && $acc[$key]['section'] === '') { $acc[$key]['section'] = (string) $hit['section']; }
+                if (isset($hit['text']) && $acc[$key]['text'] === '') { $acc[$key]['text'] = (string) $hit['text']; }
+                if ($score > $acc[$key][$axis]) { $acc[$key][$axis] = $score; }
+                $acc[$key]['from_' . $axis] = true;
+            };
+            foreach ($semanticHits as $h) { $ingest($h, 'semantic'); }
+            foreach ($keywordHits as $h) { $ingest($h, 'keyword'); }
+
+            $merged = array();
+            foreach ($acc as $e) {
+                $both = ($e['from_semantic'] && $e['from_keyword']);
+                $e['both']  = $both;
+                $e['axis']  = $both ? 'both' : ($e['from_semantic'] ? 'meaning' : 'keyword');
+                $e['score'] = (float) $e['semantic'] + (float) $e['keyword'];
+                $merged[] = $e;
+            }
+            usort($merged, function ($a, $b) {
+                if ($a['both'] !== $b['both']) { return $a['both'] ? -1 : 1; }
+                if ($a['score'] == $b['score']) { return 0; }
+                return ($a['score'] < $b['score']) ? 1 : -1;
+            });
+            if ($k >= 0 && count($merged) > $k) { $merged = array_slice($merged, 0, $k); }
+            return $merged;
         }
 
         /* Embed the query via Ollama's OpenAI-compatible endpoint. Returns an L2-normalized float
@@ -180,14 +327,21 @@ if (!class_exists("SemanticSearch")) {
     }
 }
 
-/* CLI self-test hook: the vector-search shadow drives rank() from php with NO embedding service.
-   Reads JSON {q:[...],rows:[...],k:int} from stdin, echoes json_encode(self::rank(...)). */
+/* CLI self-test hooks: the shadows drive rank()/merge() from php with NO embedding service. */
 if (php_sapi_name() === 'cli' && (isset($argv[1]) ? $argv[1] : '') === '__rank_selftest') {
     $in = json_decode(file_get_contents('php://stdin'), true);
     $q = (isset($in['q']) && is_array($in['q'])) ? $in['q'] : array();
     $rows = (isset($in['rows']) && is_array($in['rows'])) ? $in['rows'] : array();
     $k = isset($in['k']) ? (int) $in['k'] : 0;
     echo json_encode(SemanticSearch::rank($q, $rows, $k));
+    exit;
+}
+if (php_sapi_name() === 'cli' && (isset($argv[1]) ? $argv[1] : '') === '__merge_selftest') {
+    $in = json_decode(file_get_contents('php://stdin'), true);
+    $sem = (isset($in['semantic']) && is_array($in['semantic'])) ? $in['semantic'] : array();
+    $kw  = (isset($in['keyword']) && is_array($in['keyword'])) ? $in['keyword'] : array();
+    $k = isset($in['k']) ? (int) $in['k'] : 0;
+    echo json_encode(SemanticSearch::merge($sem, $kw, $k));
     exit;
 }
 ?>

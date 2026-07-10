@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.109",
+  "version": "4.110",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -17,11 +17,12 @@
     "tooling/congruencey-tests/tree-injection-shadow.py",
     "tooling/congruencey-tests/page-tag-shadow.py",
     "tooling/congruencey-tests/api-surface-shadow.py",
-    "tooling/congruencey-tests/vector-search-shadow.py"
+    "tooling/congruencey-tests/vector-search-shadow.py",
+    "tooling/congruencey-tests/multi-axis-search-shadow.py"
   ],
   "components": {
-    "congruency": "4.109",
-    "state": "4.109"
+    "congruency": "4.110",
+    "state": "4.110"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
