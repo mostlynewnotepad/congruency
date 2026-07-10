@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "forge_name": "congruency-state",
-  "forge_version": "4.106",
-  "sha256": "218aec5516cf2c89f217856a99d56dbf20ea4c34d039b350e1d398b0048b6608",
-  "size": 737108,
+  "forge_version": "4.107",
+  "sha256": "585c4daa4bb38475f39d724d6e6100d4061da152f6aeb86ae258a598cf0dc891",
+  "size": 741160,
   "kind": "xz",
   "member": "congruency.sqlite",
   "tables": [
@@ -46,5 +46,5 @@
     "ticket_edges",
     "tickets"
   ],
-  "created": "2026-07-10T00:58:05.822175"
+  "created": "2026-07-10T01:04:57.527494"
 }

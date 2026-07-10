@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.106",
+  "version": "4.107",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -18,8 +18,8 @@
     "tooling/congruencey-tests/page-tag-shadow.py"
   ],
   "components": {
-    "congruency": "4.106",
-    "state": "4.106"
+    "congruency": "4.107",
+    "state": "4.107"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
