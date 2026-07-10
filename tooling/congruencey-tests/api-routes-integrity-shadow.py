@@ -61,7 +61,8 @@ def main():
             iss = row_issue(name, method, sql, auth, params)
             if iss:
                 bad[name] = iss
-        check("every api_routes row is well-formed: method/sql/auth/params (%d routes)" % len(routes), not bad)
+        print("      scanned %d route(s)" % len(routes))   # diagnostic (not a ✓ label)
+        check("every api_routes row is well-formed: method/sql/auth/params", not bad)
         for n, i in bad.items():
             print("      %s: %s" % (n, i))
 

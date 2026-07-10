@@ -50,7 +50,8 @@ def main():
             miss = declared_ok(sql, params)
             if miss:
                 bad[name] = sorted(miss)
-        check("every :param used in a route's SQL is declared in its params (%d routes scanned)" % len(routes),
+        print("      scanned %d route(s)" % len(routes))   # diagnostic (not a ✓ label)
+        check("every :param used in a route's SQL is declared in its params",
               not bad)
         if bad:
             for n, m in bad.items():

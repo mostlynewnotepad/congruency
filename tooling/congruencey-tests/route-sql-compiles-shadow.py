@@ -53,7 +53,8 @@ def main():
             err = compiles(con, sql, params)
             if err:
                 bad[name] = err
-        check("every route's SQL compiles against the real schema (%d routes)" % len(routes), not bad)
+        print("      scanned %d route(s)" % len(routes))   # diagnostic (not a ✓ label)
+        check("every route's SQL compiles against the real schema", not bad)
         for n, e in bad.items():
             print("      %s: %s" % (n, e))
 

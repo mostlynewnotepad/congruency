@@ -42,7 +42,8 @@ def main():
         con.close()
 
         violations = [n for n, sql in routes if FRAGILE.search(sql or "")]
-        check("no route uses the NULL-unsafe `:x='' OR ...` optional-facet guard (use COALESCE) — %d route(s) scanned" % len(routes),
+        print("      scanned %d route(s)" % len(routes))   # diagnostic (not a ✓ label -> not a harvested guarantee)
+        check("no route uses the NULL-unsafe `:x='' OR ...` optional-facet guard (use COALESCE)",
               not violations)
         if violations:
             print("      VIOLATIONS:", ", ".join(violations))

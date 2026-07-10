@@ -89,7 +89,8 @@ def main():
         # TEETH: an INTERPOLATED query with the OR payload returns the row; the BOUND form returns none.
         interp = con.execute("SELECT * FROM bugs WHERE source='%s'" % OR).fetchall()
         bound = con.execute("SELECT * FROM bugs WHERE source=:s", {"s": OR}).fetchall()
-        check("shadow has teeth: interpolation leaks the row (%d) while binding does not (%d)" % (len(interp), len(bound)),
+        print("      interpolated=%d bound=%d" % (len(interp), len(bound)))   # diagnostic (not a ✓ label)
+        check("shadow has teeth: interpolation leaks the row while binding does not",
               len(interp) == 1 and len(bound) == 0)
 
         con.close()
