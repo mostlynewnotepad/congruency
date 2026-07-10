@@ -112,6 +112,17 @@ if (!class_exists("GraphNode")) {
                     $head = "<div style='font-size:.8rem;color:#555;margin-bottom:.3rem'>" . $covered . "/" . count($cl) . " clauses verified</div>";
                     if (isset($by[0])) { $rows .= "<div style='margin-top:.4rem;font-size:.75rem;color:#888'>" . count($by[0]) . " guarantee(s) not bound to a clause</div>"; }
                     return $head . $rows;
+                case 'artifacts':
+                    $ar = $db->query("SELECT name, version, forge_sha, kind FROM ticket_artifacts WHERE ticket_id=" . $id . " ORDER BY id")
+                             ->fetchAll(PDO::FETCH_ASSOC);
+                    if (!$ar) { return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>"; }
+                    $o = "";
+                    foreach ($ar as $a) {
+                        $o .= "<div><code>" . self::esc($a['name']) . ":" . self::esc($a['version']) . "</code> "
+                            . "<span style='font-size:.72rem;color:#888'>" . self::esc($a['kind'])
+                            . " &middot; forge " . self::esc(substr((string)$a['forge_sha'], 0, 12)) . "</span></div>";
+                    }
+                    return $o;
                 case 'journey':
                     $ev = $db->query("SELECT kind, text FROM journey WHERE ticket_id=" . $id . " ORDER BY id")
                              ->fetchAll(PDO::FETCH_ASSOC);
