@@ -112,8 +112,21 @@ if (!class_exists("GraphNode")) {
                     $head = "<div style='font-size:.8rem;color:#555;margin-bottom:.3rem'>" . $covered . "/" . count($cl) . " clauses verified</div>";
                     if (isset($by[0])) { $rows .= "<div style='margin-top:.4rem;font-size:.75rem;color:#888'>" . count($by[0]) . " guarantee(s) not bound to a clause</div>"; }
                     return $head . $rows;
+                case 'children':
+                    $ch = $db->query("SELECT e.child_id, e.kind, t.title, t.status FROM ticket_edges e "
+                                   . "JOIN tickets t ON t.id = e.child_id WHERE e.parent_id=" . $id . " ORDER BY e.child_id DESC")
+                             ->fetchAll(PDO::FETCH_ASSOC);
+                    if (!$ch) { return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>"; }
+                    $o = "";
+                    foreach ($ch as $c) {
+                        $cid = (int)$c['child_id'];
+                        $o .= "<div>&mdash; <a href='?page=graphs&amp;ticket=" . $cid . "'>#" . $cid . " "
+                            . self::esc($c['title']) . "</a> <span style='font-size:.72rem;color:#888'>("
+                            . self::esc($c['kind']) . " &middot; " . self::esc($c['status']) . ")</span></div>";
+                    }
+                    return $o;
                 default:
-                    // mandate / manifestations / guarantees / journey / artifacts / children
+                    // manifestations / journey / artifacts
                     return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>";
             }
         }
