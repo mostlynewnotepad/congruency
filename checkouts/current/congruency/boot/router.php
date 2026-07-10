@@ -18,6 +18,8 @@ ob_start();  // buffer output so ?api= can emit clean JSON + status headers afte
 
 require $BOOT . '/shim.php';                            // mysql_* -> PDO/sqlite
 require $BOOT . '/configure.php';                       // install.json + defaults -> ALL constants
+require $BOOT . '/monitor.php';                         // fatal-error net (catch uncaught/ fatal -> log + auto-file a bug)
+congruency_install_monitor();                           // register shutdown + exception handlers early -- covers ?route= AND ?page=
 
 set_include_path($BOOT . PATH_SEPARATOR . get_include_path());  // shadow the app's illegal AutoLoader.php
 require(CLASS_LOADER_HEADER);
