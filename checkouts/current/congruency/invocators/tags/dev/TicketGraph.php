@@ -22,7 +22,7 @@ if (!class_exists("TicketGraph")) {
 
         // the ordered slots the ticket-class aggregate contains (goal .. children)
         private static $slots = array('goal', 'patch', 'approval', 'runs',
-                                      'mandate', 'manifestations', 'guarantees', 'journey', 'artifacts', 'children');
+                                      'mandate', 'manifestations', 'guarantees', 'journey', 'artifacts', 'source', 'children');
 
         private static function st_colour($st) {
             $map = array('OPEN' => '#1a7a3a', 'REQUESTED' => '#5a6a8a', 'APPROVED' => '#1a5a7a',

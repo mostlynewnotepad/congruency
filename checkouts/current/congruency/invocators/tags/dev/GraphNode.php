@@ -31,7 +31,7 @@ if (!class_exists("GraphNode")) {
             'goal' => 'goal', 'patch' => 'patch', 'approval' => 'approval', 'runs' => 'runs',
             'mandate' => 'mandate (clauses)', 'manifestations' => 'manifestations',
             'guarantees' => 'guarantees', 'journey' => 'journey (blunders &amp; successes)',
-            'artifacts' => 'artifacts (forge)', 'children' => 'children',
+            'artifacts' => 'artifacts (forge)', 'source' => 'source (forge tree)', 'children' => 'children',
         );
 
         private function db() {
@@ -135,6 +135,12 @@ if (!class_exists("GraphNode")) {
                         $o .= "<div style='color:" . $c . "'>" . $mk . " <b>" . self::esc($e['kind']) . "</b> &mdash; " . self::esc($e['text']) . "</div>";
                     }
                     return $o;
+                case 'source':
+                    $v = $db->query("SELECT version FROM crank_runs WHERE ticket_id=" . $id . " ORDER BY id DESC")->fetchColumn();
+                    $lbl = ($v !== false && $v !== '')
+                         ? "browse congruency source (this ticket minted v" . self::esc($v) . ")"
+                         : "browse congruency source (forge-parked tree)";
+                    return "<div>&mdash; <a href='?page=tree&amp;repo=congruency'>" . $lbl . "</a></div>";
                 case 'children':
                     $ch = $db->query("SELECT e.child_id, e.kind, t.title, t.status FROM ticket_edges e "
                                    . "JOIN tickets t ON t.id = e.child_id WHERE e.parent_id=" . $id . " ORDER BY e.child_id DESC")
