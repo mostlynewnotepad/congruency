@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.111",
+  "version": "4.112",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -19,11 +19,12 @@
     "tooling/congruencey-tests/api-surface-shadow.py",
     "tooling/congruencey-tests/vector-search-shadow.py",
     "tooling/congruencey-tests/multi-axis-search-shadow.py",
-    "tooling/congruencey-tests/forge-view-shadow.py"
+    "tooling/congruencey-tests/forge-view-shadow.py",
+    "tooling/congruencey-tests/omni-explorer-shadow.py"
   ],
   "components": {
-    "congruency": "4.111",
-    "state": "4.111"
+    "congruency": "4.112",
+    "state": "4.112"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
