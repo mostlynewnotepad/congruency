@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "forge_name": "congruency-state",
-  "forge_version": "4.099",
-  "sha256": "2098e13b723cd9f2cf04fb424ccb33e0897c338e84a248f3333eda909defd4e8",
-  "size": 663384,
+  "forge_version": "4.100",
+  "sha256": "7a496b28080b02f087cd9d47dae71f43089415bb1a286696a2577f45d0c76bbc",
+  "size": 667924,
   "kind": "xz",
   "member": "congruency.sqlite",
   "tables": [
@@ -36,12 +36,14 @@
     "mandates",
     "memories",
     "orders",
+    "repos",
     "schema_migrations",
     "signals",
+    "source_commits",
     "sqlite_sequence",
     "ticket_artifacts",
     "ticket_edges",
     "tickets"
   ],
-  "created": "2026-07-09T21:33:40.514555"
+  "created": "2026-07-09T21:45:34.475018"
 }
