@@ -133,4 +133,89 @@ if (!function_exists('congruency_monitor_report')) {
         register_shutdown_function('congruency_monitor_shutdown');
         set_exception_handler('congruency_monitor_exception');
     }
+
+    // report ONE client (front-end) JS error -- mirrors the SERVER fatal pipe (v4.118) for a browser
+    // crash: an error_log row marked type='js' (ALWAYS) + a de-duped auto-filed bug source='front-end'
+    // keyed by a client signature sig=substr(sha1('js'|message|route),0,16) within a 3600s window.
+    // Reuses the SAME log+auto-bug shape bug.record uses so a client crash surfaces in ?page=bugs.
+    // NEVER throws (a telemetry-logging failure must not itself fatal a served page).
+    function congruency_monitor_report_client($message, $route, $detail = '', $pdo = null, $dedup = true) {
+        try {
+            $db = congruency_monitor_db($pdo);
+            if (!($db instanceof PDO)) { return; }
+            $message = (string) $message;
+            $route   = (string) $route;
+            $detail  = (string) $detail;
+            $ts      = time();
+            $sig     = substr(sha1('js' . '|' . $message . '|' . $route), 0, 16);
+
+            // (a) ALWAYS record the error_log row -- type='js' marks a CLIENT crash (server fatals use an int type).
+            $st = $db->prepare('INSERT INTO error_log (ts, type, message, file, line, route, sig)
+                                VALUES (:ts, :type, :message, :file, :line, :route, :sig)');
+            $st->execute(array(':ts' => $ts, ':type' => 'js', ':message' => $message,
+                               ':file' => $detail, ':line' => 0, ':route' => $route, ':sig' => $sig));
+
+            // (b) DE-DUP: one open bug per signature within the window -- a repeat still logs but files no 2nd bug.
+            if ($dedup) {
+                $seen = $db->prepare('SELECT COUNT(*) FROM error_log WHERE sig = :sig AND ts >= :since');
+                $seen->execute(array(':sig' => $sig, ':since' => $ts - 3600));
+                if ((int) $seen->fetchColumn() > 1) { return; }
+            }
+
+            // (b) AUTO-FILE a bug, source='front-end', SAME columns bug.record uses -> shows in ?page=bugs.
+            $GLOBALS['__monitor_seq'] = (isset($GLOBALS['__monitor_seq']) ? $GLOBALS['__monitor_seq'] : 0) + 1;
+            $short = (strlen($message) > 77) ? (substr($message, 0, 77) . '...') : $message;
+            $title = 'js: ' . $short . ' @ ' . $route;
+            $bodytxt = 'source=front-end route=' . $route . ' | ' . $message . ' | ' . $detail;
+            $bug = $db->prepare('INSERT OR REPLACE INTO bugs
+                (bug_id, source, title, severity, location, repro, success, fanout, repos, status, pattern, meta)
+                VALUES (:bug_id, :source, :title, :severity, :location, :repro, :success, :fanout, :repos, :status, :pattern, :meta)');
+            $bug->execute(array(
+                ':bug_id'   => $sig . '-' . $GLOBALS['__monitor_seq'],
+                ':source'   => 'front-end',
+                ':title'    => $title,
+                ':severity' => 'high',
+                ':location' => $route,
+                ':repro'    => '',
+                ':success'  => '',
+                ':fanout'   => 0,
+                ':repos'    => 0,
+                ':status'   => 'open',
+                ':pattern'  => 'js',
+                ':meta'     => $bodytxt,
+            ));
+        } catch (\Throwable $e) {
+            // a telemetry-logging failure must never itself fatal -- swallow it.
+        }
+    }
+
+    // ingest ONE front-end telemetry beacon. Branch on kind: 'error' mirrors the fatal pipe
+    // (congruency_monitor_report_client -> error_log + de-duped front-end bug); EVERY kind also lands
+    // one front_telemetry stream row (guarded so a missing table is a no-op). NEVER throws.
+    function congruency_telemetry_ingest($kind, $route, $message = '', $detail = '', $pdo = null, $dedup = true) {
+        try {
+            $db = congruency_monitor_db($pdo);
+            if (!($db instanceof PDO)) { return; }
+            $kind    = (string) $kind;
+            $route   = (string) $route;
+            $message = (string) $message;
+            $detail  = (string) $detail;
+            if ($kind === 'error') {
+                congruency_monitor_report_client($message, $route, $detail, $db, $dedup);
+            }
+            try {
+                $ua  = isset($_SERVER['HTTP_USER_AGENT']) ? (string) $_SERVER['HTTP_USER_AGENT'] : '';
+                $det = ($kind === 'error') ? trim($message . ' | ' . $detail, ' |') : $detail;
+                $sig = substr(sha1($kind . '|' . $route . '|' . $det), 0, 16);
+                $st  = $db->prepare('INSERT INTO front_telemetry (ts, kind, route, detail, ua, sig)
+                                     VALUES (:ts, :kind, :route, :detail, :ua, :sig)');
+                $st->execute(array(':ts' => time(), ':kind' => $kind, ':route' => $route,
+                                   ':detail' => $det, ':ua' => $ua, ':sig' => $sig));
+            } catch (\Throwable $e2) {
+                // a missing front_telemetry table / write race must never fatal a served page.
+            }
+        } catch (\Throwable $e) {
+            // swallow -- telemetry must never fatal a page.
+        }
+    }
 }

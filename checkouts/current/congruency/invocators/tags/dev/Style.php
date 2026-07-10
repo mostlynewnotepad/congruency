@@ -24,7 +24,8 @@ if (!class_exists("Style")) {
                  . "table{border-collapse:collapse}"
                  . "th,td{text-align:left}"
                  . ".prose{max-width:70ch}"   // reading pages opt in via class='prose' — a comfortable measure; data/code pages stay full-width
-                 . "</style>";
+                 . "</style>"
+                 . "<<<TelemetryBeacon>>>";
         }
     }
 }

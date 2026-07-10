@@ -82,6 +82,14 @@ function congruency_rest_route($db, $route, $method) {
         $body = json_decode((string) file_get_contents('php://input'), true);
         if (is_array($body)) { $input = array_merge($input, $body); }
     }
+
+    // Front-end telemetry receiver: telemetry.record carries a kind (error|pageview|event) a single
+    // SQL row can't branch on -- a client 'error' must ALSO log to error_log and auto-file a de-duped
+    // front-end bug (reusing boot/monitor.php's fatal pipe). Handle it in PHP and short-circuit; the
+    // route's INSERT SQL stays the compile-checked contract (route-sql-compiles / route-params-declared).
+    if ($route === 'telemetry.record' && function_exists('congruency_telemetry_record')) {
+        return congruency_telemetry_record($db, $input);
+    }
     $decl = json_decode(((string) ($def['params'] ?? '')) ?: '{}', true);
     if (!is_array($decl)) { $decl = array(); }
 
@@ -106,6 +114,25 @@ function congruency_rest_route($db, $route, $method) {
         echo json_encode(array('route' => $route, 'affected' => $st->rowCount(), 'rowid' => $db->lastInsertId()),
                          JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
     }
+    return true;
+}
+
+/* Front-end telemetry receiver behind ?route=telemetry.record (POST, public). Reads the JSON body
+ * fields congruency_rest_route already merged into $input and hands them to boot/monitor.php's
+ * telemetry ingest, which branches on kind: a client 'error' ALSO logs to error_log and auto-files a
+ * de-duped front-end bug (reusing the v4.118 fatal pipe), while pageview/event just land a
+ * front_telemetry stream row. Emits a small JSON ack. Never throws (the ingest swallows its own
+ * failures) so a beacon can't fatal a page. */
+function congruency_telemetry_record($db, $input) {
+    $kind    = isset($input['kind'])    ? (string) $input['kind']    : 'pageview';
+    $route   = isset($input['route'])   ? (string) $input['route']   : '';
+    $message = isset($input['message']) ? (string) $input['message'] : '';
+    $detail  = isset($input['detail'])  ? (string) $input['detail']  : '';
+    if (function_exists('congruency_telemetry_ingest')) {
+        congruency_telemetry_ingest($kind, $route, $message, $detail, $db, true);
+    }
+    echo json_encode(array('route' => 'telemetry.record', 'ok' => true, 'kind' => $kind),
+                     JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
     return true;
 }
 
