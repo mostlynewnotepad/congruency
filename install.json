@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.103",
+  "version": "4.104",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -12,11 +12,12 @@
     "tooling/congruencey-tests/db-preserve-shadow.py",
     "tooling/congruencey-tests/agents-migration-shadow.py",
     "tooling/congruencey-tests/crank-confinement-shadow.py",
-    "tooling/congruencey-tests/invocator-escape-shadow.py"
+    "tooling/congruencey-tests/invocator-escape-shadow.py",
+    "tooling/congruencey-tests/rest-dispatch-shadow.py"
   ],
   "components": {
-    "congruency": "4.103",
-    "state": "4.103"
+    "congruency": "4.104",
+    "state": "4.104"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
