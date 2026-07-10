@@ -14,6 +14,7 @@ exception (Variant-A), best-effort jazz telemetry.
     python3 checkouts/current/congruency/tools/make_state.py
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -119,7 +120,7 @@ def _snapshot_sqlite(src_path, dst_path):
         src.close()
 
 
-def build_tarball(reg, php, tmp):
+def build_tarball(reg, tmp):
     """Capture THIS crank's state into `tmp` and return (tar_path, tables).
 
     The state IS the big unified database. `source_db` in STATE.json names it (default
@@ -130,29 +131,22 @@ def build_tarball(reg, php, tmp):
     spec = json.load(open(STATE_SPEC)) if os.path.isfile(STATE_SPEC) else {}
     sqlite_tmp = os.path.join(tmp, "congruency.sqlite")
 
+    # State is the REAL live DB and ONLY the real live DB. `source_db` must name it and exist; there
+    # is NO fabricate/installed fallback. Capturing a seed as "state" is exactly how the clobber bug
+    # propagated (a stale seed got re-committed and re-shipped, re-arming every extract site), so we
+    # REFUSE rather than snapshot a guess.
     source_db = spec.get("source_db")
     src_path = os.path.expanduser(source_db) if source_db else None
-    installed = os.path.join(STATE, "congruency.sqlite")       # the currently-installed db
-    if src_path and os.path.isfile(src_path):
-        _snapshot_sqlite(src_path, sqlite_tmp)                  # 1) snapshot the configured source db
-        members = [(sqlite_tmp, "congruency.sqlite")]
-    elif os.path.isfile(installed):
-        # 2) source_db absent -> re-snapshot the db that was INSTALLED into the crank (install the
-        # database on every crank). Never re-fabricate: the installed db is the source of truth.
-        _snapshot_sqlite(installed, sqlite_tmp)
-        members = [(sqlite_tmp, "congruency.sqlite")]
-    else:
-        # 3) last-resort legacy fallback: fabricate from the seed generator (the old stub path)
-        seed_src = os.path.join(reg["__root__"], spec.get("seed", "tooling/congruencey-harness/seed.php"))
-        if not os.path.isfile(seed_src):
-            raise FileNotFoundError("no source_db (%s), no installed db (%s), and seed generator missing: %s"
-                                    % (src_path, installed, seed_src))
-        seed_tmp = os.path.join(tmp, "seed.php")
-        shutil.copy2(seed_src, seed_tmp)
-        r = subprocess.run([php, seed_tmp], cwd=tmp, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0 or not os.path.isfile(sqlite_tmp):
-            raise RuntimeError("seed failed (exit %s): %s" % (r.returncode, (r.stderr or r.stdout).strip()[:400]))
-        members = [(sqlite_tmp, "congruency.sqlite"), (seed_tmp, "seed.php")]
+    if not src_path:
+        raise RuntimeError("STATE.json has no source_db — refusing to mint state. Point source_db at "
+                           "the real live DB (~/bin/config/congruency/congruency.sqlite).")
+    if os.path.islink(src_path) and not os.path.exists(src_path):
+        raise RuntimeError("source_db symlink %s is DANGLING — refusing to snapshot a missing live DB." % src_path)
+    if not os.path.isfile(src_path):
+        raise RuntimeError("source_db %s does not exist — refusing to fabricate/snapshot a seed. The "
+                           "live DB is the sole source of truth." % src_path)
+    _snapshot_sqlite(src_path, sqlite_tmp)                      # WAL-safe read-only backup of the REAL live db
+    members = [(sqlite_tmp, "congruency.sqlite")]
 
     con = sqlite3.connect(sqlite_tmp)
     try:
@@ -178,29 +172,59 @@ def build_tarball(reg, php, tmp):
     return tar_path, tables
 
 
+FORGE_DIR = "/Users/stevenpeterson/code/jazz-forge"
+STATE_ARTIFACT = "congruency-state"    # forge artifact name for the state snapshot
+
+
+def _forge():
+    """The local content-addressed registry as a library (stdlib-only, cwd-independent)."""
+    if FORGE_DIR not in sys.path:
+        sys.path.insert(0, FORGE_DIR)
+    from forge import artifacts
+    return artifacts
+
+
+def _git_head():
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=SOURCE, capture_output=True, text=True)
+        return (r.stdout or "").strip() or None
+    except Exception:      # noqa: BLE001
+        return None
+
+
 def main():
-    ap = argparse.ArgumentParser(description="produce this crank's state as an in-tree database.tar.xz")
-    # State no longer lives on a side branch — it rides IN the version commit (the crank). The old
-    # `state` branch and `state-*` tags are gone; make_state just writes the artifact into the tree,
-    # and mint_crank captures it as part of the version. --version kept only for call-site compat.
-    ap.add_argument("--version", default=None, help="accepted for compatibility; state now rides in the crank")
+    ap = argparse.ArgumentParser(description="publish this crank's state to forge + write state.lock")
+    # State does NOT ride in the git commit anymore: the reproducible snapshot is content-addressed in
+    # forge, and only a small `state.lock` pointer is committed. Keeps cranks lean and, together with
+    # halt-on-absent + explicit restore, makes a seed-over-live clobber structurally impossible.
+    ap.add_argument("--version", default=None, help="crank version (from mint); labels the forge blob")
     a = ap.parse_args()
 
     reg = load_registry()
-    php = find_php(reg)
-    spec = json.load(open(STATE_SPEC)) if os.path.isfile(STATE_SPEC) else {}
-    artifact = os.path.join(reg["__root__"], spec.get("artifact", "checkouts/current/state/database.tar.xz"))
-
+    lock_path = os.path.join(STATE, "state.lock")
     T, _ = telemetry_handles(reg)
     t0 = time.time()
     with tempfile.TemporaryDirectory() as tmp:
-        tar_path, tables = build_tarball(reg, php, tmp)
-        os.makedirs(os.path.dirname(artifact), exist_ok=True)
-        shutil.copy2(tar_path, artifact)           # state rides IN the crank; captured by mint's add -A
-    result = {"version": a.version, "artifact": os.path.relpath(artifact, reg["__root__"]),
-              "artifact_bytes": os.path.getsize(artifact), "tables": tables}
+        tar_path, tables = build_tarball(reg, tmp)                       # WAL-safe snapshot of the REAL live db
+        sha = hashlib.sha256(open(tar_path, "rb").read()).hexdigest()
+        ver = a.version or ("unversioned-%s" % sha[:12])
+        artifacts = _forge()
+        res = artifacts.put(tar_path, name=STATE_ARTIFACT, version=ver, kind="xz",
+                            source_repo="congruency", source_commit=_git_head(), meta={"tables": tables})
+        if res.get("sha256") != sha:
+            raise RuntimeError("forge sha %s != computed %s — refusing to write an inconsistent lock"
+                               % (res.get("sha256"), sha))
+        os.makedirs(STATE, exist_ok=True)
+        lock = {"schema": 1, "forge_name": res["name"], "forge_version": res["version"], "sha256": sha,
+                "size": res.get("size"), "kind": "xz", "member": "congruency.sqlite", "tables": tables,
+                "created": datetime.now().isoformat()}
+        with open(lock_path, "w") as fh:
+            json.dump(lock, fh, indent=2)
+            fh.write("\n")
+    result = {"forge_name": res["name"], "forge_version": res["version"], "sha256": sha,
+              "size": res.get("size"), "lock": os.path.relpath(lock_path, reg["__root__"]), "tables": tables}
     if T:
-        T.emit("make_state", status="ok", ms=(time.time() - t0) * 1000.0, version=a.version)
+        T.emit("make_state", status="ok", ms=(time.time() - t0) * 1000.0, version=res["version"])
     print(json.dumps({"ok": True, **result}, indent=2))
     return 0
 

@@ -10,6 +10,8 @@ __pycache__/
 /tooling/congruencey-harness/php/
 /checkouts/current/state/congruency.sqlite
 /checkouts/current/state/seed.php
+# state DB no longer rides in the commit — it's a content-addressed forge blob pointed at by state.lock
+/checkouts/current/state/database.tar.xz
 /checkouts/current/install.json
 # runtime-regenerated index (written by fixes/boot_www.py on stand-up) — keep it from dirtying the tree:
 /checkouts/current/congruency/fixes/index.json

@@ -241,7 +241,7 @@ def write_component_configs(root, version):
             fh.write("\n")
 
 
-def step_capture(message):
+def step_capture(message, version=None):
     """Capture the patch as the next version — LEAN single-repo path.
 
     commit_release's collect_modules() scans the parent for child repos (root=repo -> "no
@@ -260,7 +260,8 @@ def step_capture(message):
     # to pushing. The ratchet's install.py reads `version-<v>:install.json` for the version +
     # args, so nobody hand-types them and it runs on any machine.
     tags_before = set(git("tag", "-l", "version-*").stdout.split())
-    version = compute_next_version(g, ROOT)                     # python-computed from live tags
+    if version is None:
+        version = compute_next_version(g, ROOT)                 # python-computed from live tags
     tag = "version-%s" % version
     write_install_config(ROOT, version)
     write_component_configs(ROOT, version)                     # per-component config objects
@@ -281,16 +282,27 @@ def step_capture(message):
             "install_config": "install.json"}
 
 
-def step_state():
-    """Produce the crank's state as an in-tree database.tar.xz (no side branch). Runs BEFORE
-    capture so `add -A` folds the db into the version commit — the crank carries its own state."""
-    r = run_py(os.path.join(HERE, "make_state.py"))
+def _next_version():
+    """Compute the next crank version from LIVE tags (the same source step_capture uses). Called once
+    in main() and threaded to make_state + capture so the forge blob label and the tag always agree."""
+    if VERSIONING not in sys.path:
+        sys.path.insert(0, VERSIONING)
+    from gitutil import Git
+    from version_source import compute_next_version
+    g = Git(identity={"name": "ratchet", "email": "ratchet@congruency.local"}, echo=False)
+    return compute_next_version(g, ROOT)
+
+
+def step_state(version):
+    """Publish this crank's state to forge and write the committed `state.lock` pointer — no in-tree
+    db blob. Runs BEFORE capture so `add -A` folds the small pointer into the version commit."""
+    r = run_py(os.path.join(HERE, "make_state.py"), "--version", version)
     if r.returncode != 0:
         raise Unexpected("make_state failed: %s" % (r.stderr or r.stdout).strip()[-400:])
-    artifact = os.path.join(ROOT, "checkouts", "current", "state", "database.tar.xz")
-    if not os.path.isfile(artifact):
-        raise Unexpected("make_state produced no in-tree database.tar.xz at %s" % artifact)
-    return {"artifact": "checkouts/current/state/database.tar.xz", "bytes": os.path.getsize(artifact)}
+    lock = os.path.join(ROOT, "checkouts", "current", "state", "state.lock")
+    if not os.path.isfile(lock):
+        raise Unexpected("make_state produced no state.lock at %s" % lock)
+    return {"lock": "checkouts/current/state/state.lock", "bytes": os.path.getsize(lock)}
 
 
 def step_shadows():
@@ -396,17 +408,18 @@ def main():
     if patch_mode:
         dest = do("inject", lambda: step_inject(a.patch, name))
         do("run patch", lambda: step_run(dest))
+    version = _next_version()      # compute ONCE; thread to make_state + capture (no double-compute race)
     if a.no_state:
-        print("\n== state ==\n   no-state: cranking WITHOUT a database (make_state skipped; no database.tar.xz)")
+        print("\n== state ==\n   no-state: cranking WITHOUT state (make_state skipped; no state.lock)")
     elif a.keep_state:
-        art = os.path.join(ROOT, "checkouts", "current", "state", "database.tar.xz")
-        print("\n== state (in-tree db) ==\n   keep-state: %s"
-              % ("reusing existing database.tar.xz" if os.path.isfile(art)
-                 else "no database.tar.xz present — proceeding without one"))
+        lock = os.path.join(ROOT, "checkouts", "current", "state", "state.lock")
+        print("\n== state (forge pointer) ==\n   keep-state: %s"
+              % ("reusing existing state.lock" if os.path.isfile(lock)
+                 else "no state.lock present — proceeding without one"))
     else:
-        do("state (in-tree db)", step_state)                # produce db BEFORE capture...
+        do("state (forge)", lambda: step_state(version))    # publish to forge + write state.lock BEFORE capture
     do("shadow gate", step_shadows)                         # Mac-native regression gate before landing
-    cap = do("capture (commit + tag)", lambda: step_capture(message))   # ...so it rides in the version commit
+    cap = do("capture (commit + tag)", lambda: step_capture(message, version))
     do("verify", lambda: step_verify(skip=a.no_verify))
 
     if T:

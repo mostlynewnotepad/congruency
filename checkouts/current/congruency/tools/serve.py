@@ -104,17 +104,20 @@ def find_php(reg):
 
 
 def ensure_db():
-    """The state sqlite ships compressed; extract on first boot (artifact is gitignored)."""
+    """Require a PRESENT live DB — never fabricate/extract one.
+
+    `SQLITE` is a symlink to the live DB; extracting a seed here writes THROUGH the symlink and
+    destroys real data — the historical clobber bug. serve.py must never write the state path. If
+    the DB is absent (or the symlink dangles), HALT and tell the operator to restore explicitly."""
+    if os.path.islink(SQLITE) and not os.path.exists(SQLITE):
+        raise FileNotFoundError(
+            "state DB symlink %s is DANGLING (live DB moved/absent). Refusing to serve or reseed — "
+            "restore explicitly: `python3 congruency_up.py restore`." % SQLITE)
     if os.path.isfile(SQLITE):
         return "present"
-    if os.path.isfile(DB_TAR):
-        with tarfile.open(DB_TAR) as t:
-            t.extractall(STATE)
-        if os.path.isfile(SQLITE):
-            return "extracted"
     raise FileNotFoundError(
-        "state DB missing and no database.tar.xz at %s (run "
-        "fixes/install_state_db.py)" % DB_TAR)
+        "no live state DB at %s. Refusing to fabricate a seed (that was the data-loss bug) — "
+        "restore explicitly: `python3 congruency_up.py restore`." % SQLITE)
 
 
 # --------------------------------------------------------------------------- #

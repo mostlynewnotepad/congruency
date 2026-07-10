@@ -366,28 +366,29 @@ def _verify_tables(sqlite_path, expect):
     return sorted(tables)
 
 
-def do_state(version, preserve_db=False):
-    """Materialize state from the db that RIDES IN the version commit (no state branch): the
-    checkout put checkouts/current/state/database.tar.xz in the tree; extract it (gitignored).
+def do_state(version, preserve_db=True):
+    """VERIFY a present live DB — NEVER extract or fabricate one.
 
-    preserve_db (the "remember our db" guard): if a live congruency.sqlite already sits in the
-    state dir, DO NOT re-extract the seed tarball over it — that would wipe every ticket/memory/
-    api_key. Instead verify the existing db and keep it. This mirrors serve.py:ensure_db's
-    idempotency, so `install` is as non-destructive as `up` already is. A truly fresh install
-    (no db present) still extracts the seed."""
+    The live DB is the sole source of truth; `state/congruency.sqlite` is a symlink to it, so any
+    extract here writes THROUGH the symlink and destroys real data — the historical clobber bug.
+    So this never seeds: a present db is verified and kept (regardless of `preserve_db`, retained
+    only for signature compatibility); an ABSENT db HALTS and requires an explicit restore
+    (`congruency_up.py restore`, which pulls the real state from forge). A dangling symlink is
+    treated as unsafe/absent — never a reason to extract through it."""
     expect = set(_state_spec().get("expect_tables", []))
     state_dir = os.path.join(HERE, "checkouts", "current", "state")
     sqlite_path = os.path.join(state_dir, "congruency.sqlite")
-    if preserve_db and os.path.isfile(sqlite_path):
+    if os.path.islink(sqlite_path) and not os.path.exists(sqlite_path):
+        raise RuntimeError(
+            "state DB symlink %s is DANGLING (live DB moved/absent) — refusing to seed. "
+            "Restore explicitly (congruency_up.py restore)." % sqlite_path)
+    if os.path.isfile(sqlite_path):
         tables = _verify_tables(sqlite_path, expect)
-        print("   preserve_db: kept existing live db (%d tables) — seed tarball NOT extracted" % len(tables))
+        print("   state: verified present live db (%d tables) — never re-seeded" % len(tables))
         return {"tables": tables, "preserved": True}
-    tarball = os.path.join(state_dir, "database.tar.xz")
-    if not os.path.isfile(tarball):
-        raise RuntimeError("version %s carries no in-tree database.tar.xz (state rides in the crank)" % version)
-    with tarfile.open(tarball, "r:xz") as t:
-        t.extractall(state_dir, filter="data")
-    return {"tables": _verify_tables(sqlite_path, expect), "preserved": False}
+    raise RuntimeError(
+        "version %s: no live state DB at %s. Refusing to fabricate a seed (that was the data-loss "
+        "bug). Restore the real state explicitly (congruency_up.py restore)." % (version, sqlite_path))
 
 
 def _migrations_dir():
