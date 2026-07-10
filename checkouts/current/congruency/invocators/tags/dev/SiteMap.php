@@ -32,7 +32,7 @@ if (!class_exists("SiteMap")) {
                 // the nav now leads with Pages (all pages) and Tags (all tags).
                 $block = array('invalid' => 1, 'thanks' => 1, 'ticketDone' => 1, 'tagDone' => 1, 'order' => 1,
                                'catalog' => 1, 'about' => 1, 'config' => 1, 'categoryDone' => 1, 'annotateDone' => 1);
-                $label = array('pages' => 'Pages', 'tags' => 'Tags', 'bugs' => 'bug report',
+                $label = array('pages' => 'Pages', 'tags' => 'Tags', 'bugs' => 'Bugs',
                                'source' => 'Source', 'docs' => 'Docs', 'annotations' => 'Annotations',
                                'database' => 'Database', 'graphs' => 'Graphs', 'tree' => 'Source', 'repodocs' => 'Repo Docs', 'api' => 'API', 'search' => 'Search', 'forge' => 'Forge', 'omni' => 'Omni-git');
                 $order = array('pages', 'tags', 'bugs', 'forms', 'tickets', 'graphs', 'tree', 'forge', 'omni', 'memories', 'source', 'docs', 'repodocs', 'api', 'search', 'annotations', 'database');
