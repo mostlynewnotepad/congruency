@@ -86,6 +86,32 @@ if (!class_exists("GraphNode")) {
                     $o = "<ol style='margin:.2rem 0 0 1.1rem;padding:0'>";
                     foreach ($cl as $c) { $o .= "<li>" . self::esc($c) . "</li>"; }
                     return $o . "</ol>";
+                case 'guarantees':
+                    // coverage view: each mandate clause verified by its bound guarantees, or a gap
+                    $cl = $db->query("SELECT seq, clause FROM mandates WHERE ticket_id=" . $id . " ORDER BY seq")
+                             ->fetchAll(PDO::FETCH_ASSOC);
+                    $gz = $db->query("SELECT clause_seq, guarantee FROM guarantees WHERE ticket_id=" . $id . " ORDER BY id")
+                             ->fetchAll(PDO::FETCH_ASSOC);
+                    if (!$gz) { return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>"; }
+                    $by = array();
+                    foreach ($gz as $g) { $k = ($g['clause_seq'] === null) ? 0 : (int)$g['clause_seq']; $by[$k][] = $g['guarantee']; }
+                    $covered = 0;
+                    $rows = "";
+                    foreach ($cl as $c) {
+                        $seq = (int)$c['seq'];
+                        $gs  = isset($by[$seq]) ? $by[$seq] : array();
+                        if ($gs) {
+                            $covered++;
+                            $rows .= "<div>✓ <b>" . self::esc($c['clause']) . "</b>";
+                            foreach ($gs as $g) { $rows .= "<div style='margin-left:1rem;color:#555;font-size:.8rem'>&mdash; " . self::esc($g) . "</div>"; }
+                            $rows .= "</div>";
+                        } else {
+                            $rows .= "<div style='color:#b00020'>✗ <b>UNVERIFIED</b> &mdash; " . self::esc($c['clause']) . "</div>";
+                        }
+                    }
+                    $head = "<div style='font-size:.8rem;color:#555;margin-bottom:.3rem'>" . $covered . "/" . count($cl) . " clauses verified</div>";
+                    if (isset($by[0])) { $rows .= "<div style='margin-top:.4rem;font-size:.75rem;color:#888'>" . count($by[0]) . " guarantee(s) not bound to a clause</div>"; }
+                    return $head . $rows;
                 default:
                     // mandate / manifestations / guarantees / journey / artifacts / children
                     return "<span class='empty'>not yet recorded &mdash; lands with the ticket-class build</span>";
