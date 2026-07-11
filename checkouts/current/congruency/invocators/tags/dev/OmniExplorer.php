@@ -84,7 +84,26 @@ if (!class_exists("OmniExplorer")) {
             if (isset($_GET['path']) && $_GET['path'] !== '') { return $this->by_path($odb, (string) $_GET['path']); }
             if (isset($_GET['repo']) && $_GET['repo'] !== '') { return $this->by_repo($odb, (string) $_GET['repo']); }
             if (isset($_GET['sha'])  && $_GET['sha']  !== '') { return $this->by_sha($odb,  (string) $_GET['sha']); }
+            if (isset($_GET['ext'])  && $_GET['ext']  !== '') { return $this->by_ext($odb,  (string) $_GET['ext']); }
             return $this->overview($odb);
+        }
+
+        // ?ext=<extension> - files carrying one extension across repos (bound :ext), most-copied first.
+        private function by_ext($odb, $ext) {
+            $st = $odb->prepare("SELECT path, COUNT(DISTINCT repo) AS nr FROM occ WHERE ext=:ext GROUP BY path ORDER BY nr DESC, path LIMIT 200");
+            $st->execute(array(':ext' => $ext));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            $out = "<h2>files with extension <code>" . self::esc($ext) . "</code> <a href='?page=omni'>&times;</a></h2>\n";
+            if (!$rows) { return $out . "<p>(no files)</p>\n"; }
+            $out .= "<table class='omni-ext' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= self::th(array('path', 'repos'));
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=omni&path=" . self::esc(urlencode($r['path'])) . "'>" . self::esc($r['path']) . "</a></td>"
+                      . "<td>" . self::esc($r['nr']) . "</td>"
+                      . "</tr>\n";
+            }
+            return $out . "</table>\n";
         }
 
         private static function th($cols) {
@@ -187,7 +206,16 @@ if (!class_exists("OmniExplorer")) {
             foreach ($repos as $rp) {
                 $out .= "<li><a href='?page=omni&repo=" . self::esc(urlencode($rp)) . "'>" . self::esc($rp) . "</a></li>\n";
             }
-            return $out . "</ul>\n";
+            $out .= "</ul>\n";
+            $exts = $odb->query("SELECT ext, COUNT(*) AS n FROM occ WHERE ext IS NOT NULL AND ext<>'' GROUP BY ext ORDER BY n DESC LIMIT 40")->fetchAll(PDO::FETCH_ASSOC);
+            if ($exts) {
+                $out .= "<h2>By extension</h2>\n<ul class='srclist'>\n";
+                foreach ($exts as $e) {
+                    $out .= "<li><a href='?page=omni&ext=" . self::esc(urlencode($e['ext'])) . "'>" . self::esc($e['ext']) . "</a> <span style='color:#888'>" . self::esc($e['n']) . "</span></li>\n";
+                }
+                $out .= "</ul>\n";
+            }
+            return $out;
         }
     }
 }
