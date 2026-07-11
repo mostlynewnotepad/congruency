@@ -104,7 +104,7 @@ if (!class_exists("MemGraph")) {
             $ek = $mdb->query("SELECT kind, COUNT(*) AS n FROM edge GROUP BY kind ORDER BY 2 DESC")->fetchAll(PDO::FETCH_ASSOC);
             if ($ek) {
                 $parts = array();
-                foreach ($ek as $r) { $parts[] = "<strong>" . self::esc($r['n']) . "</strong>&nbsp;" . self::esc($r['kind']); }
+                foreach ($ek as $r) { $parts[] = "<strong>" . self::esc($r['n']) . "</strong>&nbsp;<a href='?page=memgraph&edge=" . self::esc(urlencode($r['kind'])) . "'>" . self::esc($r['kind']) . "</a>"; }
                 $out .= "<p><strong>edges by kind:</strong> " . implode(" &middot; ", $parts) . "</p>\n";
             }
             return $out;
@@ -112,7 +112,27 @@ if (!class_exists("MemGraph")) {
 
         private function body($mdb) {
             if (isset($_GET['node']) && $_GET['node'] !== '') { return $this->by_node($mdb, (string) $_GET['node']); }
+            if (isset($_GET['edge']) && $_GET['edge'] !== '') { return $this->by_edge($mdb, (string) $_GET['edge']); }
             return $this->high_drift($mdb) . $this->near_dupes($mdb) . $this->most_connected($mdb);
+        }
+
+        // ?edge=<kind> - all edges of one kind (bound :edge), strongest weight first; endpoints link to node view.
+        private function by_edge($mdb, $kind) {
+            $out = "<h2>edges of kind <code>" . self::esc($kind) . "</code> <a href='?page=memgraph'>&times;</a></h2>\n";
+            $st = $mdb->prepare("SELECT src, dst, round(weight,4) AS w FROM edge WHERE kind=:edge ORDER BY weight DESC, src LIMIT 200");
+            $st->execute(array(':edge' => $kind));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            if (!$rows) { return $out . "<p>(no edges of this kind)</p>\n"; }
+            $out .= "<table class='memgraph-edge' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= self::th(array('src', 'dst', 'weight'));
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=memgraph&node=" . self::esc(urlencode($r['src'])) . "'>" . self::esc($r['src']) . "</a></td>"
+                      . "<td><a href='?page=memgraph&node=" . self::esc(urlencode($r['dst'])) . "'>" . self::esc($r['dst']) . "</a></td>"
+                      . "<td>" . self::esc($r['w']) . "</td>"
+                      . "</tr>\n";
+            }
+            return $out . "</table>\n";
         }
 
         // ?node=<id> — the node's own row + its outgoing (dst) / incoming (src) edges. :node is bound.
