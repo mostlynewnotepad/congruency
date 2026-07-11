@@ -138,23 +138,25 @@ if (!class_exists("ForgeView")) {
         private function artifacts($fdb) {
             $name = isset($_GET['name']) ? (string) $_GET['name'] : '';
             $artkind = isset($_GET['artkind']) ? (string) $_GET['artkind'] : '';
+            $srcrepo = isset($_GET['srcrepo']) ? (string) $_GET['srcrepo'] : '';
             $sql = "SELECT id, name, version, kind, size, substr(sha256,1,12) AS sha, source_repo, source_commit FROM artifacts";
             $awhere = array();
             $params = array();
             if ($name !== '') { $awhere[] = "name = :name"; $params[':name'] = $name; }
             if ($artkind !== '') { $awhere[] = "kind = :artkind"; $params[':artkind'] = $artkind; }
+            if ($srcrepo !== '') { $awhere[] = "source_repo = :srcrepo"; $params[':srcrepo'] = $srcrepo; }
             if ($awhere) { $sql .= " WHERE " . implode(" AND ", $awhere); }
             $sql .= " ORDER BY id DESC LIMIT 40";
             $st = $fdb->prepare($sql);
             $st->execute($params);
             $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-            $out = "<h2>Artifacts" . (($name !== '' || $artkind !== '') ? " &middot;" . ($name !== '' ? " name " . self::esc($name) : "") . ($artkind !== '' ? " kind " . self::esc($artkind) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
+            $out = "<h2>Artifacts" . (($name !== '' || $artkind !== '' || $srcrepo !== '') ? " &middot;" . ($name !== '' ? " name " . self::esc($name) : "") . ($artkind !== '' ? " kind " . self::esc($artkind) : "") . ($srcrepo !== '' ? " srcrepo " . self::esc($srcrepo) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
             if (!$rows) { return $out . "<p>(no artifacts)</p>\n"; }
             $out .= "<table class='forge-artifacts' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
             $out .= "<tr><th style='text-align:left'>name</th><th style='text-align:left'>version</th><th style='text-align:left'>kind</th><th style='text-align:left'>size</th><th style='text-align:left'>sha256</th><th style='text-align:left'>source</th></tr>\n";
             foreach ($rows as $r) {
-                $src = self::esc($r['source_repo']);
+                $src = "<a href='?page=forge&srcrepo=" . self::esc(urlencode($r['source_repo'])) . "'>" . self::esc($r['source_repo']) . "</a>";
                 if ($r['source_commit'] !== null && $r['source_commit'] !== '') {
                     $src .= " <span style='color:#888'>@ " . self::esc(substr((string) $r['source_commit'], 0, 12)) . "</span>";
                 }
