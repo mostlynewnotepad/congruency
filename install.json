@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.120",
+  "version": "4.121",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -31,11 +31,12 @@
     "tooling/congruencey-tests/shadowforge-view-shadow.py",
     "tooling/congruencey-tests/fatal-monitor-shadow.py",
     "tooling/congruencey-tests/semantic-stream-shadow.py",
-    "tooling/congruencey-tests/front-telemetry-shadow.py"
+    "tooling/congruencey-tests/front-telemetry-shadow.py",
+    "tooling/congruencey-tests/memgraph-view-shadow.py"
   ],
   "components": {
-    "congruency": "4.120",
-    "state": "4.120"
+    "congruency": "4.121",
+    "state": "4.121"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
