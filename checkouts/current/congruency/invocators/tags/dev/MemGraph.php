@@ -98,7 +98,7 @@ if (!class_exists("MemGraph")) {
             $nk = $mdb->query("SELECT kind, COUNT(*) AS n FROM node GROUP BY kind ORDER BY 2 DESC")->fetchAll(PDO::FETCH_ASSOC);
             if ($nk) {
                 $parts = array();
-                foreach ($nk as $r) { $parts[] = "<strong>" . self::esc($r['n']) . "</strong>&nbsp;" . self::esc($r['kind']); }
+                foreach ($nk as $r) { $parts[] = "<strong>" . self::esc($r['n']) . "</strong>&nbsp;<a href='?page=memgraph&nodekind=" . self::esc(urlencode($r['kind'])) . "'>" . self::esc($r['kind']) . "</a>"; }
                 $out .= "<p><strong>nodes by kind:</strong> " . implode(" &middot; ", $parts) . "</p>\n";
             }
             $ek = $mdb->query("SELECT kind, COUNT(*) AS n FROM edge GROUP BY kind ORDER BY 2 DESC")->fetchAll(PDO::FETCH_ASSOC);
@@ -113,7 +113,26 @@ if (!class_exists("MemGraph")) {
         private function body($mdb) {
             if (isset($_GET['node']) && $_GET['node'] !== '') { return $this->by_node($mdb, (string) $_GET['node']); }
             if (isset($_GET['edge']) && $_GET['edge'] !== '') { return $this->by_edge($mdb, (string) $_GET['edge']); }
+            if (isset($_GET['nodekind']) && $_GET['nodekind'] !== '') { return $this->by_nodekind($mdb, (string) $_GET['nodekind']); }
             return $this->high_drift($mdb) . $this->near_dupes($mdb) . $this->most_connected($mdb);
+        }
+
+        // ?nodekind=<kind> - all nodes of one kind (bound :nodekind); each links to its node view.
+        private function by_nodekind($mdb, $kind) {
+            $out = "<h2>nodes of kind <code>" . self::esc($kind) . "</code> <a href='?page=memgraph'>&times;</a></h2>\n";
+            $st = $mdb->prepare("SELECT id, label FROM node WHERE kind=:nodekind ORDER BY id LIMIT 200");
+            $st->execute(array(':nodekind' => $kind));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            if (!$rows) { return $out . "<p>(no nodes of this kind)</p>\n"; }
+            $out .= "<table class='memgraph-nodekind' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= self::th(array('id', 'label'));
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=memgraph&node=" . self::esc(urlencode($r['id'])) . "'>" . self::esc($r['id']) . "</a></td>"
+                      . "<td>" . self::esc($r['label']) . "</td>"
+                      . "</tr>\n";
+            }
+            return $out . "</table>\n";
         }
 
         // ?edge=<kind> - all edges of one kind (bound :edge), strongest weight first; endpoints link to node view.
