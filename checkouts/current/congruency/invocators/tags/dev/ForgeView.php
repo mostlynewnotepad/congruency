@@ -103,22 +103,27 @@ if (!class_exists("ForgeView")) {
 
         private function actions($fdb) {
             $action = isset($_GET['action']) ? (string) $_GET['action'] : '';
-            $sql = "SELECT id, ts, action, target, status, substr(detail,1,80) AS detail FROM actions";
+            $sql = "SELECT id, ts, run_id, action, target, status, substr(detail,1,80) AS detail FROM actions";
+            $run = isset($_GET['run']) ? (string) $_GET['run'] : '';
+            $where = array();
             $params = array();
-            if ($action !== '') { $sql .= " WHERE action = :action"; $params[':action'] = $action; }
+            if ($action !== '') { $where[] = "action = :action"; $params[':action'] = $action; }
+            if ($run !== '') { $where[] = "run_id = :run"; $params[':run'] = $run; }
+            if ($where) { $sql .= " WHERE " . implode(" AND ", $where); }
             $sql .= " ORDER BY id DESC LIMIT 40";
             $st = $fdb->prepare($sql);
             $st->execute($params);
             $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-            $out = "<h2>Recent actions" . ($action !== '' ? " &middot; " . self::esc($action) . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
+            $out = "<h2>Recent actions" . (($action !== '' || $run !== '') ? " &middot;" . ($action !== '' ? " action " . self::esc($action) : "") . ($run !== '' ? " run " . self::esc($run) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
             if (!$rows) { return $out . "<p>(no actions)</p>\n"; }
             $out .= "<table class='forge-actions' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
-            $out .= "<tr><th style='text-align:left'>id</th><th style='text-align:left'>ts</th><th style='text-align:left'>action</th><th style='text-align:left'>target</th><th style='text-align:left'>status</th><th style='text-align:left'>detail</th></tr>\n";
+            $out .= "<tr><th style='text-align:left'>id</th><th style='text-align:left'>ts</th><th style='text-align:left'>run</th><th style='text-align:left'>action</th><th style='text-align:left'>target</th><th style='text-align:left'>status</th><th style='text-align:left'>detail</th></tr>\n";
             foreach ($rows as $r) {
                 $out .= "<tr>"
                       . "<td>" . self::esc($r['id']) . "</td>"
                       . "<td>" . self::esc($r['ts']) . "</td>"
+                      . "<td><a href='?page=forge&run=" . self::esc(urlencode($r['run_id'])) . "'>" . self::esc($r['run_id']) . "</a></td>"
                       . "<td><a href='?page=forge&action=" . self::esc(urlencode($r['action'])) . "'>" . self::esc($r['action']) . "</a></td>"
                       . "<td>" . self::esc($r['target']) . "</td>"
                       . "<td style='color:" . self::status_color($r['status']) . "'>" . self::esc($r['status']) . "</td>"
