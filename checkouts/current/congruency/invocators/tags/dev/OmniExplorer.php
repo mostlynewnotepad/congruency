@@ -85,7 +85,26 @@ if (!class_exists("OmniExplorer")) {
             if (isset($_GET['repo']) && $_GET['repo'] !== '') { return $this->by_repo($odb, (string) $_GET['repo']); }
             if (isset($_GET['sha'])  && $_GET['sha']  !== '') { return $this->by_sha($odb,  (string) $_GET['sha']); }
             if (isset($_GET['ext'])  && $_GET['ext']  !== '') { return $this->by_ext($odb,  (string) $_GET['ext']); }
+            if (isset($_GET['ts'])   && $_GET['ts']   !== '') { return $this->by_ts($odb,   (string) $_GET['ts']); }
             return $this->overview($odb);
+        }
+
+        // ?ts=<snapshot> - every file present at one snapshot timestamp (bound :ts); each links to its file lookup.
+        private function by_ts($odb, $ts) {
+            $st = $odb->prepare("SELECT DISTINCT path, repo FROM occ WHERE ts=:ts ORDER BY repo, path LIMIT 200");
+            $st->execute(array(':ts' => $ts));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            $out = "<h2>files at snapshot <code>" . self::esc($ts) . "</code> <a href='?page=omni'>&times;</a></h2>\n";
+            if (!$rows) { return $out . "<p>(no files)</p>\n"; }
+            $out .= "<table class='omni-ts' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= self::th(array('path', 'repo'));
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=omni&path=" . self::esc(urlencode($r['path'])) . "'>" . self::esc($r['path']) . "</a></td>"
+                      . "<td><a href='?page=omni&repo=" . self::esc(urlencode($r['repo'])) . "'>" . self::esc($r['repo']) . "</a></td>"
+                      . "</tr>\n";
+            }
+            return $out . "</table>\n";
         }
 
         // ?ext=<extension> - files carrying one extension across repos (bound :ext), most-copied first.
@@ -212,6 +231,14 @@ if (!class_exists("OmniExplorer")) {
                 $out .= "<h2>By extension</h2>\n<ul class='srclist'>\n";
                 foreach ($exts as $e) {
                     $out .= "<li><a href='?page=omni&ext=" . self::esc(urlencode($e['ext'])) . "'>" . self::esc($e['ext']) . "</a> <span style='color:#888'>" . self::esc($e['n']) . "</span></li>\n";
+                }
+                $out .= "</ul>\n";
+            }
+            $snaps = $odb->query("SELECT ts, COUNT(DISTINCT repo) AS nr FROM occ WHERE ts IS NOT NULL AND ts<>'' GROUP BY ts ORDER BY ts DESC LIMIT 40")->fetchAll(PDO::FETCH_ASSOC);
+            if ($snaps) {
+                $out .= "<h2>Recent snapshots</h2>\n<ul class='srclist'>\n";
+                foreach ($snaps as $s) {
+                    $out .= "<li><a href='?page=omni&ts=" . self::esc(urlencode($s['ts'])) . "'>" . self::esc($s['ts']) . "</a> <span style='color:#888'>" . self::esc($s['nr']) . " repos</span></li>\n";
                 }
                 $out .= "</ul>\n";
             }
