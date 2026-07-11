@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.128",
+  "version": "4.129",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -39,11 +39,12 @@
     "tooling/congruencey-tests/forge-status-facet-shadow.py",
     "tooling/congruencey-tests/memgraph-nodekind-facet-shadow.py",
     "tooling/congruencey-tests/forge-artkind-facet-shadow.py",
-    "tooling/congruencey-tests/omni-ts-facet-shadow.py"
+    "tooling/congruencey-tests/omni-ts-facet-shadow.py",
+    "tooling/congruencey-tests/shadowforge-repo-breakdown-shadow.py"
   ],
   "components": {
-    "congruency": "4.128",
-    "state": "4.128"
+    "congruency": "4.129",
+    "state": "4.129"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }

@@ -95,6 +95,14 @@ if (!class_exists("ShadowForge")) {
                 }
                 $out .= "<li>by reason: " . implode(" &middot; ", $parts) . "</li>\n";
             }
+            $byrepo = $sdb->query("SELECT repo, COUNT(*) AS n FROM sf_deficit GROUP BY repo ORDER BY n DESC, repo")->fetchAll(PDO::FETCH_ASSOC);
+            if ($byrepo) {
+                $rparts = array();
+                foreach ($byrepo as $r) {
+                    $rparts[] = "<a href='?page=shadowforge&repo=" . self::esc(urlencode($r['repo'])) . "'>" . self::esc($r['repo']) . "</a>&nbsp;" . self::esc($r['n']);
+                }
+                $out .= "<li>by repo: " . implode(" &middot; ", $rparts) . "</li>\n";
+            }
             return $out . "</ul>\n";
         }
 
