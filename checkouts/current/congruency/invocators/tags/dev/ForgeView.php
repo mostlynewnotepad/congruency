@@ -137,15 +137,19 @@ if (!class_exists("ForgeView")) {
 
         private function artifacts($fdb) {
             $name = isset($_GET['name']) ? (string) $_GET['name'] : '';
+            $artkind = isset($_GET['artkind']) ? (string) $_GET['artkind'] : '';
             $sql = "SELECT id, name, version, kind, size, substr(sha256,1,12) AS sha, source_repo, source_commit FROM artifacts";
+            $awhere = array();
             $params = array();
-            if ($name !== '') { $sql .= " WHERE name = :name"; $params[':name'] = $name; }
+            if ($name !== '') { $awhere[] = "name = :name"; $params[':name'] = $name; }
+            if ($artkind !== '') { $awhere[] = "kind = :artkind"; $params[':artkind'] = $artkind; }
+            if ($awhere) { $sql .= " WHERE " . implode(" AND ", $awhere); }
             $sql .= " ORDER BY id DESC LIMIT 40";
             $st = $fdb->prepare($sql);
             $st->execute($params);
             $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-            $out = "<h2>Artifacts" . ($name !== '' ? " &middot; " . self::esc($name) . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
+            $out = "<h2>Artifacts" . (($name !== '' || $artkind !== '') ? " &middot;" . ($name !== '' ? " name " . self::esc($name) : "") . ($artkind !== '' ? " kind " . self::esc($artkind) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
             if (!$rows) { return $out . "<p>(no artifacts)</p>\n"; }
             $out .= "<table class='forge-artifacts' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
             $out .= "<tr><th style='text-align:left'>name</th><th style='text-align:left'>version</th><th style='text-align:left'>kind</th><th style='text-align:left'>size</th><th style='text-align:left'>sha256</th><th style='text-align:left'>source</th></tr>\n";
@@ -157,7 +161,7 @@ if (!class_exists("ForgeView")) {
                 $out .= "<tr>"
                       . "<td><a href='?page=forge&name=" . self::esc(urlencode($r['name'])) . "'>" . self::esc($r['name']) . "</a></td>"
                       . "<td>" . self::esc($r['version']) . "</td>"
-                      . "<td>" . self::esc($r['kind']) . "</td>"
+                      . "<td><a href='?page=forge&artkind=" . self::esc(urlencode($r['kind'])) . "'>" . self::esc($r['kind']) . "</a></td>"
                       . "<td>" . self::esc($r['size']) . "</td>"
                       . "<td><code>" . self::esc($r['sha']) . "</code></td>"
                       . "<td>" . $src . "</td>"
