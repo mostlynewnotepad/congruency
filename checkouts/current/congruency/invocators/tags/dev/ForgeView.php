@@ -87,6 +87,14 @@ if (!class_exists("ForgeView")) {
                 }
                 $out .= "<li>status: " . implode(" &middot; ", $parts) . "</li>\n";
             }
+            $topact = $fdb->query("SELECT action, COUNT(*) AS n FROM actions GROUP BY action ORDER BY n DESC, action LIMIT 12")->fetchAll(PDO::FETCH_ASSOC);
+            if ($topact) {
+                $aparts = array();
+                foreach ($topact as $r) {
+                    $aparts[] = "<a href='?page=forge&action=" . self::esc(urlencode($r['action'])) . "'>" . self::esc($r['action']) . "</a>&nbsp;" . self::esc($r['n']);
+                }
+                $out .= "<li>top actions: " . implode(" &middot; ", $aparts) . "</li>\n";
+            }
             $out .= "</ul>\n";
 
             // the omni corpus / bare archives: archive.register row(s) if present
