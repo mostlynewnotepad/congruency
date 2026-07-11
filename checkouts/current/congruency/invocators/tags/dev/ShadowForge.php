@@ -128,7 +128,9 @@ if (!class_exists("ShadowForge")) {
                 $sel = ((string) $rp === $repo) ? " selected" : "";
                 $out .= "<option value='" . self::esc($rp) . "'" . $sel . ">" . self::esc($rp) . "</option>";
             }
-            $out .= "</select> <button type='submit'>filter</button></form>\n";
+            $ext = isset($_GET['ext']) ? (string) $_GET['ext'] : '';
+            $out .= "</select> ext <input type='text' name='ext' value='" . self::esc($ext) . "' size='6' placeholder='py'>";
+            $out .= " <button type='submit'>filter</button></form>\n";
             return $out;
         }
 
@@ -137,16 +139,21 @@ if (!class_exists("ShadowForge")) {
         private function deficits($sdb) {
             $reason = isset($_GET['reason']) ? (string) $_GET['reason'] : '';
             $repo   = isset($_GET['repo'])   ? (string) $_GET['repo']   : '';
+            $ext    = isset($_GET['ext'])    ? (string) $_GET['ext']    : '';
             $st = $sdb->prepare(
-                "SELECT path, repo, reason, detail FROM sf_deficit
-                 WHERE (COALESCE(:reason,'')='' OR reason=:reason) AND (COALESCE(:repo,'')='' OR repo=:repo)
-                 ORDER BY reason, repo, path LIMIT 300");
-            $st->execute(array(':reason' => $reason, ':repo' => $repo));
+                "SELECT d.path AS path, d.repo AS repo, d.reason AS reason, d.detail AS detail
+                 FROM sf_deficit d LEFT JOIN sf_file f ON f.path = d.path
+                 WHERE (COALESCE(:reason,'')='' OR d.reason=:reason)
+                   AND (COALESCE(:repo,'')='' OR d.repo=:repo)
+                   AND (COALESCE(:ext,'')='' OR f.ext=:ext)
+                 ORDER BY d.reason, d.repo, d.path LIMIT 300");
+            $st->execute(array(':reason' => $reason, ':repo' => $repo, ':ext' => $ext));
             $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
             $facet = array();
             if ($reason !== '') { $facet[] = "reason=" . self::esc($reason); }
             if ($repo   !== '') { $facet[] = "repo=" . self::esc($repo); }
+            if ($ext    !== '') { $facet[] = "ext=" . self::esc($ext); }
             $suffix = $facet ? " &middot; " . implode(" &middot; ", $facet) . " <a href='?page=shadowforge'>&times;</a>" : "";
             $out = "<h2>Deficit backlog" . $suffix . "</h2>\n";
             if (!$rows) { return $out . "<p>(no deficits)</p>\n"; }
