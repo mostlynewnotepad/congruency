@@ -83,7 +83,7 @@ if (!class_exists("ForgeView")) {
             if ($byst) {
                 $parts = array();
                 foreach ($byst as $r) {
-                    $parts[] = "<span style='color:" . self::status_color($r['status']) . "'>" . self::esc($r['status']) . "</span>&nbsp;" . self::esc($r['n']);
+                    $parts[] = "<a href='?page=forge&status=" . self::esc(urlencode($r['status'])) . "'><span style='color:" . self::status_color($r['status']) . "'>" . self::esc($r['status']) . "</span></a>&nbsp;" . self::esc($r['n']);
                 }
                 $out .= "<li>status: " . implode(" &middot; ", $parts) . "</li>\n";
             }
@@ -105,17 +105,19 @@ if (!class_exists("ForgeView")) {
             $action = isset($_GET['action']) ? (string) $_GET['action'] : '';
             $sql = "SELECT id, ts, run_id, action, target, status, substr(detail,1,80) AS detail FROM actions";
             $run = isset($_GET['run']) ? (string) $_GET['run'] : '';
+            $status = isset($_GET['status']) ? (string) $_GET['status'] : '';
             $where = array();
             $params = array();
             if ($action !== '') { $where[] = "action = :action"; $params[':action'] = $action; }
             if ($run !== '') { $where[] = "run_id = :run"; $params[':run'] = $run; }
+            if ($status !== '') { $where[] = "status = :status"; $params[':status'] = $status; }
             if ($where) { $sql .= " WHERE " . implode(" AND ", $where); }
             $sql .= " ORDER BY id DESC LIMIT 40";
             $st = $fdb->prepare($sql);
             $st->execute($params);
             $rows = $st->fetchAll(PDO::FETCH_ASSOC);
 
-            $out = "<h2>Recent actions" . (($action !== '' || $run !== '') ? " &middot;" . ($action !== '' ? " action " . self::esc($action) : "") . ($run !== '' ? " run " . self::esc($run) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
+            $out = "<h2>Recent actions" . (($action !== '' || $run !== '' || $status !== '') ? " &middot;" . ($action !== '' ? " action " . self::esc($action) : "") . ($run !== '' ? " run " . self::esc($run) : "") . ($status !== '' ? " status " . self::esc($status) : "") . " <a href='?page=forge'>&times;</a>" : "") . "</h2>\n";
             if (!$rows) { return $out . "<p>(no actions)</p>\n"; }
             $out .= "<table class='forge-actions' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
             $out .= "<tr><th style='text-align:left'>id</th><th style='text-align:left'>ts</th><th style='text-align:left'>run</th><th style='text-align:left'>action</th><th style='text-align:left'>target</th><th style='text-align:left'>status</th><th style='text-align:left'>detail</th></tr>\n";

@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.124",
+  "version": "4.125",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -35,11 +35,12 @@
     "tooling/congruencey-tests/memgraph-view-shadow.py",
     "tooling/congruencey-tests/forge-run-facet-shadow.py",
     "tooling/congruencey-tests/memgraph-edge-facet-shadow.py",
-    "tooling/congruencey-tests/omni-ext-facet-shadow.py"
+    "tooling/congruencey-tests/omni-ext-facet-shadow.py",
+    "tooling/congruencey-tests/forge-status-facet-shadow.py"
   ],
   "components": {
-    "congruency": "4.124",
-    "state": "4.124"
+    "congruency": "4.125",
+    "state": "4.125"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
