@@ -86,7 +86,26 @@ if (!class_exists("OmniExplorer")) {
             if (isset($_GET['sha'])  && $_GET['sha']  !== '') { return $this->by_sha($odb,  (string) $_GET['sha']); }
             if (isset($_GET['ext'])  && $_GET['ext']  !== '') { return $this->by_ext($odb,  (string) $_GET['ext']); }
             if (isset($_GET['ts'])   && $_GET['ts']   !== '') { return $this->by_ts($odb,   (string) $_GET['ts']); }
+            if (isset($_GET['ref'])  && $_GET['ref']  !== '') { return $this->by_ref($odb,  (string) $_GET['ref']); }
             return $this->overview($odb);
+        }
+
+        // ?ref=<ref> - every file on one ref/branch (bound :ref); each links to its file lookup.
+        private function by_ref($odb, $ref) {
+            $st = $odb->prepare("SELECT DISTINCT path, repo FROM occ WHERE ref=:ref ORDER BY repo, path LIMIT 200");
+            $st->execute(array(':ref' => $ref));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            $out = "<h2>files on ref <code>" . self::esc($ref) . "</code> <a href='?page=omni'>&times;</a></h2>\n";
+            if (!$rows) { return $out . "<p>(no files)</p>\n"; }
+            $out .= "<table class='omni-ref' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= self::th(array('path', 'repo'));
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=omni&path=" . self::esc(urlencode($r['path'])) . "'>" . self::esc($r['path']) . "</a></td>"
+                      . "<td><a href='?page=omni&repo=" . self::esc(urlencode($r['repo'])) . "'>" . self::esc($r['repo']) . "</a></td>"
+                      . "</tr>\n";
+            }
+            return $out . "</table>\n";
         }
 
         // ?ts=<snapshot> - every file present at one snapshot timestamp (bound :ts); each links to its file lookup.
@@ -239,6 +258,14 @@ if (!class_exists("OmniExplorer")) {
                 $out .= "<h2>Recent snapshots</h2>\n<ul class='srclist'>\n";
                 foreach ($snaps as $s) {
                     $out .= "<li><a href='?page=omni&ts=" . self::esc(urlencode($s['ts'])) . "'>" . self::esc($s['ts']) . "</a> <span style='color:#888'>" . self::esc($s['nr']) . " repos</span></li>\n";
+                }
+                $out .= "</ul>\n";
+            }
+            $refs = $odb->query("SELECT ref, COUNT(DISTINCT path) AS nf FROM occ WHERE ref IS NOT NULL AND ref<>'' GROUP BY ref ORDER BY nf DESC LIMIT 40")->fetchAll(PDO::FETCH_ASSOC);
+            if ($refs) {
+                $out .= "<h2>By ref</h2>\n<ul class='srclist'>\n";
+                foreach ($refs as $rf) {
+                    $out .= "<li><a href='?page=omni&ref=" . self::esc(urlencode($rf['ref'])) . "'>" . self::esc($rf['ref']) . "</a> <span style='color:#888'>" . self::esc($rf['nf']) . " files</span></li>\n";
                 }
                 $out .= "</ul>\n";
             }
