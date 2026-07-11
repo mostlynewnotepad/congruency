@@ -54,6 +54,9 @@ if (!class_exists("ShadowForge")) {
                 return "<p class='cy-form-error'>shadow forge not readable at <code>" . self::esc($path) . "</code> &mdash; run forge/shadow_forge.py</p>";
             }
             try {
+                if (isset($_GET['shadow']) && $_GET['shadow'] !== '') {
+                    return $this->summary($sdb) . $this->by_shadow($sdb, (string) $_GET['shadow']);
+                }
                 if (isset($_GET['file']) && $_GET['file'] !== '') {
                     return $this->summary($sdb) . $this->by_file($sdb, (string) $_GET['file']);
                 }
@@ -176,7 +179,25 @@ if (!class_exists("ShadowForge")) {
             $out .= "<table class='shadowforge-covers' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
             $out .= "<tr><th style='text-align:left'>shadow</th><th style='text-align:left'>spec_refs</th></tr>\n";
             foreach ($rows as $r) {
-                $out .= "<tr><td>" . self::esc($r['shadow']) . "</td><td><code>" . self::esc($r['spec_refs']) . "</code></td></tr>\n";
+                $out .= "<tr><td><a href='?page=shadowforge&shadow=" . self::esc(urlencode($r['shadow'])) . "'>" . self::esc($r['shadow']) . "</a></td><td><code>" . self::esc($r['spec_refs']) . "</code></td></tr>\n";
+            }
+            return $out . "</table>\n";
+        }
+
+        // ?shadow=<name> - every file a given shadow-doc covers (bound :shadow); the inverse of ?file=.
+        private function by_shadow($sdb, $shadow) {
+            $out = "<h2>Files covered by <code>" . self::esc($shadow) . "</code> <a href='?page=shadowforge'>&times;</a></h2>\n";
+            $st = $sdb->prepare("SELECT covers, spec_refs FROM sf_shadow WHERE shadow=:shadow ORDER BY covers LIMIT 200");
+            $st->execute(array(':shadow' => $shadow));
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            if (!$rows) { return $out . "<p>(no files covered by this shadow-doc)</p>\n"; }
+            $out .= "<table class='shadowforge-covered' style='border-collapse:collapse;width:100%;font-size:.85rem'>\n";
+            $out .= "<tr><th style='text-align:left'>covers</th><th style='text-align:left'>spec_refs</th></tr>\n";
+            foreach ($rows as $r) {
+                $out .= "<tr>"
+                      . "<td><a href='?page=shadowforge&file=" . self::esc(urlencode($r['covers'])) . "'>" . self::esc($r['covers']) . "</a></td>"
+                      . "<td><code>" . self::esc($r['spec_refs']) . "</code></td>"
+                      . "</tr>\n";
             }
             return $out . "</table>\n";
         }
