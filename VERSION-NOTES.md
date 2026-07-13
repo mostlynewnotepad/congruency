@@ -7,6 +7,35 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.136 — session log: source_db repoint to the new config home (docs crank)
+
+Log of the 2026-07-13 maintenance session, each action in order:
+
+1. **Status survey** — tree at `version-4.134`, tracked-clean; server down (nothing listening
+   on :8899); live DB located at `~/code/installed/jazz-project/config/congruency/congruency.sqlite`
+   (143 MB, WAL recently active), with `pre-4.111`…`pre-4.120` backups alongside it.
+2. **Fault found** — `checkouts/current/state/STATE.json` `source_db` still named the RETIRED
+   `~/bin/config/congruency/congruency.sqlite` (`~/bin` was snapshotted away to `~/bin.snapshot`).
+   By design `make_state`/`restore` HALT on an absent `source_db`, so the next state-producing
+   crank would have refused to mint.
+3. **Repoint** — `source_db` → `~/code/installed/jazz-project/config/congruency/congruency.sqlite`.
+   Verified `make_state.py` expanduser-resolves the `~`, and that the target DB carries all five
+   `expect_tables` (Document_Templates, Documents, Products, forms, orders).
+4. **Stale-path sweep** — updated the two remaining mentions of the old path:
+   `tooling/congruencey-tests/db-preserve-shadow.py:12` (docstring) and
+   `checkouts/current/congruency/tools/make_state.py:142` (the refusal error message, which would
+   have pointed a future failure at the dead location). Grep confirms zero references remain.
+5. **Mint version-4.135** — `mint_crank.py --no-patch --keep-state -m "Repoint STATE.json
+   source_db …"`: shadow gate green (37/37 suites), PHP verify 3 passed / 0 failed,
+   `install.json` re-stamped with the durable fields carried forward; state untouched
+   (`state.lock` for 4.134 reused).
+6. **This crank (4.136)** — this log entry, minted `--no-patch --keep-state`; then `main` plus
+   tags `version-4.135` and `version-4.136` pushed to `origin` (gitlab).
+
+Flagged, NOT fixed: the `forge` and `local` git remotes still point at dangling
+`file:///…/bin/config/forge/remotes/*.git` paths, so `congruency_up.py restore` (which pulls
+state from the forge registry) likely needs the registry's new home wired up before it will work.
+
 ## version-4.092 — native macOS arm64 (no x86 emulation): arch-aware php provisioner
 
 congruency previously required a `linux/amd64` container on Apple Silicon only because
