@@ -9,7 +9,7 @@ and treats a dangling symlink as unsafe. This shadow pins that invariant so re-i
 auto-seed / clobber fails the gate loudly.
 
 Isolation: each check runs in its own tempfile state dir with `setup.HERE` monkeypatched. The real
-live DB (~/bin/config/congruency/congruency.sqlite) and the repo state dir are NEVER touched.
+live DB (~/code/installed/jazz-project/config/congruency/congruency.sqlite) and the repo state dir are NEVER touched.
 """
 import os
 import sqlite3

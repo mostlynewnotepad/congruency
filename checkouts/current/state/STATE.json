@@ -1,6 +1,6 @@
 {
   "_comment": "State = the REAL live DB, and ONLY the real live DB. make_state takes a WAL-safe online-backup snapshot of `source_db` and publishes it to the local content-addressed forge registry (`forge_name`); only a small committed `state.lock` pointer rides in the version commit (no in-tree database.tar.xz). There is NO seed: no fabricate/installed fallback, no auto-extract anywhere. A present live DB is verified and kept; an ABSENT one HALTS and requires an explicit `python3 congruency_up.py restore` (which pulls the real state from forge). This source/state split ends the seed-clobbers-live-DB data-loss bug.",
-  "source_db": "~/bin/config/congruency/congruency.sqlite",
+  "source_db": "~/code/installed/jazz-project/config/congruency/congruency.sqlite",
   "forge_name": "congruency-state",
   "expect_tables": ["Document_Templates", "Documents", "Products", "forms", "orders"]
 }

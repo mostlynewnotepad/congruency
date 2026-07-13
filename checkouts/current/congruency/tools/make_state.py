@@ -139,7 +139,7 @@ def build_tarball(reg, tmp):
     src_path = os.path.expanduser(source_db) if source_db else None
     if not src_path:
         raise RuntimeError("STATE.json has no source_db — refusing to mint state. Point source_db at "
-                           "the real live DB (~/bin/config/congruency/congruency.sqlite).")
+                           "the real live DB (~/code/installed/jazz-project/config/congruency/congruency.sqlite).")
     if os.path.islink(src_path) and not os.path.exists(src_path):
         raise RuntimeError("source_db symlink %s is DANGLING — refusing to snapshot a missing live DB." % src_path)
     if not os.path.isfile(src_path):
