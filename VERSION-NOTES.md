@@ -7,6 +7,28 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.140 — harvest + playbook: memory as an AUDITED ARTIFACT
+
+The answer to "should agents keep memory for N turns?" — no: memory is bounded by SCOPE, not by
+count, and an agent may remember only what it has FILED. Implemented as the harvest/playbook loop:
+
+- **Harvest at settle** — every pair_loop run (pass, and gave-up too: failures teach most) now ends
+  with a `scribe-t<id>` agent filing a `lesson` event: a MECHANICAL distillation composed from the
+  journal (what the adversary caught, what resolved it) — no spawn, so it cannot confabulate.
+  `--harvest N` retro-harvests an already-settled ticket (used on #151).
+- **`0031_harvest_routes.sql`** — ticket.lesson [POST] (lessons are ticket_events, so they inherit
+  0029's append-only triggers) and lessons.recent [GET] (cross-ticket, playbook input).
+- **`--compile-playbook`** — files a documentation ticket embedding ALL harvested lessons and runs
+  THE SAME adversarial pair over it: the playbook is itself an audited, permanent-UID work.
+- **Birth-prompt injection** — when `docs/PLAYBOOK.md` exists, every future worker is told to read
+  it first. The full loop: journal → harvest → lesson → pair-audited playbook → next worker's
+  birth prompt. Stored memory is worthless; READ memory is the only kind that exists.
+- **Proven live: ticket #152** — the compile ran through the pair (writer-t152r1 distilled #151's
+  lesson into four checkable themes; the blind auditor passed it round 1), settled DONE, manifest
+  **UID 2** (`docs/PLAYBOOK.md`, riding in this crank), and #152's own harvest fired — the playbook
+  ticket's lesson feeds the NEXT playbook. Also: pair_loop output is now line-buffered (watchable
+  when redirected).
+
 ## version-4.139 — pair_loop.py: the adversarial pair, harnessed — and its maiden voyage
 
 The agent-pair loop the spec pointed at: a ticket authorizes a worker; a BLIND counterpart

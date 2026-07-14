@@ -123,7 +123,7 @@ Deliverable: write it to %(deliverable)s (create or overwrite that file; touch n
 Ground every claim in the actual repository — read the real migrations, routes, and tools you
 describe; never document intentions as behavior. Your counterpart will adversarially audit this
 with no access to your reasoning, so the artifact must stand alone.
-%(findings)s
+%(playbook)s%(findings)s
 When the deliverable is written, print as your LAST line:
 {"done": true, "ref": "%(deliverable)s", "note": "<one line on what you produced>"}
 """ + GOVERNANCE
@@ -158,6 +158,47 @@ def spawn_claude(prompt, allowed_tools, timeout):
     raise Unexpected("no JSON verdict on the agent's last line; tail: %r" % (r.stdout or "")[-200:])
 
 
+def harvest(tid, history, passed, final_note):
+    """Distill the settled ticket into a LESSON event — memory an agent may keep is memory it filed.
+    Mechanical (no spawn): the lesson is composed from what the record already proves happened."""
+    scribe = "scribe-t%d" % tid
+    rest("agent.register", {"agent_id": scribe, "parent": "pair_loop", "tools": json.dumps(["ticket.lesson"]),
+                            "prompt": "You are %s, the scribe of ticket #%d. Your one duty: distill the "
+                                      "settled ticket's journal into a lesson future workers can apply — "
+                                      "what the adversary caught, what resolved it. You record; you never "
+                                      "author or judge work product." % (scribe, tid)})
+    rest("ticket.assign", {"ticket_id": tid, "agent_id": scribe, "role": "scribe"})
+    if passed and len(history) == 1:
+        note = "clean pass in 1 round — the adversary found nothing. Produced: %s" % (final_note or "(see manifest)")
+    elif passed:
+        forced = "; ".join("round %d findings: %s" % (h["round"], " | ".join(h["findings"])) for h in history if h.get("findings"))
+        note = ("passed in %d rounds. Rework forced by the adversary — %s. Resolution: %s"
+                % (len(history), forced, final_note or "(see manifest)"))
+    else:
+        last = history[-1].get("findings", []) if history else []
+        note = "UNRESOLVED after %d round(s). Standing findings: %s" % (len(history), " | ".join(last) or "(none recorded)")
+    rest("ticket.lesson", {"ticket_id": tid, "agent_id": scribe, "note": note})
+    print("== harvest == lesson filed on #%d by %s" % (tid, scribe))
+
+
+def harvest_settled(tid):
+    """--harvest N: retro-harvest an ALREADY-settled ticket from its journal (no spawns)."""
+    history, final_note, passed = [], "", False
+    for ev in rows("ticket.journal", {"ticket_id": tid}):
+        note = ev.get("note") or ""
+        if ev.get("event") == "progress" and "verdict: fail" in note:
+            fx = note.split("findings:", 1)[1].strip() if "findings:" in note else note
+            history.append({"round": len(history) + 1, "findings": [f.strip() for f in fx.split(";") if f.strip()]})
+        elif ev.get("event") == "progress" and "verdict: pass" in note:
+            passed = True
+            history.append({"round": len(history) + 1, "findings": []})
+        elif ev.get("event") == "progress" and ": produced" in note:
+            final_note = note
+    if not history:
+        raise Unexpected("ticket #%s journal has no pair verdicts to harvest" % tid)
+    harvest(tid, history, passed, final_note)
+
+
 def step(name, fn, *a, **kw):
     t0 = time.time()
     try:
@@ -177,12 +218,34 @@ def main():
     ap.add_argument("--ticket", type=int, help="existing ticket id to run the pair on")
     ap.add_argument("--file", metavar="KIND", help="file a NEW ticket of this kind instead")
     ap.add_argument("--title"), ap.add_argument("--body", default=""), ap.add_argument("--component", default="congruency")
-    ap.add_argument("--deliverable", required=True, help="repo-relative path the worker must produce")
+    ap.add_argument("--deliverable", help="repo-relative path the worker must produce")
     ap.add_argument("--rounds", type=int, default=2, help="max worker rounds before giving up")
     ap.add_argument("--timeout", type=int, default=480, help="seconds per agent spawn")
+    ap.add_argument("--harvest", type=int, metavar="TICKET", help="retro-harvest a settled ticket's lesson, then exit")
+    ap.add_argument("--compile-playbook", action="store_true",
+                    help="file a documentation ticket from ALL harvested lessons and run the pair on it")
+    ap.add_argument("--playbook", default="docs/PLAYBOOK.md",
+                    help="the audited playbook artifact: injected into worker prompts when present; the --compile-playbook deliverable")
     a = ap.parse_args()
     if not API_KEY:
         raise Unexpected("no CONGRUENCY_API_KEY (secrets or env) — token routes need it")
+
+    # ── harvest-only mode: file the lesson and exit ───────────────────────────
+    if a.harvest:
+        harvest_settled(a.harvest)
+        return 0
+
+    # ── compile mode: the playbook is itself a pair-audited deliverable ──────
+    if a.compile_playbook:
+        lessons = rows("lessons.recent", {})
+        if not lessons:
+            raise Unexpected("no harvested lessons yet — settle (or --harvest) some tickets first")
+        a.file, a.deliverable = "documentation", a.playbook
+        a.title = "Compile the playbook: audited lessons from settled tickets"
+        a.body = ("Write %s: the playbook future workers read at birth. Distill the harvested lessons "
+                  "below into actionable guidance — what adversaries catch, how workers avoid it. Group "
+                  "by theme, keep each lesson checkable, cite the source ticket ids. Lessons:\n%s"
+                  % (a.playbook, "\n".join("- [ticket #%s] %s" % (l["ticket_id"], l["note"]) for l in lessons)))
 
     # ── ticket: take it or file it ────────────────────────────────────────────
     if a.file:
@@ -195,6 +258,8 @@ def main():
         tid = a.ticket
     else:
         ap.error("--ticket N or --file KIND required")
+    if not a.deliverable:
+        ap.error("--deliverable is required to run the pair")
 
     with urllib.request.urlopen(CONG + "/rest.php?api=tickets&id=%d" % tid, timeout=15) as r:
         tk = json.loads(r.read().decode()).get("row") or {}
@@ -214,11 +279,15 @@ def main():
         return 3
     print("== brake == no active stops on #%s" % tid)
 
-    findings = []
+    pb = os.path.join(ROOT, a.playbook)
+    pb_line = ("\nBefore starting, read %s — the AUDITED playbook of lessons harvested from prior "
+               "tickets. Apply what applies.\n" % a.playbook) if os.path.isfile(pb) else ""
+
+    findings, history = [], []
     for rnd in range(1, a.rounds + 1):
         worker = "%s-t%dr%d" % (w_role, tid, rnd)
         auditor = "%s-t%dr%d" % (a_role, tid, rnd)
-        ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable)
+        ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable, playbook=pb_line)
 
         # fresh pair, registered + authorized (fresh spawn = cleared memory; trails persist)
         def pair():
@@ -249,6 +318,7 @@ def main():
                                  "steps_remaining": 1 if vres.get("verdict") == "pass" else 3})
 
         if vres.get("verdict") == "pass":
+            history.append({"round": rnd, "findings": []})
             rest("work.record", {"ticket_id": tid, "kind": "doc" if kind == "documentation" else "code",
                                  "ref": wres.get("ref", a.deliverable), "note": wres.get("note", "")})
             rest("process_status", {"id": tid, "status": "DONE"})  # db refuses without the pair
@@ -256,11 +326,14 @@ def main():
                                      "note": "PASS — manifest updated, ticket DONE; pair retired (fresh agents next iteration)",
                                      "steps_remaining": 0})
             print("== settled == ticket #%s DONE (round %d) — deliverable %s carries a permanent UID" % (tid, rnd, wres.get("ref")))
+            harvest(tid, history, True, wres.get("note", ""))
             return 0
         findings = vres.get("findings", ["(none given)"])
+        history.append({"round": rnd, "findings": findings})
         print("== round %d failed == %d finding(s); respawning a FRESH worker" % (rnd, len(findings)))
 
     print("== gave up == %d rounds exhausted on #%s; findings journaled, status stays ACTIVE" % (a.rounds, tid))
+    harvest(tid, history, False, "")
     return 1
 
 
