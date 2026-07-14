@@ -7,6 +7,22 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.143 — dispatch-01 on a schedule (tool + config; ACTIVATION is a human act)
+
+`tools/dispatch_schedule.py` — one python script in the congruency_up idiom (registry-gated,
+no shell scripts): installs a macOS LaunchAgent (`com.congruency.dispatch`) that runs
+`pair_loop.py --dispatch <cap>` every `interval_hours`. Config is the registry.json `dispatch`
+block (6h / cap 3 / 480s timeout). Verbs: install / uninstall / status / run-once (kickstart).
+The plist pins WorkingDirectory to the repo, routes stdout/err to logs/dispatch.log|.err, and
+carries PATH to the `claude` CLI so the pairs can spawn under launchd.
+
+The BOUNDS are the safety case: the per-run cap, the stop-ticket brake pair_loop checks before
+acting, the SQL governance that refuses erasure regardless of who is driving — and the last
+bound is DELIBERATE: the harness permission layer refused to let the session install the
+LaunchAgent itself. Activating an autonomous schedule is a human act:
+
+    python3 checkouts/current/congruency/tools/dispatch_schedule.py install
+
 ## version-4.142 — the bug sweep + dispatch-01 takes the wheel (and correctly declines it)
 
 - **Bug sweep, both round-1 passes with EXECUTING testers** (bug/build pairs now also carry the

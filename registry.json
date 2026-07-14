@@ -14,5 +14,11 @@
       "version": "8.4.23",
       "member": "php"
     }
+  },
+  "dispatch": {
+    "_comment": "dispatch-01 on a schedule (tools/dispatch_schedule.py): route up to `cap` queue tickets every `interval_hours`. Bounds are the safety case: the cap, the stop-ticket brake, and the SQL governance.",
+    "interval_hours": 6,
+    "cap": 3,
+    "timeout": 480
   }
 }
