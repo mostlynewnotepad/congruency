@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.137",
+  "version": "4.138",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -45,11 +45,12 @@
     "tooling/congruencey-tests/forge-srcrepo-facet-shadow.py",
     "tooling/congruencey-tests/omni-ref-facet-shadow.py",
     "tooling/congruencey-tests/forge-top-actions-shadow.py",
-    "tooling/congruencey-tests/shadowforge-ext-facet-shadow.py"
+    "tooling/congruencey-tests/shadowforge-ext-facet-shadow.py",
+    "tooling/congruencey-tests/ticket-authorization-shadow.py"
   ],
   "components": {
-    "congruency": "4.137",
-    "state": "4.137"
+    "congruency": "4.138",
+    "state": "4.138"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
