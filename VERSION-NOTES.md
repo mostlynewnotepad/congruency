@@ -7,6 +7,31 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.139 — pair_loop.py: the adversarial pair, harnessed — and its maiden voyage
+
+The agent-pair loop the spec pointed at: a ticket authorizes a worker; a BLIND counterpart
+validates; fresh spawns each round ARE the memory clear (the record never clears — trails, journal
+and manifest persist; "an agent may remember only what it has filed").
+
+- **`checkouts/current/congruency/tools/pair_loop.py`** — one iteration: BRAKE (ticket.stops:
+  active stop tickets aimed at the target or any 'spawned'-ancestor HALT the run) → PAIR (register
+  a fresh worker+adversary with full birth prompts; ticket.assign; ACTIVE — permitted only because
+  assignment exists) → WORK (`claude -p`, tools limited; artifact + JSON done-line) → VALIDATE
+  (adversary sees ticket + artifact, never the worker's reasoning; JSON verdict) → SETTLE (pass:
+  work.record permanent UID + DONE, which the db refuses without two distinct agents in two
+  distinct roles; fail: findings journaled, FRESH worker respawned with findings in its birth
+  prompt, --rounds cap). Registry-gated (note-for-claude), Variant-A bug reports on unexpected
+  outcomes, ALL writes through the governed token routes — the harness holds no SQL pen.
+- **`migrations/0030_pair_loop_routes.sql`** — ticket.kind (the sanctioned set-once classify;
+  re-kinding still aborts via the identity trigger) and ticket.stops (recursive-CTE stop-state:
+  unreleased stops on the ticket or any ancestor; SELECT-first so the dispatcher returns rows).
+- **Maiden voyage: ticket #151** (documentation, pair writer/readability-auditor) — the network
+  WORKED: round-1 auditor FAILED the doc with two real findings (a documented invocation argparse
+  actually rejects — required --deliverable; a route-order section contradicting the harness flow
+  it documents), each cited to file:line. Fresh writer-t151r2 spawned with the findings, produced
+  the corrected `docs/TICKETS.md`; round-2 auditor passed clean. DONE; manifest **UID 1**; all four
+  agents remain on the crew record. The deliverable (docs/TICKETS.md) rides in this crank.
+
 ## version-4.137 — the ticket IS an authorization: spec kernel + agent roster
 
 Implements the ticket spec (2026-07-13, Steven) as `migrations/0029_ticket_authorization.sql` —
