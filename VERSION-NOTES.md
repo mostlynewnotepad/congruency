@@ -7,6 +7,33 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.141 — the build campaign: kind-aware pairs, four deliverables, a triaged queue
+
+pair_loop grew EXECUTING testers, then the whole open build queue went through it. Every open
+ticket is now settled-with-artifact, closed-with-evidence, kinded for a later sweep, or stopped.
+
+- **Kind-aware pairs** (`pair_loop.py` FOCUS): build/bug pairs get `Bash(python3:*)` — the coder
+  must RUN its own work before reporting done; the tester's stance is "assume it's broken and
+  PROVE it" by executing documented invocations ("a tester that cannot run code is a book
+  reviewer, not an adversary"). Documentation pairs stay read-only.
+- **Ticket #153 → `tools/ticket_status.py` (UID 3)** — one-glance rollup CLI (header/crew/journal/
+  manifest/lessons/'steps remaining: X of Y'). Round-1 tester finding was a systems-level catch:
+  `mode=ro` on a WAL db still CREATES -shm/-wal sidecars (proven before/after in isolation),
+  violating "never creates files" — fixed round 2 with `immutable=1`. The tool reports its own
+  birth ticket cleanly.
+- **Sweep (fresh pair per ticket, all round-1 passes, spot-checked live)**: #147 →
+  `tools/list_versions.py` (UID 4; 91 installable versions discoverable, latest marked); #46 →
+  `tools/tag_test_harness.py` (UID 5; predicted-vs-rendered bets/tests as tickets); #43 →
+  `invocators/tags/dev/CategoryBrowse.php` (UID 6; renders via ?page=tags&tag=CategoryBrowse).
+- **Triage (triage-01, journaled evidence per ticket)**: CLOSED #146/#148/#149/#150 (already
+  solved by the setup.py config object, pushed tags, and state/component.json); kinded #79/#139
+  `bug` (future bug sweep); **stop ticket #154 aimed at #140** (WASM, shelved by its own body) via
+  a 'stops' edge — the brake verifies active_stops=1 and pair_loop HALTS on it.
+- **Playbook v2 (ticket #155, UID 7)** — recompiled from ALL six harvested lessons; every future
+  worker is now born knowing the WAL/immutable=1 catch and the standalone-artifact discipline.
+- Journal accounting: tickets #43/#46/#147/#153/#155 carry full pair provenance (crew, verdicts,
+  lessons); the state db's stray committed -wal/-shm sidecars are dropped from the tree.
+
 ## version-4.140 — harvest + playbook: memory as an AUDITED ARTIFACT
 
 The answer to "should agents keep memory for N turns?" — no: memory is bounded by SCOPE, not by

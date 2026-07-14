@@ -120,9 +120,8 @@ TICKET: %(title)s
 %(body)s
 
 Deliverable: write it to %(deliverable)s (create or overwrite that file; touch nothing else).
-Ground every claim in the actual repository — read the real migrations, routes, and tools you
-describe; never document intentions as behavior. Your counterpart will adversarially audit this
-with no access to your reasoning, so the artifact must stand alone.
+%(worker_focus)s Your counterpart will adversarially audit this with no access to your
+reasoning, so the artifact must stand alone.
 %(playbook)s%(findings)s
 When the deliverable is written, print as your LAST line:
 {"done": true, "ref": "%(deliverable)s", "note": "<one line on what you produced>"}
@@ -134,12 +133,37 @@ TICKET: %(title)s
 %(body)s
 
 The worker produced %(deliverable)s. You did NOT see the worker's reasoning — judge the artifact
-alone, as a hostile newcomer: no context, no charity. Verify its claims against the actual
-repository (read the migrations/routes/tools it cites). Findings are: claims that don't match the
-code, steps that can't be executed as written, terms undefined at first use, anything a newcomer
-must read twice. Nitpicks are not findings. Print as your LAST line:
+alone: no context, no charity. %(audit_focus)s Nitpicks are not findings. Print as your LAST line:
 {"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}
 """ + GOVERNANCE
+
+
+# per-kind focus: what the worker optimizes for, how the adversary attacks, and each side's tools.
+# build/bug pairs EXECUTE (a tester that cannot run code is a book reviewer, not an adversary).
+FOCUS = {
+    "documentation": {
+        "worker_focus": "Ground every claim in the actual repository — read the real code you "
+                        "describe; never document intentions as behavior.",
+        "audit_focus": "Read as a hostile newcomer and verify every claim against the actual "
+                       "repository (read the migrations/routes/tools it cites). Findings are: claims "
+                       "that don't match the code, steps that can't be executed as written, terms "
+                       "undefined at first use, anything a newcomer must read twice.",
+        "worker_tools": "Read,Grep,Glob,Write,Edit",
+        "auditor_tools": "Read,Grep,Glob",
+    },
+    "build": {
+        "worker_focus": "Produce working code that meets the ticket's required behavior exactly; "
+                        "mirror the repo's established patterns; RUN your own work before reporting "
+                        "done (python3 is allowed).",
+        "audit_focus": "Assume the code is broken and try to PROVE it: execute its documented "
+                       "invocations (python3 is allowed), feed edge cases, and compare ACTUAL "
+                       "behavior to the ticket's required behavior, point by point. Findings are: "
+                       "requirements not met, crashes, wrong output, side effects the ticket forbids.",
+        "worker_tools": "Read,Grep,Glob,Write,Edit,Bash(python3:*)",
+        "auditor_tools": "Read,Grep,Glob,Bash(python3:*)",
+    },
+}
+FOCUS["bug"] = FOCUS["build"]
 
 
 def spawn_claude(prompt, allowed_tools, timeout):
@@ -287,7 +311,9 @@ def main():
     for rnd in range(1, a.rounds + 1):
         worker = "%s-t%dr%d" % (w_role, tid, rnd)
         auditor = "%s-t%dr%d" % (a_role, tid, rnd)
-        ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable, playbook=pb_line)
+        focus = FOCUS.get(kind, FOCUS["documentation"])
+        ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable, playbook=pb_line,
+                   worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"])
 
         # fresh pair, registered + authorized (fresh spawn = cleared memory; trails persist)
         def pair():
@@ -303,7 +329,7 @@ def main():
 
         fx = "\nPrior adversary findings to address:\n- " + "\n- ".join(findings) + "\n" if findings else ""
         wp = WORKER_PROMPT % {**ctx, "agent": worker, "role": w_role, "findings": fx}
-        wres = step("work: %s" % worker, spawn_claude, wp, "Read,Grep,Glob,Write,Edit", a.timeout)
+        wres = step("work: %s" % worker, spawn_claude, wp, focus["worker_tools"], a.timeout)
         if not wres.get("done"):
             raise Unexpected("worker did not report done: %s" % wres)
         rest("ticket.progress", {"ticket_id": tid, "agent_id": worker,
@@ -311,7 +337,7 @@ def main():
                                  "steps_remaining": 2})
 
         aprompt = AUDITOR_PROMPT % {**ctx, "agent": auditor, "role": a_role}
-        vres = step("validate: %s" % auditor, spawn_claude, aprompt, "Read,Grep,Glob", a.timeout)
+        vres = step("validate: %s" % auditor, spawn_claude, aprompt, focus["auditor_tools"], a.timeout)
         rest("ticket.progress", {"ticket_id": tid, "agent_id": auditor,
                                  "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
                                         ("; findings: " + "; ".join(vres.get("findings", []))) if vres.get("findings") else ""),
