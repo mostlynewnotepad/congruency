@@ -7,6 +7,23 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.145 — tag_selfcheck.py: the system inspects its own assets (ticket #159)
+
+The answer to the twice-seen pattern (tags referencing disk content no test exercises — the forge
+repaths, the empty RepoDocs): `tools/tag_selfcheck.py`, built by its own pair, UID'd on #159.
+
+- Enumerates every tag under invocators/tags/dev and extracts THREE dependency classes: external
+  sqlite paths (the getenv-with-default pattern, both sides parsed), CONGRUENCY_SQLITE tables its
+  SQL reads, and db-stored disk paths (every repos.forge_remote checked on disk — all 263).
+- Verifies each: files exist and open as sqlite read-only with immutable=1 (the playbook's WAL
+  lesson, applied); tables present; ingestion-fed tables that are EMPTY are WARN (named per tag),
+  not failures. Every tag rendered standalone over HTTP; any PHP Fatal/Warning is a FAIL.
+- Live maiden run: all OK, exit 0, with exactly the expected WARNs — repo_docs empty, flagged for
+  RepoDocs AND SemanticSearch (the second one unprompted; the harness found a dependent the spec
+  didn't name).
+- `--file-tickets`: FAILs become de-duped bug tickets via the governed REST surface — wire this
+  into the dispatch schedule and asset rot becomes a queued ticket instead of a browser surprise.
+
 ## version-4.144 — the views catch up with reality: repaths, a rebuilt TicketList, resumable pairs
 
 - **Forge config home repath** (tickets #157/#158, repair-01, closed with journaled evidence):

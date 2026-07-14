@@ -1,6 +1,6 @@
 {
   "component": "ratchet",
-  "version": "4.144",
+  "version": "4.145",
   "no_verify": false,
   "return_to_main": false,
   "host": "0.0.0.0",
@@ -49,8 +49,8 @@
     "tooling/congruencey-tests/ticket-authorization-shadow.py"
   ],
   "components": {
-    "congruency": "4.144",
-    "state": "4.144"
+    "congruency": "4.145",
+    "state": "4.145"
   },
   "generated_by": "mint_crank.py (instrumentation)"
 }
