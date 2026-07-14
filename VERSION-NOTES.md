@@ -7,6 +7,40 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.137 — the ticket IS an authorization: spec kernel + agent roster
+
+Implements the ticket spec (2026-07-13, Steven) as `migrations/0029_ticket_authorization.sql` —
+one node type (ticket), one append-only journal, typed edges, permanent UIDs, projections for
+state, and SQL triggers refusing the rest. Directly answers the erased-progress problem: the
+dispatch agent deleted ledger rows because "never delete" lived in a docstring; it now lives in
+the database (21 id-gaps in the config db, 11 in the serving db, remain as evidence).
+
+- **Kinds + pairs**: `ticket_kinds` — pair kinds (build, bug, documentation, bet) name a worker
+  and an adversary (coder/tester, writer/readability-auditor, claimant/adjudicator); solo kinds
+  (test, rfc-investigation, audit, design, spec) where the adversary IS the work or the output is
+  a spec. `stop`/`start` are kinds too: control is made of tickets ('stops'/'starts' edges).
+- **Lifecycle as data**: `ticket_lifecycles` (versioned) — enumerable steps per kind, so
+  `steps_remaining` is countable and a parent's distance-to-goal is a rollup, not a meeting.
+- **Journal**: `ticket_events` — attributed, dated progress reports; status changes auto-journal
+  via trigger; UPDATE/DELETE refused.
+- **Manifest**: `ticket_works` — every authorized item gets a mechanical, PERMANENT uid;
+  UPDATE/DELETE refused.
+- **Authorization**: `ticket_agents` — only REGISTERED agents (0001 registry) can be assigned;
+  ACTIVE requires an agent; pair-kind DONE requires two DISTINCT agents in two DISTINCT roles.
+  Existing crankd flows untouched (status/approval_sig stay mutable; guards bind to new statuses).
+- **Routes**: ticket.assign / ticket.crew / ticket.progress / ticket.journal / work.record /
+  ticket.manifest / kind.roster / lifecycle.steps / agent.prompt; agent.roster's documented
+  "omit n for all" contract FIXED (`LIMIT COALESCE(:n,-1)` — omitted params bind NULL).
+- **Shadow gate**: `ticket-authorization-shadow.py` (20/20) pins additive-ness, every refusal,
+  the auto-journal, pair completion, and the roster fix; added to `install.json` shadows.
+- **Applied to BOTH live dbs** (serving db caught up 0002→0029 — it tracked only 0001; config db
+  +0029). **Agent roster registered via the live agent.register route** with FULL birth prompts
+  (the prompt column is unbounded TEXT; roster truncates to 160 for display; agent.prompt returns
+  it whole): dispatch-01 and its spawns coder-01/tester-01 (coding pair), writer-01/reader-01
+  (documentation pair), researcher-01 (rfc→spec), scribe-01 (progress metadata) — mirrored into
+  the config db (roster there: 12 with 5 pre-existing).
+- Verified live: DELETE refused on both dbs; roster/prompt/kind/lifecycle routes serve.
+
 ## version-4.136 — session log: source_db repoint to the new config home (docs crank)
 
 Log of the 2026-07-13 maintenance session, each action in order:
