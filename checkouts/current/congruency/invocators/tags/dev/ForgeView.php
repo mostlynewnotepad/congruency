@@ -5,12 +5,12 @@ Congruency is free software, licensed under the GNU GPLv2 or later.
 See the LICENSE file in the project root for full license terms.
 */
 /*
- * ForgeView — congruency reflects the LOCAL forge store (~/bin/config/forge/forge.db), a SEPARATE
+ * ForgeView — congruency reflects the LOCAL forge store (~/code/installed/jazz-project/config/forge/forge.db), a SEPARATE
  * sqlite database from CONGRUENCY_SQLITE. A read-only reflection of forge's own append-only actions
  * journal + content-addressed artifacts registry + bare remotes/archives.
  *
  * Invoked as <<<ForgeView>>> on ?page=forge. Data source: forge.db, resolved from
- * getenv('FORGE_DB') ?: $HOME/bin/config/forge/forge.db, opened through a SECOND PDO handle with
+ * getenv('FORGE_DB') ?: $HOME/code/installed/jazz-project/config/forge/forge.db, opened through a SECOND PDO handle with
  * `PRAGMA query_only=1` so the reflection can NEVER mutate forge. If the db is absent/unreadable the
  * page degrades gracefully ("forge db not found at <path>"), it never crashes the page.
  *   ?page=forge                 -> summary + recent actions + artifacts
@@ -31,7 +31,7 @@ if (!class_exists("ForgeView")) {
         private static function forge_path() {
             $p = getenv('FORGE_DB');
             if ($p !== false && $p !== '') { return $p; }
-            return getenv('HOME') . '/bin/config/forge/forge.db';
+            return getenv('HOME') . '/code/installed/jazz-project/config/forge/forge.db';
         }
 
         public function get_document() {

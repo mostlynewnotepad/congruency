@@ -6,13 +6,13 @@ See the LICENSE file in the project root for full license terms.
 */
 /*
  * ShadowForge — congruency reflects the SHADOW FORGE index
- * (~/bin/config/forge/shadow_forge/shadow_index.db), a SEPARATE sqlite database from
+ * (~/code/installed/jazz-project/config/forge/shadow_forge/shadow_index.db), a SEPARATE sqlite database from
  * CONGRUENCY_SQLITE, built by jazz-forge's forge/shadow_forge.py (RFC-0030). A read-only reflection
  * of per-file test/spec coverage over our actively-developed code, and the DEFICIT backlog: files
  * that lack a test and/or a spec citation ("learn the deficits within our specifications").
  *
  * Invoked as <<<ShadowForge>>> on ?page=shadowforge. Data source: shadow_index.db, resolved from
- * getenv('SHADOW_FORGE_DB') ?: $HOME/bin/config/forge/shadow_forge/shadow_index.db, opened through a
+ * getenv('SHADOW_FORGE_DB') ?: $HOME/code/installed/jazz-project/config/forge/shadow_forge/shadow_index.db, opened through a
  * SECOND PDO handle with `PRAGMA query_only=1` so the reflection can NEVER mutate the shadow index.
  * Absent/unreadable -> the page degrades gracefully ("shadow forge not built yet at <path>"), it
  * never crashes the page.
@@ -38,7 +38,7 @@ if (!class_exists("ShadowForge")) {
         private static function shadow_path() {
             $p = getenv('SHADOW_FORGE_DB');
             if ($p !== false && $p !== '') { return $p; }
-            return getenv('HOME') . '/bin/config/forge/shadow_forge/shadow_index.db';
+            return getenv('HOME') . '/code/installed/jazz-project/config/forge/shadow_forge/shadow_index.db';
         }
 
         public function get_document() {

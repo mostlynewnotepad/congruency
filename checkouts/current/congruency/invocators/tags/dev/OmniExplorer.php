@@ -5,13 +5,13 @@ Congruency is free software, licensed under the GNU GPLv2 or later.
 See the LICENSE file in the project root for full license terms.
 */
 /*
- * OmniExplorer — congruency reflects the omni-git INDEX (~/bin/config/forge/omni_index.db), a
+ * OmniExplorer — congruency reflects the omni-git INDEX (~/code/installed/jazz-project/config/forge/omni_index.db), a
  * SEPARATE sqlite database from CONGRUENCY_SQLITE, built by jazz-forge's omni_index.py. It answers
  * "each file maps to one or more repositories at different times": occ holds one row per (blob,path)
  * OCCURRENCE across every snapshot, so a single path fans out to many (repo,ts) pairs.
  *
  * Invoked as <<<OmniExplorer>>> on ?page=omni. Data source: omni_index.db, resolved from
- * getenv('OMNI_INDEX_DB') ?: $HOME/bin/config/forge/omni_index.db, opened through a SECOND PDO
+ * getenv('OMNI_INDEX_DB') ?: $HOME/code/installed/jazz-project/config/forge/omni_index.db, opened through a SECOND PDO
  * handle with `PRAGMA query_only=1` so the reflection can NEVER mutate the index. Absent/unreadable
  * -> the page degrades gracefully ("omni index not found at <path>"), it never crashes the page.
  *   ?page=omni                 -> most widely-copied files + repos
@@ -33,7 +33,7 @@ if (!class_exists("OmniExplorer")) {
         private static function omni_path() {
             $p = getenv('OMNI_INDEX_DB');
             if ($p !== false && $p !== '') { return $p; }
-            return getenv('HOME') . '/bin/config/forge/omni_index.db';
+            return getenv('HOME') . '/code/installed/jazz-project/config/forge/omni_index.db';
         }
 
         public function get_document() {

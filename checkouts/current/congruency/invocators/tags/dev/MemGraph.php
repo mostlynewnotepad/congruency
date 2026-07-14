@@ -6,7 +6,7 @@ See the LICENSE file in the project root for full license terms.
 */
 /*
  * MemGraph — congruency reflects the RFC-0031 memory-and-spec graph
- * (~/bin/config/forge/mem_graph.db), a SEPARATE sqlite database from CONGRUENCY_SQLITE, built by
+ * (~/code/installed/jazz-project/config/forge/mem_graph.db), a SEPARATE sqlite database from CONGRUENCY_SQLITE, built by
  * jazz-forge's forge/mem_graph.py. It is the property graph that unifies the omni corpus, spec-drift,
  * the memory timeline, the shadow-forge, and semantic near-duplicates:
  *   node(id, kind, label, attrs, ts)      -- kinds: file/path/blob/snap/mem/event/shadow
@@ -16,7 +16,7 @@ See the LICENSE file in the project root for full license terms.
  *   meta(built_at, n_nodes, n_edges, sources) -- freshness stamp
  *
  * Invoked as <<<MemGraph>>> on ?page=memgraph. Data source: mem_graph.db, resolved from
- * getenv('MEM_GRAPH_DB') ?: $HOME/bin/config/forge/mem_graph.db, opened through a SECOND PDO handle
+ * getenv('MEM_GRAPH_DB') ?: $HOME/code/installed/jazz-project/config/forge/mem_graph.db, opened through a SECOND PDO handle
  * with `PRAGMA query_only=1` so the reflection can NEVER mutate the graph. Absent/unreadable -> the
  * page degrades gracefully ("memory graph not built yet at <path>"), it never crashes the page.
  *   ?page=memgraph            -> summary + high-drift + near-duplicates + most-connected nodes
@@ -38,7 +38,7 @@ if (!class_exists("MemGraph")) {
         private static function mem_path() {
             $p = getenv('MEM_GRAPH_DB');
             if ($p !== false && $p !== '') { return $p; }
-            return getenv('HOME') . '/bin/config/forge/mem_graph.db';
+            return getenv('HOME') . '/code/installed/jazz-project/config/forge/mem_graph.db';
         }
 
         public function get_document() {

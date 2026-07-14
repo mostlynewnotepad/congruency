@@ -7,6 +7,27 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.144 — the views catch up with reality: repaths, a rebuilt TicketList, resumable pairs
+
+- **Forge config home repath** (tickets #157/#158, repair-01, closed with journaled evidence):
+  source tree was dead ("No repos registered") and Omni-git pointed at the retired
+  `~/bin/config/forge`. Defaults in OmniExplorer/ForgeView/ShadowForge/MemGraph.php now resolve to
+  the canonical `~/code/installed/jazz-project/config/forge` (env overrides unchanged); **263
+  repos** re-registered from the canonical remotes (real HEADs, both live dbs); the interim
+  remotes copy removed (#158 supersedes-edge → #157). All five forge-backed pages verified
+  serving live data. En route: the config db's "unable to open (14)" was the #153 lesson again —
+  WAL sidecars checkpointed away + `mode=ro`; `immutable=1` is the answer, now twice-learned.
+- **TicketList rebuilt through its own machinery** (ticket #156, UID'd): the tickets view now
+  renders the authorization model — kind, crew roles, 'X of Y' lifecycle progress, works/lessons
+  counts, an explicit `Stopped` badge from the unreleased-stop edge logic, ACTIVE-first grouping,
+  muted settled rows, htmlspecialchars on EVERY value (titles contain literal <<<Tag>>> syntax).
+- **Resumable pairs**: `0033_assign_idempotent.sql` — ticket.assign is INSERT OR IGNORE (a crashed
+  run's re-assign was a PK-violation 500 that killed the retry; now a no-op — append-only
+  semantics intact). Spawn timeouts are a graceful ROUND OUTCOME (journal + Variant-A), not a
+  harness crash; heavier tickets take --timeout (156 needed 900s).
+- In flight: ticket #159, the tag-asset SELF-CHECK harness (every tag's disk/db dependencies
+  verified ongoing; failures file de-duped bug tickets) — next crank.
+
 ## version-4.143 — dispatch-01 on a schedule (tool + config; ACTIVATION is a human act)
 
 `tools/dispatch_schedule.py` — one python script in the congruency_up idiom (registry-gated,

@@ -169,8 +169,12 @@ FOCUS["bug"] = FOCUS["build"]
 
 def spawn_claude(prompt, allowed_tools, timeout):
     """One fresh-context agent run. Fresh spawn = clean memory; the db keeps the durable trail."""
-    r = subprocess.run(["claude", "-p", prompt, "--allowedTools", allowed_tools],
-                       cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(["claude", "-p", prompt, "--allowedTools", allowed_tools],
+                           cwd=ROOT, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # a spawn overrunning its budget is a ROUND OUTCOME, not a harness crash — journal + bug-report
+        raise Unexpected("agent spawn exceeded its %ss budget (raise --timeout for heavier tickets)" % timeout)
     if r.returncode != 0:
         raise Unexpected("claude exited %s: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
     for line in reversed((r.stdout or "").strip().splitlines()):
