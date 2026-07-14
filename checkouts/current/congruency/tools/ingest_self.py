@@ -118,16 +118,35 @@ def ls_tree(ref):
 
 
 def blob_body(h):
-    # Read the RAW blob bytes -- NOT via git() (text=True), which does universal-newline translation and would
-    # strip \r, mutating the content so it no longer hashes to its git blob id. Decode losslessly so the stored
-    # body is byte-exact and git_blob_sha(body) == h (content-addressing stays sound; db_verify.py checks it).
+    """Return (body, nbytes): git blob `h` decoded losslessly, and its TRUE raw byte length.
+
+    Read the RAW blob bytes -- NOT via git() (text=True), whose universal-newline translation strips
+    \\r and would mutate the content so it no longer hashes to its git blob id.
+
+    A valid UTF-8 blob decodes so that body.encode("utf-8") == the raw bytes; hence git_blob_sha(body)
+    == h and db_verify.py's content-address check passes. Every in-scope file today is UTF-8 text, so
+    this is the path they all take -- nothing about their storage changes.
+
+    A non-utf8 / binary blob decodes latin-1 (ISO-8859-1) instead of the old errors="replace". latin-1
+    is a total byte<->codepoint bijection (0x00..0xFF <-> U+0000..U+00FF), so the exact bytes survive
+    and are recoverable via body.encode("latin-1") -- where "replace" discarded them irreversibly
+    (mapping every bad byte to U+FFFD). sqlite stores such a body verbatim, embedded NUL included. The
+    git blob id is a hash of the raw bytes re-encoded strict UTF-8, so a genuinely non-utf8 body cannot
+    match that specific check without editing db_verify.py; latin-1's job is FIDELITY -- keep the bytes
+    intact for later recovery/rehash if scope ever widens past text -- not to spoof that hash.
+
+    nbytes is the raw blob length regardless of codec, so the stored `bytes` column is the file's true
+    size, not a re-encoded approximation.
+    """
     r = subprocess.run(["git", "cat-file", "blob", h], cwd=ROOT, capture_output=True)
     if r.returncode != 0:
-        return ""
+        return "", 0
+    raw = r.stdout
     try:
-        return r.stdout.decode("utf-8")
+        body = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return r.stdout.decode("utf-8", "replace")
+        body = raw.decode("latin-1")   # lossless: byte-exact, recoverable via body.encode("latin-1")
+    return body, len(raw)
 
 
 # ------------------------------------------------------------------ classify / write
@@ -150,9 +169,8 @@ def have_blob(db, domain, h):
     return db.execute("SELECT 1 FROM %s WHERE hash=?" % tbl, (h,)).fetchone() is not None
 
 
-def store_blob(db, domain, h, path, body):
+def store_blob(db, domain, h, path, body, nbytes):
     lang = LANG.get(os.path.splitext(path)[1], "text")
-    nbytes = len(body.encode("utf-8", "replace"))
     if domain == "code":
         db.execute("INSERT OR IGNORE INTO code_blobs(hash,lang,bytes,body) VALUES(?,?,?,?)", (h, lang, nbytes, body))
     else:
@@ -174,7 +192,8 @@ def ingest_ref(db, ref, ts, main_extras=True):
         if not dom:
             continue
         if not have_blob(db, dom, h):
-            store_blob(db, dom, h, path, blob_body(h))
+            body, nbytes = blob_body(h)
+            store_blob(db, dom, h, path, body, nbytes)
         add_ref(db, dom, h, path, sha, ts)
         seen.append((dom, path, h, sha))
     if main_extras:
@@ -185,7 +204,8 @@ def ingest_ref(db, ref, ts, main_extras=True):
             if r.returncode == 0 and len(parts) >= 3 and parts[1] == "blob":
                 h, path = parts[2], "main:" + name
                 if not have_blob(db, "code", h):
-                    store_blob(db, "code", h, path, blob_body(h))
+                    body, nbytes = blob_body(h)
+                    store_blob(db, "code", h, path, body, nbytes)
                 add_ref(db, "code", h, path, main_sha, ts)
                 seen.append(("code", path, h, main_sha))
     return seen

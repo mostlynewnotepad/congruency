@@ -154,13 +154,14 @@ FOCUS = {
     "build": {
         "worker_focus": "Produce working code that meets the ticket's required behavior exactly; "
                         "mirror the repo's established patterns; RUN your own work before reporting "
-                        "done (python3 is allowed).",
+                        "done (python3 and the repo php at tooling/congruencey-harness/php/php are allowed).",
         "audit_focus": "Assume the code is broken and try to PROVE it: execute its documented "
-                       "invocations (python3 is allowed), feed edge cases, and compare ACTUAL "
-                       "behavior to the ticket's required behavior, point by point. Findings are: "
-                       "requirements not met, crashes, wrong output, side effects the ticket forbids.",
-        "worker_tools": "Read,Grep,Glob,Write,Edit,Bash(python3:*)",
-        "auditor_tools": "Read,Grep,Glob,Bash(python3:*)",
+                       "invocations (python3 and the repo php at tooling/congruencey-harness/php/php "
+                       "are allowed), feed edge cases, and compare ACTUAL behavior to the ticket's "
+                       "required behavior, point by point. Findings are: requirements not met, "
+                       "crashes, wrong output, side effects the ticket forbids.",
+        "worker_tools": "Read,Grep,Glob,Write,Edit,Bash(python3:*),Bash(tooling/congruencey-harness/php/php:*)",
+        "auditor_tools": "Read,Grep,Glob,Bash(python3:*),Bash(tooling/congruencey-harness/php/php:*)",
     },
 }
 FOCUS["bug"] = FOCUS["build"]
@@ -180,6 +181,67 @@ def spawn_claude(prompt, allowed_tools, timeout):
             except ValueError:
                 continue
     raise Unexpected("no JSON verdict on the agent's last line; tail: %r" % (r.stdout or "")[-200:])
+
+
+DISPATCH_RULES = """
+THE QUEUE above lists open/requested tickets with their active_stops count. For EACH ticket decide ONE action:
+- "run": actionable NOW by a single pair producing ONE deliverable file. Supply "kind" (choose from
+  the pair/solo kinds if the ticket is unkinded) and "deliverable" (repo-relative path — inspect the
+  repository to choose the right home; mirror the existing layout).
+- "skip": not actionable — control tickets (kind stop/start), tickets with active_stops > 0, work
+  that needs a spec or a graft first, or anything too big for one deliverable. Supply "reason".
+  Be conservative: prefer skip-with-reason over guessing.
+- "stop": a job that should NOT proceed at all. Supply "reason" — a stop ticket will be aimed at it.
+You route; you never author work product. Print as your LAST line ONLY this JSON, nothing after:
+{"plan": [{"ticket": <id>, "action": "run|skip|stop", "kind": "<kind-or-empty>", "deliverable": "<path-or-empty>", "reason": "<why>"}]}
+"""
+
+
+def do_dispatch(a):
+    """--dispatch: dispatch-01 (its REGISTERED prompt, read back from the agents table) reads the
+    queue and decides; the harness executes each decision through the governed routes."""
+    reg = rows("agent.prompt", {"agent_id": "dispatch-01"})
+    if not reg:
+        raise Unexpected("dispatch-01 is not registered — agent.register it first")
+    queue = rows("ticket.queue", {})
+    if not queue:
+        print("== dispatch == queue is empty; nothing to route")
+        return 0
+    for t in queue:
+        st = rows("ticket.stops", {"ticket_id": t["id"]})
+        t["active_stops"] = st[0].get("active_stops", 0) if st else 0
+    prompt = (reg[0]["prompt"] + "\n\nTHE QUEUE:\n" + json.dumps(queue, indent=1) + "\n" + DISPATCH_RULES)
+    res = step("dispatch: plan", spawn_claude, prompt, "Read,Grep,Glob", a.timeout)
+    plan = res.get("plan", [])
+    if not plan:
+        raise Unexpected("dispatch-01 returned no plan")
+    results = []
+    for d in plan[: a.dispatch]:
+        tid, act = d.get("ticket"), d.get("action")
+        rest("ticket.progress", {"ticket_id": tid, "agent_id": "dispatch-01",
+                                 "note": "dispatch: %s — %s" % (act, d.get("reason") or d.get("deliverable") or "")})
+        if act == "run" and d.get("deliverable"):
+            if d.get("kind"):
+                try:
+                    rest("ticket.kind", {"id": tid, "kind": d["kind"]})   # set-once; refused if kinded
+                except Exception:
+                    pass
+            rc = subprocess.call([sys.executable, os.path.abspath(__file__), "--ticket", str(tid),
+                                  "--deliverable", d["deliverable"], "--rounds", str(a.rounds),
+                                  "--timeout", str(a.timeout)], cwd=ROOT)
+            results.append((tid, "run -> exit %s" % rc))
+        elif act == "stop":
+            out = rest("ticket.create", {"component": "congruency", "severity": "normal", "patch": "",
+                                         "title": "STOP: #%s (dispatched)" % tid, "body": d.get("reason", "")})
+            sid = int(out.get("rowid", 0))
+            rest("ticket.kind", {"id": sid, "kind": "stop"})
+            rest("edge.record", {"parent_id": sid, "child_id": tid, "kind": "stops"})
+            results.append((tid, "stopped by #%s" % sid))
+        else:
+            results.append((tid, "skip — %s" % (d.get("reason") or "")))
+    for tid, what in results:
+        print("== dispatched == #%s: %s" % (tid, what))
+    return 0
 
 
 def harvest(tid, history, passed, final_note):
@@ -246,6 +308,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=2, help="max worker rounds before giving up")
     ap.add_argument("--timeout", type=int, default=480, help="seconds per agent spawn")
     ap.add_argument("--harvest", type=int, metavar="TICKET", help="retro-harvest a settled ticket's lesson, then exit")
+    ap.add_argument("--dispatch", type=int, nargs="?", const=5, metavar="N",
+                    help="dispatch-01 routes up to N queue tickets (default 5): decide run/skip/stop, then execute")
     ap.add_argument("--compile-playbook", action="store_true",
                     help="file a documentation ticket from ALL harvested lessons and run the pair on it")
     ap.add_argument("--playbook", default="docs/PLAYBOOK.md",
@@ -258,6 +322,10 @@ def main():
     if a.harvest:
         harvest_settled(a.harvest)
         return 0
+
+    # ── dispatch mode: dispatch-01 routes the queue ───────────────────────────
+    if a.dispatch:
+        return do_dispatch(a)
 
     # ── compile mode: the playbook is itself a pair-audited deliverable ──────
     if a.compile_playbook:

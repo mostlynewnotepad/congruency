@@ -7,6 +7,23 @@ Per-crank notes. Newest first. A crank = a commit + a `version-*` tag.
 
 ---
 
+## version-4.142 — the bug sweep + dispatch-01 takes the wheel (and correctly declines it)
+
+- **Bug sweep, both round-1 passes with EXECUTING testers** (bug/build pairs now also carry the
+  repo php at tooling/congruencey-harness/php/php, so PHP fixes are PROVEN, not read): ticket #79 →
+  `ProductDAO.php` fixed (UID 8; `paw.product` MySQL notation → `Products`, provenance comment in
+  place); ticket #139 → `ingest_self.py` non-utf8 fidelity fixed (UID 9). Lessons harvested.
+- **`--dispatch [N]` mode** (`pair_loop.py do_dispatch` + `0032_dispatch_routes.sql` ticket.queue):
+  the harness reads dispatch-01's REGISTERED birth prompt back out of the agents table (the
+  registry is the instruction source, not decoration), shows it the queue with per-ticket
+  active_stops, and executes its JSON plan — run (kind set-once + pair_loop on itself, same
+  brake→pair→settle→harvest chain), skip (journaled reason), or stop (stop ticket + 'stops' edge).
+  Cap N (default 5) bounds the blast radius. Every decision journals as dispatch-01.
+- **Maiden dispatch**: queue was #140 + #154; dispatch-01 SKIPPED both with correct spec reasoning
+  ("#140 authorizes nothing until a start ticket aimed at #154 releases it"; "#154 is a control
+  ticket, resolved by a start-ticket graft, not routed to a pair"). A dispatcher that declines
+  correctly is the safety case for letting it run.
+
 ## version-4.141 — the build campaign: kind-aware pairs, four deliverables, a triaged queue
 
 pair_loop grew EXECUTING testers, then the whole open build queue went through it. Every open
