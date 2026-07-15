@@ -91,21 +91,42 @@ two sources, and the union is what makes it airtight:
   With --file-tickets, an unreadable ticket.queue is fatal to the run: it refuses to file rather
   than risk duplicates.
 
-BATCHED + SELF-REPOPULATING, AND THE CHAIN DOES NOT STALL (#196). Append-only governance means a
-ticket cannot reopen, so the work perpetuates by spawning a successor. Successors are GENERATION-
-NUMBERED — `[go-port:successor:<chain>:g<N>]` — and that number is what keeps the chain alive:
+BATCHED + SELF-REPOPULATING, AND THE CHAIN DOES NOT STALL (#196, #245). Append-only governance
+means a ticket cannot reopen, so the work perpetuates by spawning a successor. Successors are
+GENERATION-NUMBERED — `[go-port:successor:<chain>:g<N>]` — and a run's own generation keeps it alive:
 
-    run --gen 0 (a human/dispatch starts it) -> files a batch -> spawns successor g1
-    the pair executing g1 runs the command in g1's OWN body, which carries --gen 1
-      -> it sees its own g1 marker, does NOT count itself, and spawns g2
-    g1 settles; later the pair executing g2 runs --gen 2 -> spawns g3 ... until nothing remains.
+    a run with nothing open (a human/dispatch starts it) -> files a batch -> spawns successor g1
+    the pair executing g1 runs the decomposer again
+      -> the run READS THE QUEUE, sees g1 is the highest OPEN successor of this chain, and concludes
+         it IS g1's own run: it does not count itself, and spawns g2
+    g1 settles; later the pair executing g2 runs -> spawns g3 ... until nothing remains.
 
-A run at generation N declines to spawn ONLY IF an open successor of generation > N already exists
-(someone already filed its replacement). It ignores its own generation and any stale open
-predecessor (gen <= N), because a predecessor will never file anything again — that is precisely
-the stall a "does ANY open successor exist?" test causes: the run launched from the successor's own
-body always sees itself, never spawns, and the chain dies with ~100 units un-ticketed. The chain
-is scoped by --subset, so a `--subset tag:` drain and a full drain never block each other.
+A run at generation N declines to spawn ONLY IF an OPEN successor of generation > N already exists
+(someone already filed its replacement). It ignores its own generation and any stale open predecessor
+(gen <= N), because a predecessor will never file anything again — that is precisely the stall a
+"does ANY open successor exist?" test causes: the run launched from the successor's own body always
+sees itself, never spawns, and the chain dies with everything past the first batch un-ticketed.
+
+THE GENERATION IS DERIVED FROM THE QUEUE, NOT DEMANDED ON THE COMMAND LINE (#245 — the stall this
+tool actually shipped with; it was reproduced end-to-end before it was fixed). The generation used to
+come ONLY from an explicit `--gen N`, defaulting to 0. That made the flag load-bearing and invisible:
+a pair or dispatcher running the tool the obvious way — `--file-tickets`, no flag — was generation 0
+while g1 sat OPEN in the queue, so `1 > 0` fired the decline branch. It filed its batch, spawned
+NOTHING, and the chain died after the FIRST successor with every remaining unit stranded — and no
+line of the output called that a failure. So the default generation is now READ FROM THE LIVE QUEUE:
+the highest
+OPEN successor of this chain, which is precisely what the run launched from that successor's ticket
+is (or 0 for a fresh chain, where none is open). The no-flag invocation now continues the chain
+instead of ending it, so the chain drains to the last unit however the command reaches the pair.
+
+`--gen N` remains as an explicit OVERRIDE for the deliberate case: re-running an OLD generation's
+command must still decline, because a NEWER open successor is the one carrying the chain. It is belt
+and braces now, not the mechanism.
+
+Successor numbers are MONOTONIC: the next generation is one past the highest this chain has EVER used
+(the db, ALL statuses, UNION the live queue), so a chain whose g1 has since settled/closed never
+re-mints the number g1 and the journal stays readable. The chain is scoped by --subset, so a
+`--subset tag:` drain and a full drain never block each other.
 
 SAFE BY DEFAULT: run with no flags this tool only REPORTS — it writes to no db and creates no file
 (verified before/after in isolation: the state dir gains no `-wal`/`-shm`/anything and the db's hash
@@ -1581,13 +1602,18 @@ def successor_key(subset, gen):
 
 
 def max_open_generation(titles, subset):
-    """The highest successor GENERATION currently open for this chain, or -1 if none.
+    """The highest successor GENERATION currently OPEN for this chain, or -1 if none.
 
-    This is the anti-stall rule (see the module docstring). A run at generation N spawns unless some
-    open successor has generation > N. It deliberately does NOT count itself (gen == N) or a stale
-    open predecessor (gen < N): the run doing the asking IS the one launched from generation N's own
-    ticket body, so a naive 'does ANY open successor exist?' test always sees itself, never spawns,
-    and the chain dies after one batch with ~100 units un-ticketed."""
+    This carries the anti-stall rule (see the module docstring), and it does two jobs:
+
+      1. it DERIVES a run's own generation when --gen was not given (this_generation()). The run
+         asking the question is, in practice, the run a pair launched from this chain's newest open
+         successor — so that successor's generation IS this run's generation. Defaulting to 0 instead
+         is what stalled the chain at its first successor (#245).
+      2. it is the spawn guard: a run at generation N spawns unless some open successor has
+         generation > N. It deliberately does NOT count itself (gen == N) or a stale open predecessor
+         (gen < N): a predecessor will never file anything again, so a naive 'does ANY open successor
+         exist?' test always sees itself, never spawns, and the chain dies after one batch."""
     hi = -1
     chain = chain_of(subset)
     for t in titles:
@@ -1597,14 +1623,41 @@ def max_open_generation(titles, subset):
     return hi
 
 
+def max_generation_ever(con, titles, subset):
+    """The highest successor generation this chain has EVER used — the db (ALL statuses) UNION the
+    live queue — or -1 if the chain is new. Successors are minted one past this, so a generation
+    whose ticket has since settled/closed never has its number re-used by a later spawn."""
+    hi = -1
+    chain = chain_of(subset)
+    seen = [(t or "") for (t,) in con.execute("SELECT title FROM tickets")] + list(titles or [])
+    for t in seen:
+        m = SUCC_RE.search(t)
+        if m and m.group(1) == chain:
+            hi = max(hi, int(m.group(2)))
+    return hi
+
+
+def this_generation(explicit, open_hi):
+    """This run's own generation. An explicit --gen wins (the deliberate override). Otherwise it is
+    DERIVED: the highest OPEN successor of this chain is the ticket a pair is running the decomposer
+    from, so that is this run's generation; with none open the chain is fresh and this run is 0.
+
+    Deriving is what keeps the chain alive when the command reaches the pair without the flag — the
+    #245 stall. See the module docstring."""
+    if explicit is not None:
+        return explicit
+    return open_hi if open_hi >= 0 else 0
+
+
 def successor_body(remaining, batch, subset, gen):
     # The command must be the one that files exactly the `remaining` units counted above — so a subset
-    # run's successor carries the same --subset, or it would misreport its own work. --gen is what
-    # keeps the chain alive: the run launched from THIS body announces itself as generation `gen`, so
-    # it does not mistake this very ticket for a successor someone else already filed, and it goes on
-    # to spawn generation gen+1. The path is repo-root-relative on purpose: this ticket is executed
-    # from the repo root (dispatch runs tools with cwd=ROOT), and the shorter `tools/...` form does
-    # not resolve from there.
+    # run's successor carries the same --subset, or it would misreport its own work. --gen PINS the run
+    # launched from THIS body to generation `gen`, so it does not mistake this very ticket for a
+    # successor someone else already filed, and it goes on to spawn generation gen+1. It is belt and
+    # braces, NOT the mechanism: a run without the flag derives the same generation from the queue
+    # (#245), so a pair that types a plain `--file-tickets` continues the chain instead of ending it.
+    # The path is repo-root-relative on purpose: this ticket is executed from the repo root (dispatch
+    # runs tools with cwd=ROOT), and the shorter `tools/...` form does not resolve from there.
     cmd = "python3 %s --file-tickets --batch %d --gen %d%s" % (
         SELF_FROM_ROOT, batch, gen, "" if not subset else " --subset %s" % subset)
     return (
@@ -1620,11 +1673,16 @@ def successor_body(remaining, batch, subset, gen):
         "\n"
         "    %s\n"
         "\n"
-        "RUN IT EXACTLY AS WRITTEN — the `--gen %d` matters. It tells the decomposer that the run is\n"
-        "this generation-%d ticket's own run, so it will not mistake THIS ticket for a successor that\n"
-        "someone else already filed. It then spawns generation %d, and the chain continues after this\n"
-        "ticket settles. Drop the flag and the run sees this very ticket, declines to spawn, and the\n"
-        "chain dies here with those %d units un-ticketed.\n"
+        "The `--gen %d` pins the run to THIS ticket's generation, so it will not mistake this very\n"
+        "ticket for a successor someone else already filed; it then spawns generation %d, and the chain\n"
+        "continues after this ticket settles.\n"
+        "\n"
+        "DROPPING THE FLAG DOES NOT KILL THE CHAIN (it used to — see #245). With no --gen the\n"
+        "decomposer DERIVES its generation from the queue: the highest OPEN successor of this chain is\n"
+        "normally this very ticket, so a plain `--file-tickets --batch %d` reaches the same conclusion\n"
+        "and spawns the next generation anyway. Keep the flag regardless — it is what makes a run\n"
+        "started from a STALE copy of this line (one the chain has already moved past, because a NEWER\n"
+        "successor is open) correctly DECLINE, instead of adding a redundant successor.\n"
         "\n"
         "It is idempotent: it re-files nothing already ticketed. Run it with no flags first (and no\n"
         "--file-tickets) to see the enumeration without writing anything. A stop ticket aimed at this\n"
@@ -1632,8 +1690,8 @@ def successor_body(remaining, batch, subset, gen):
         "\n"
         "Filed mechanically by %s under ticket #%d."
         % (successor_key(subset, gen), chain_of(subset), gen, remaining,
-           "" if not subset else " matching --subset %s" % subset, batch, cmd, gen, gen, gen + 1,
-           remaining, SELF_FROM_ROOT, DECOMPOSER_TICKET))
+           "" if not subset else " matching --subset %s" % subset, batch, cmd, gen, gen + 1, batch,
+           SELF_FROM_ROOT, DECOMPOSER_TICKET))
 
 
 # ── filing ───────────────────────────────────────────────────────────────────────────────────────
@@ -1648,7 +1706,10 @@ def file_ticket(base, key, title, body, kind="build"):
     return tid
 
 
-def file_batch(base, key, todo, remaining_after, batch, parent, spawn, subset, gen):
+def file_batch(base, key, todo, unticketed, batch, parent, spawn, subset, gen, ever_hi):
+    """File this run's batch, then keep the chain alive. `unticketed` is how many units were
+    un-ticketed BEFORE this run filed anything; what is left for the successor is derived from what
+    actually got filed, so a partial failure understates nothing in the successor's own body."""
     filed = []
     for u in todo:
         try:
@@ -1661,8 +1722,14 @@ def file_batch(base, key, todo, remaining_after, batch, parent, spawn, subset, g
         print("== filed == #%-4s %s" % (tid, u["title"]))
     step("%d unit ticket(s) filed" % len(filed))
 
+    # what the successor must still do, from what THIS run actually filed (not from what it hoped to)
+    remaining_after = max(unticketed - len(filed), 0)
+
     if not filed:
-        step("nothing filed — no successor spawned (a re-run that files nothing spawns nothing)")
+        # main() never calls this with an empty todo, so this is a filing FAILURE, not a no-op re-run:
+        # every ticket.create above broke. Spawning would go through the same route and break too.
+        step("nothing filed — no successor spawned (every ticket.create failed; %d unit(s) remain "
+             "un-ticketed and the chain needs a re-run once the route works)" % unticketed)
         return filed
     if not remaining_after:
         step("every unit is now ticketed — the chain is drained; no successor spawned")
@@ -1677,16 +1744,19 @@ def file_batch(base, key, todo, remaining_after, batch, parent, spawn, subset, g
         # (the next run files nothing new and stops), whereas a missing successor silently ends the
         # chain — the failure this whole generation scheme exists to prevent.
         step("ticket.queue unreadable after filing — spawning generation %d anyway (a stacked "
-             "successor is recoverable; a dead chain is not)" % (gen + 1))
+             "successor is recoverable; a dead chain is not)" % (max(ever_hi, gen) + 1))
     else:
         hi = max_open_generation(titles, subset)
         if hi > gen:
             step("chain %r already has an OPEN successor at generation %d (> this run's generation "
-                 "%d) — not stacking another" % (chain_of(subset), hi, gen))
+                 "%d) — not stacking another. %d unit(s) stay un-ticketed for IT to file; this run "
+                 "did not end the chain" % (chain_of(subset), hi, gen, remaining_after))
             return filed
+        ever_hi = max(ever_hi, hi)
         step("chain %r: highest open successor generation is %d, this run is generation %d — "
-             "spawning generation %d" % (chain_of(subset), hi, gen, gen + 1))
-    nxt = gen + 1
+             "spawning generation %d" % (chain_of(subset), hi, gen, max(ever_hi, gen) + 1))
+    # monotonic: never re-mint a number this chain already used (its g<N> ticket may have settled)
+    nxt = max(ever_hi, gen) + 1
     try:
         sid = file_ticket(base, key,
                           "Continue the congruency-go decomposition: %d unit(s) left [%s]"
@@ -1737,12 +1807,15 @@ def main():
                     help="only units whose key contains SPEC, e.g. 'tag:', 'db:route', "
                          "'route:agent.' — the acceptance run of #230. It also names the drain chain, "
                          "so a subset drain and a full drain never block each other's successors")
-    ap.add_argument("--gen", type=int, default=0, metavar="N",
-                    help="this run's successor GENERATION (default 0 = a fresh chain). A spawned "
-                         "successor ticket prints the exact command with its own --gen; run it as "
-                         "written. A run spawns unless an OPEN successor of a HIGHER generation "
-                         "already exists, so a successor's own run never mistakes itself for its "
-                         "replacement — that is what keeps the chain from stalling after one batch")
+    ap.add_argument("--gen", type=int, default=None, metavar="N",
+                    help="OVERRIDE this run's successor GENERATION. By default it is DERIVED from the "
+                         "live queue — the highest OPEN successor of this chain (0 if none is open, "
+                         "i.e. a fresh chain) — because that successor's ticket is what a pair runs "
+                         "the decomposer from. A run spawns unless an OPEN successor of a HIGHER "
+                         "generation already exists, so a successor's own run never mistakes itself "
+                         "for its replacement and the chain does not stall after one batch. Pass this "
+                         "only to deliberately act as an OLDER generation (which then declines to "
+                         "spawn, leaving the newer successor to carry the chain)")
     ap.add_argument("--parent", type=int, default=DECOMPOSER_TICKET, metavar="ID",
                     help="ticket the spawned-successor edge hangs from (default %d)" % DECOMPOSER_TICKET)
     ap.add_argument("--no-spawn", action="store_true", help="file the batch but spawn no successor")
@@ -1754,7 +1827,7 @@ def main():
 
     if a.batch < 1:
         die("--batch must be 1 or more (got %d)" % a.batch)
-    if a.gen < 0:
+    if a.gen is not None and a.gen < 0:
         die("--gen must be 0 or more (got %d)" % a.gen)
 
     con = connect_ro(a.db)
@@ -1785,11 +1858,15 @@ def main():
     done = keys_from_db(con)
     step("%d unit key(s) already ticketed per the state db (all statuses)" % len(done))
     titles = queue_titles(a.base, key)
+    open_hi = max_open_generation(titles or [], a.subset)
+    gen = this_generation(a.gen, open_hi)
+    ever_hi = max_generation_ever(con, titles, a.subset)
     if titles is not None:
         live = keys_from_queue(titles)
         step("%d unit key(s) in the live queue (OPEN/REQUESTED); chain %r highest open successor "
-             "generation = %d, this run is generation %d"
-             % (len(live), chain_of(a.subset), max_open_generation(titles, a.subset), a.gen))
+             "generation = %d, this run is generation %d (%s)"
+             % (len(live), chain_of(a.subset), open_hi, gen,
+                "--gen override" if a.gen is not None else "derived from the queue"))
         done |= live
     elif a.file_tickets:
         die("cannot read the live ticket.queue at %s — refusing to file, to not risk duplicates (is "
@@ -1797,8 +1874,8 @@ def main():
     else:
         step("live queue unreadable — the report below rests on the db read alone")
 
-    todo = [u for u in units if u["key"] not in done][:a.batch]
-    remaining_after = len([u for u in units if u["key"] not in done]) - len(todo)
+    unticketed = [u for u in units if u["key"] not in done]
+    todo = unticketed[:a.batch]
     report(units, done, todo, a.subset, a.batch)
 
     if a.json:
@@ -1818,7 +1895,8 @@ def main():
         return 0
 
     print()
-    file_batch(a.base, key, todo, remaining_after, a.batch, a.parent, not a.no_spawn, a.subset, a.gen)
+    file_batch(a.base, key, todo, len(unticketed), a.batch, a.parent, not a.no_spawn, a.subset,
+               gen, ever_hi)
     return 0
 
 
