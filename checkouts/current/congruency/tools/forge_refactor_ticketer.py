@@ -153,12 +153,89 @@ BEHAVIORAL EXEMPLARS (#200's "verified, not asserted"). For each module it files
   criteria_miner's own honest limit is carried onto each ticket: mined exemplars cover the SAMPLED
   inputs, so they are a strong refactor-drift net, not a proof of total equivalence.
 
+THE EMBEDDED SOURCE — EVERY UNIT CARRIES ITS OWN BYTES (#346, the fix that unblocks the campaign).
+Each rewrite ticket EMBEDS the original module's source verbatim in its BODY, between the marker
+lines `===ORIGINAL SOURCE (...)===` and `===END SOURCE===`. Those embedded bytes are the
+AUTHORITATIVE copy and the behavior-preserving basis the rewrite is judged against. The
+`git --git-dir=... cat-file blob` command under CANONICAL SOURCE stays on the ticket as a REFERENCE
+for a reader who has forge access, but nothing in the ticket requires running it.
+
+  WHY THE BODY, AND NOWHERE ELSE. A unit is executed by pair_loop, whose WORKER is spawned into the
+  ticket's own congruency worktree and SANDBOXED to it. The forge's bare repos live outside that
+  directory, so the worker cannot run the cat-file command and there is no cached copy to read.
+  Every forge unit therefore blocked with "canonical source unreadable, refused to fabricate" — the
+  worker behaving CORRECTLY, because #200 demands behavior PRESERVED and you cannot preserve what you
+  cannot read (#259 is the proof; #346 is the fix). This tool runs in the DISPATCH context, which CAN
+  read the forge, so it is the one that can carry the bytes across. It puts them in the body because
+  the body is the only channel that reaches a worker: pair_loop reads the ticket's TITLE and BODY and
+  nothing else (pair_loop.py:990-992), passes `body` into the prompt context (:1028), and
+  WORKER_PROMPT splices it into the birth prompt (:448). No journal, no manifest and no route is read
+  into that prompt.
+
+  HOW, exactly. All four cases are stated ON the ticket that carries them, never silently:
+    * UTF-8 TEXT WITHIN THE CAP -> the bytes verbatim: no re-indentation, no re-wrapping, nothing
+      elided. This is the normal case — every module of the acceptance runs is a few KB.
+    * NOT UTF-8 TEXT, or it holds a NUL byte (which JSON transport and sqlite TEXT do not carry
+      safely) -> the same bytes, BASE64-encoded, with a one-line python3 decode command on the
+      ticket. Still zero forge access needed.
+    * OVER THE CAP — MAX_EMBED_BYTES, 256 KiB (262144), below -> only the first 256 KiB are embedded,
+      under a TRUNCATED banner that states both byte counts and tells the worker NOT to rewrite from
+      an excerpt (a rewrite of a truncated original is a new program, not a preserved one). Such a
+      unit DOES still need forge access and SAYS so, rather than pretending to be self-contained. The
+      cap exists because a body is read into every prompt of the pair, so an unbounded blob blows the
+      prompt, not merely the row.
+    * THE FENCE COLLIDES — the module's own text contains `===END SOURCE===` -> both markers take a
+      `:<module-sha>` suffix. The body NAMES its exact end marker directly above the block, so it is
+      self-describing whichever pair is in use.
+
+--patch-bodies — THE ALREADY-FILED UNITS ARE SUPERSEDED, NOT EDITED (#346). Units filed before #346
+carry no embedded source: they are the blocked ones. They cannot be repaired in place, and that is
+not a preference — A TICKET BODY IS IMMUTABLE IN SQL. `tg_tickets_immutable_identity` ABORTs any
+UPDATE that changes id/ts/title/body/component/kind (migrations/0029_ticket_authorization.sql:
+111-117), and no route edits a body. Appending the source with `ticket.progress` is permitted (the
+journal is append-only and that is what it is for) but would NOT unblock anything: the worker's birth
+prompt is title + body only (pair_loop.py:990-992,1028,448), so a journal event never reaches the
+agent that needs the bytes — it would file one progress report per unit and leave every unit exactly
+as blocked. So `--patch-bodies` does what the schema itself prescribes for this case, "stop + spawn +
+supersedes-edge = graft" (0029_ticket_authorization.sql:8). Per sourceless OPEN unit:
+
+    1. file a REPLACEMENT unit — same module key, same requirements, PLUS the embedded source (and
+       the ledger's converged location cluster and freshly mined exemplars), edged `spawned` from
+       #200 like every other unit;
+    2. edge `supersedes` from the replacement to the original — the direction 0012's own header
+       states, "a superseding ticket OWNS the predecessor it replaced" (0012_ticket_edges.sql:2-3);
+    3. file a `stop` ticket aimed at the original through a `stops` edge, so the queue stops handing
+       a sandboxed worker a ticket it provably cannot do (ticket.stops, 0030_pair_loop_routes.sql);
+    4. append an attributed `ticket.progress` note to the original recording what superseded it and
+       why — the journal used for what it IS good for: recording what happened.
+
+  NOTHING IS DELETED OR EDITED. The original ticket, its journal and its edges stay on the record
+  forever; it is halted, not erased, and a `start` ticket aimed at the stop would release it. The
+  flag keeps the name #346 gave it; what it cannot do is patch a body, and it says so rather than
+  pretending.
+
+  IDEMPOTENT, AND RESUMABLE MID-GRAFT. A unit is skipped when its body already carries the source, or
+  when an active stop already aims at it (`ticket.stops` > 0 — which is also how a HUMAN's stop is
+  respected: this tool never grafts a ticket someone else has halted). If a run dies after filing the
+  replacement but before the stop, the next run sees a self-contained OPEN unit ALREADY carrying that
+  module key and files NO second replacement — it only finishes the stop. Re-running a completed
+  patch pass reports "nothing to patch" and writes nothing.
+
+  IT NEVER FABRICATES. The replacement's source is read from the canonical blob — located in the
+  ledger, or parsed from the original's OWN "CANONICAL SOURCE" block when the ledger is gone — and is
+  then PROVEN to be the right module: its identity is recomputed (the same module_identity() every
+  filing uses) and must equal the module-sha carried in the unit's title. A blob that will not read,
+  or that re-identifies as a DIFFERENT module, is reported and skipped. It is never guessed at.
+
 THE LEDGER — WHAT IT WRITES. Its own sqlite db, a SIBLING of omni_index.db by default
-(`forge_refactor_ledger.db`; --ledger or $FORGE_REFACTOR_LEDGER overrides). Four tables, all
+(`forge_refactor_ledger.db`; --ledger or $FORGE_REFACTOR_LEDGER overrides). Five tables, all
 IF NOT EXISTS. No RECORD is ever deleted — the one row that is rewritten is the bookmark, which is
 what a bookmark is for, and every position it ever held is kept forever in `runs`:
     modules      (module_sha PK, ident_kind, ext, ticket_id, title, canonical repo/path/blob, ...)
-                 -- the idempotency ledger the ticket requires: one row per module-sha ever filed
+                 -- the idempotency ledger the ticket requires: one row per module-sha ever filed.
+                 -- `ticket_id` is the ticket FIRST filed for that module and is left alone even
+                 -- when --patch-bodies later supersedes it, because rewriting it would erase which
+                 -- ticket the filing run actually created. The succession is in `grafts` below.
     locations    (module_sha, repo, path, blob_sha, origin)  -- the cluster: every PLACE it lives,
                  ONE row per (repo, path), `origin` recording how that place was learned — 'tip'
                  (a scan enumerated it live at a repo's tip) or 'omni' (joined from the blob index,
@@ -172,6 +249,11 @@ what a bookmark is for, and every position it ever held is kept forever in `runs
                  and an uncorrectable wrong mark is exactly how modules get orphaned.
     runs         (ts, chain, scanned, filed, hwm)            -- one append-only row per filing run,
                  including the mark that run resolved: the audit trail of every mark ever held
+    grafts       (ts, module_sha, old_ticket, new_ticket, stop_ticket, reason)
+                 -- one APPEND-ONLY row per --patch-bodies supersession: which sourceless unit was
+                 -- superseded, by which self-contained replacement, halted by which stop ticket.
+                 -- Written only after all three tickets exist, so it never claims a graft that did
+                 -- not happen. Nothing here is ever updated or deleted.
 THE CLUSTER KEEPS COMPLETING. A batch is bounded, so a module's ticket is filed knowing only the
 copies scanned up to that point; later runs meet the rest. A --file-tickets run therefore records the
 locations of copies of ALREADY-ticketed modules too — it does not re-file them (that is the whole
@@ -285,8 +367,9 @@ by-product of reporting. A dry run over a healthy forge writes nothing at all. M
 read through `git cat-file` into memory and normalized/mined AS TEXT — codebean's `_ast_norm`,
 `lower_node` and criteria_miner's `mine` all take source, so not even a temp file is created. It
 writes exactly three things, each only when asked: --file-tickets POSTs through the governed rest.php
-routes (ticket.create -> ticket.kind -> edge.record) with X-Api-Key from ../.secrets/ats.env (the
-same source pair_loop.py reads) and records what it filed in the ledger; --json writes the one path
+routes (ticket.create -> ticket.kind -> edge.record, plus agent.register -> ticket.progress when it
+is grafting under --patch-bodies) with X-Api-Key from ../.secrets/ats.env (the same source
+pair_loop.py reads) and records what it filed in the ledger; --json writes the one path
 you name; and it appends to the registry's bug_reports sink if it hits an unexpected exception (the
 Variant-A report note-for-claude mandates: filename / function / time-of-occurance /
 methods-to-reproduce / possible-cause). Pure-python stdlib + git plumbing, registry-gated (a tool
@@ -306,7 +389,11 @@ checkouts/current/congruency, so that shorter form only resolves from the CMS ap
             --file-tickets --rescan
         # the idempotency proof: re-walk from repo 1, ignore the bookmark -> files ZERO
     python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py --json /tmp/mods.json
-        # dump the enumeration (keys, locations, exemplars, bodies) as JSON
+        # dump the enumeration (keys, locations, exemplars, bodies incl. the embedded source) as JSON
+    python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py --patch-bodies
+        # report which already-filed OPEN units carry no embedded source; writes NOTHING
+    python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py --patch-bodies --file-tickets
+        # graft them: per unit a self-contained replacement + a `supersedes` edge + a `stop` ticket
 
 ACCEPTANCE (#201) — a SUBSET of the forge, end to end. #201'S OWN ACCEPTANCE RUNS ARE ON THE RECORD,
 so read them before re-running anything: `--subset audio_tagger` filed FIVE rewrite tickets — #259,
@@ -355,16 +442,18 @@ repos and holds ONE ticket (#260), not five. Successors #261 and #264 were filed
     A. FILE A BATCH + SPAWN THE SUCCESSOR — on a chain nobody has drained yet (dry-run it first, per
        the paragraph above):
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
-               --subset dz_debug --file-tickets --batch 4
-       -> one build ticket per UNIQUE module, each referencing its source repo(s)/path(s), #200, the
-          control-config + installable requirements, and its captured behavior; each edged `spawned`
-          from #200; then a successor edged `spawned` from #201, primed for the next batch. `dz_debug`
-          is 7 repos carrying 8 source files in the first alone, so --batch 4 fills MID-REPO: the
-          mark stays before that repo, all 7 repos are reported left, and the successor finishes it.
-          (Run it WITHOUT --file-tickets first to see the same batch and write nothing. Dry-run
-          verified fresh as this was written: 7 repos scanned, 9 unique un-ticketed modules, 37 of
-          its files collapsed by module-sha. `coupler` — which this step named before the chain was
-          drained — is now step B's example instead, which is the one-way street in action.)
+               --subset crank_pi --file-tickets --batch 4
+       -> one build ticket per UNIQUE module, each EMBEDDING its module's original source (#346) and
+          referencing its source repo(s)/path(s), #200, the control-config + installable
+          requirements, and its captured behavior; each edged `spawned` from #200; then a successor
+          edged `spawned` from #201, primed for the next batch. `crank_pi` is 3 repos and the first
+          alone carries 23 source files, so --batch 4 fills MID-REPO: the mark stays before that
+          repo, all 3 repos are reported left, and the successor finishes it. (Run it WITHOUT
+          --file-tickets first to see the same batch and write nothing. Dry-run verified fresh as
+          this was written: 1 repo scanned, 4 unique un-ticketed modules — all four `.sh`, so all
+          four take the CONTENT-SHA256 identity — 4 complete sources embedded, 0 truncated, 3 repos
+          left. `dz_debug`, which this step named before that chain was drained, and `coupler` before
+          it, are the one-way street in action: BOTH are now step B examples, not step A ones.)
     B. A RE-RUN FILES ZERO — on a drained chain, with --rescan so what is tested is the LEDGER and
        not the bookmark:
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
@@ -378,12 +467,37 @@ repos and holds ONE ticket (#260), not five. Successors #261 and #264 were filed
           ZERO duplicates. (It still RECORDS any copy location it had not seen before — see THE
           CLUSTER KEEPS COMPLETING — which is knowledge, not a duplicate.)
 
-Exit 0 on a clean run (including "nothing new to file", the expected result of a re-run). Exit 2 with
-a one-line message (never a traceback) on a bad invocation or an unusable environment. Exit 3 when an
-active stop ticket brakes the chain.
+ACCEPTANCE (#346) — THE UNITS ARE SELF-CONTAINED, and both steps check it while writing NOTHING:
+
+    C. A FRESHLY-FILED UNIT CARRIES ITS SOURCE — on any chain that still has un-ticketed modules
+       (`bakery_shreds` was dry-run-verified fresh as this was written; the one-way street of step A
+       applies here too, so dry-run first and pick another --subset if it reports 0):
+           python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
+               --subset bakery_shreds --batch 2 --json /tmp/units.json
+       -> files nothing (no --file-tickets) and writes only /tmp/units.json. Each entry's "body"
+          holds that module's original bytes between the "source_begin_marker" and
+          "source_end_marker" lines it names, and "source_embedded" is true. Take the lines strictly
+          between those two markers, base64-decode them if "source_base64" is true, and diff against
+          `git --git-dir=<remotes>/<repo>.git cat-file blob <blob_sha>`: BYTE-IDENTICAL (verified for
+          both of that chain's modules, and for all 31 replacement bodies of step D). A worker
+          reading only that body has everything the rewrite needs, and no forge access.
+    D. THE ALREADY-FILED UNITS ARE PATCHED (or reported as needing nothing):
+           python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py --patch-bodies
+       -> the plan: every OPEN forge unit whose body carries no source, the self-contained
+          replacement that would supersede it, and the stop that would halt it. Verified as this was
+          written: 31 open units, 31 planned supersessions, every one's canonical blob read and
+          PROVEN to re-identify as the module its title names. Add --file-tickets to execute it. A
+          re-run afterwards reports every unit "already halted" and plans nothing — the graft is
+          idempotent, and a graft interrupted between filing the replacement and filing the stop is
+          finished by the next run rather than duplicated.
+
+Exit 0 on a clean run (including "nothing new to file" and "nothing to patch", the expected results
+of a re-run). Exit 2 with a one-line message (never a traceback) on a bad invocation or an unusable
+environment. Exit 3 when an active stop ticket brakes the chain.
 """
 import argparse
 import ast
+import base64
 import contextlib
 import glob
 import hashlib
@@ -440,6 +554,16 @@ BASE = (os.environ.get("CONGRUENCY_URL") or "http://127.0.0.1:8899").rstrip("/")
 
 FACTORY_TICKET = 201        # the ticket that authorizes this factory; parent of every successor
 STD_TICKET = 200            # #std — the refactor standard; parent of every rewrite ticket
+FIX_TICKET = 346            # the ticket that made every unit carry its own source (see THE EMBEDDED
+                            # SOURCE); cited on the artifacts --patch-bodies files, so a reader of a
+                            # stop or a replacement can find why it exists
+
+# The agent this tool journals as when it grafts. REGISTERED (agent.register) but deliberately never
+# ticket.assign'd — exactly how pair_loop's forge steward and dispatch-01 journal onto tickets they
+# are not authorized on, and for the same reason: tg_tickets_pair_completion (0029) refuses DONE on a
+# pair ticket without two DISTINCT agents in two DISTINCT roles, and an always-present third agent on
+# ticket_agents would hollow that backstop out. This tool files and journals; it never does the work.
+TICKETER_AGENT = "forge-refactor-ticketer"
 
 # A module key is `forge-rw:` + EXACTLY 16 hex chars. A successor key is
 # `forge-rw:successor:<chain>:g<N>` — "successor" is not 16 hex chars, so the two patterns are
@@ -463,6 +587,37 @@ MAX_BODY_CALLABLES = 40
 MAX_BODY_EXEMPLAR_FNS = 8
 MAX_BODY_EXEMPLARS = 6
 GIT_TIMEOUT = 60
+
+# ── the embedded source (#346; see THE EMBEDDED SOURCE in the module docstring) ───────────────────
+# THE SIZE CAP. 256 KiB of a module's own bytes go into the ticket body verbatim; a blob larger than
+# this is embedded TRUNCATED to its first MAX_EMBED_BYTES, under a banner that says so on the ticket.
+# The cap is not about the db column (sqlite TEXT is effectively unbounded) — it is about the PROMPT:
+# a body is spliced into the birth prompt of every agent of the pair (pair_loop.py:448,461,1028), so
+# an unbounded blob costs that budget twice per round. 256 KiB is ~40x the largest module either
+# acceptance chain met (the biggest is a few KB), so truncation is the pathological case it is meant
+# to be and not the normal one.
+MAX_EMBED_BYTES = 262144
+B64_LINE = 76               # base64 wrap width, so a binary blob's block stays readable in a prompt
+
+# The fence. The `(...)` description states which of the four cases produced the block — verbatim
+# text, base64, or either of those truncated — so the block is never ambiguous about what it holds.
+EMBED_BEGIN_FMT = "===ORIGINAL SOURCE (%s)==="
+EMBED_END = "===END SOURCE==="
+# Collision fence: used only when the module's OWN text contains a marker line (see _marks()).
+EMBED_BEGIN_NONCE_FMT = "===ORIGINAL SOURCE:%s (%s)==="
+EMBED_END_NONCE_FMT = "===END SOURCE:%s==="
+# What a body is TESTED for when deciding whether a ticket already carries its source. Both the plain
+# and the nonce'd fences start with these, so the test holds for either — see body_has_source().
+EMBED_BEGIN_SENTINEL = "===ORIGINAL SOURCE"
+EMBED_END_SENTINEL = "===END SOURCE"
+
+EMBED_DESC_TEXT = "verbatim, the behavior-preserving basis"
+EMBED_DESC_B64 = "verbatim, base64 — this blob is not UTF-8 text"
+EMBED_DESC_TEXT_CUT = "TRUNCATED EXCERPT — NOT the whole module"
+EMBED_DESC_B64_CUT = "TRUNCATED EXCERPT, base64 — NOT the whole module"
+
+B64_DECODE_CMD = ("python3 -c \"import base64,sys;"
+                  "sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))\"")
 
 
 class Fault(Exception):
@@ -681,6 +836,116 @@ def module_key(module_sha):
     return "forge-rw:%s" % module_sha
 
 
+# ── the embedded source: the module's own bytes, carried INSIDE the ticket (#346) ────────────────
+def _marks(desc, payload, sha):
+    """(begin, end) — the fence for one embedded block.
+
+    Normally the plain markers. If the payload itself contains a marker line, the module's own text
+    would end the block early and the worker would silently read a PREFIX of the source as if it were
+    the whole module — so both markers take a `:<module-sha>` suffix, which the payload cannot
+    contain (it would have had to embed its own identity). The body always names its exact end marker
+    directly above the block, so a reader never has to know which pair was chosen."""
+    begin, end = EMBED_BEGIN_FMT % desc, EMBED_END
+    if EMBED_BEGIN_SENTINEL in payload or EMBED_END_SENTINEL in payload:
+        begin, end = EMBED_BEGIN_NONCE_FMT % (sha, desc), EMBED_END_NONCE_FMT % sha
+    return begin, end
+
+
+def embed_source(raw, sha):
+    """The module's bytes, rendered for a ticket body. Never raises on corpus input.
+
+    Returns {"begin", "end", "payload", "binary", "truncated", "shown", "total"} where `payload` is
+    what goes between the two marker lines, `shown` is how many of the module's `total` bytes it
+    represents, and `binary`/`truncated` say which of the four cases produced it (see THE EMBEDDED
+    SOURCE in the module docstring). Every case is stated on the ticket by source_block().
+
+    The two decisions, in order:
+      TRUNCATE — a blob over MAX_EMBED_BYTES contributes only its first MAX_EMBED_BYTES bytes.
+      ENCODE   — those bytes go in verbatim when they are UTF-8 text with no NUL (a NUL is not safe
+                 through JSON transport into a sqlite TEXT column), and base64 otherwise. Only a
+                 TRUNCATION can split a multi-byte character, so the decode is retried backing off at
+                 most 3 bytes — and only when truncating. An UNCUT blob that will not decode is
+                 genuinely not text, so it is base64'd rather than mangled."""
+    total = len(raw)
+    truncated = total > MAX_EMBED_BYTES
+    head = raw[:MAX_EMBED_BYTES] if truncated else raw
+    text, shown = None, len(head)
+    for back in ((0, 1, 2, 3) if truncated else (0,)):
+        try:
+            text = head[:len(head) - back].decode("utf-8")
+            shown = len(head) - back
+            break
+        except UnicodeDecodeError:
+            text = None
+    if text is not None and "\x00" in text:
+        text = None                                       # valid UTF-8, but not body-safe: base64 it
+    if text is None:
+        b64 = base64.b64encode(head).decode("ascii")
+        payload = "\n".join(b64[i:i + B64_LINE] for i in range(0, len(b64), B64_LINE))
+        shown, binary = len(head), True
+    else:
+        payload, binary = text, False
+    begin, end = _marks((EMBED_DESC_B64_CUT if truncated else EMBED_DESC_B64) if binary else
+                        (EMBED_DESC_TEXT_CUT if truncated else EMBED_DESC_TEXT), payload, sha)
+    return {"begin": begin, "end": end, "payload": payload, "binary": binary,
+            "truncated": truncated, "shown": shown, "total": total}
+
+
+def source_block(m):
+    """The ticket body's ORIGINAL SOURCE section: the bytes, fenced, with everything a worker needs
+    to know about them and nothing it has to take on trust. m["embed"] is set by prepare()."""
+    e = m["embed"]
+    out = []
+    out.append(
+        "THE ORIGINAL SOURCE, EMBEDDED — YOU NEED NO FORGE ACCESS TO DO THIS TICKET.\n"
+        "The module's own bytes are reproduced below, inside this ticket. THEY are the\n"
+        "authoritative copy and the behavior-preserving basis: rewrite from them. The\n"
+        "`git --git-dir=... cat-file blob` command under CANONICAL SOURCE above is kept only as a\n"
+        "REFERENCE for a reader who happens to have forge access — running it is NOT part of this\n"
+        "ticket. (Why the bytes are here at all: the pair_loop worker that executes this ticket is\n"
+        "sandboxed to the ticket's own congruency worktree and cannot read the forge's bare repos.\n"
+        "Ticket #%d is the fix that put them on the ticket.)\n"
+        "\n"
+        "The block BEGINS at the line\n"
+        "    %s\n"
+        "and ENDS at the first line\n"
+        "    %s\n"
+        "Everything strictly between those two lines is the module%s."
+        % (FIX_TICKET, e["begin"], e["end"],
+           " — %d byte(s), byte for byte, with no re-indentation, no re-wrapping and nothing\n"
+           "elided" % e["shown"] if not e["binary"] else
+           " base64-encoded (see the decode line below)"))
+    if e["binary"]:
+        out.append("THIS BLOB IS NOT UTF-8 TEXT (or it carries a NUL byte, which does not survive the\n"
+                   "JSON transport into a ticket body intact), so it is embedded BASE64-ENCODED\n"
+                   "rather than mangled. Recover the exact original bytes by piping the block below\n"
+                   "into:\n"
+                   "    %s\n"
+                   "That yields the %d byte(s) embedded here, and nothing about it needs the forge."
+                   % (B64_DECODE_CMD, e["shown"]))
+    if e["truncated"]:
+        out.append("!! TRUNCATED — READ THIS BEFORE YOU REWRITE ANYTHING !!\n"
+                   "This module is %d bytes, over this ticketer's %d-byte embedding cap, so ONLY ITS\n"
+                   "FIRST %d BYTE(S) ARE BELOW. The block is an EXCERPT, not the module: %d byte(s)\n"
+                   "are NOT in this ticket. Do NOT rewrite from the excerpt as though it were the\n"
+                   "whole module — a rewrite of a truncated original is not behavior-preserving, it\n"
+                   "is a different program. THIS ONE TICKET therefore still needs the canonical\n"
+                   "location above: read the complete source with the `cat-file` command, and if you\n"
+                   "cannot reach the forge, report BLOCKED. Do not fabricate the missing bytes."
+                   % (e["total"], MAX_EMBED_BYTES, e["shown"], e["total"] - e["shown"]))
+    out.append("%s\n%s\n%s" % (e["begin"], e["payload"], e["end"]))
+    return "\n\n".join(out)
+
+
+def body_has_source(body):
+    """True when a ticket body already carries an embedded source block. Both fences (plain and
+    `:<module-sha>`-nonce'd) begin with these sentinels, so one test covers either. Used by
+    --patch-bodies to leave an already-self-contained unit alone — its only false positive would be a
+    body that names both markers without fencing anything, which nothing this tool writes does."""
+    b = body or ""
+    return EMBED_BEGIN_SENTINEL in b and EMBED_END_SENTINEL in b
+
+
 # ── the omni-git blob index: extra locations for a blob, joined on the git blob sha1 ─────────────
 def omni_locations(omni, blob_sha):
     """[(repo, path, ts)] — every DISTINCT {repo, path} this exact blob has appeared at, from
@@ -808,6 +1073,18 @@ CREATE TABLE IF NOT EXISTS runs (
   scanned  INTEGER,
   filed    INTEGER,
   hwm_repo TEXT
+);
+-- `grafts` — one APPEND-ONLY row per --patch-bodies supersession (#346). `modules.ticket_id` is
+-- deliberately NOT rewritten when a unit is superseded: it records the ticket the filing run really
+-- created, and this table records what replaced it. A reader following a module-sha therefore sees
+-- both the original filing and its succession, and neither erases the other.
+CREATE TABLE IF NOT EXISTS grafts (
+  ts          REAL,
+  module_sha  TEXT,
+  old_ticket  INTEGER,
+  new_ticket  INTEGER,
+  stop_ticket INTEGER,
+  reason      TEXT
 );
 """
 
@@ -1126,9 +1403,12 @@ def scan(cw, omni, repos, start_at, exts, batch, done, old_idx):
             if len(todo) >= batch:
                 filled = True
                 break
+            # `raw` is kept because the ticket body EMBEDS it (#346). It is bounded by --batch, and
+            # only for the modules this run actually files: `raw` is dropped for every blob that
+            # collapses as a duplicate, and no un-batched blob is ever held.
             m = {"sha": sha, "ident_kind": kind, "ext": os.path.splitext(path)[1].lower(),
                  "repo": name, "repo_idx": i, "path": path, "blob_sha": blob_sha, "ref": ref,
-                 "ref_how": how, "size": len(raw), "text": text, "locations": []}
+                 "ref_how": how, "size": len(raw), "text": text, "raw": raw, "locations": []}
             _add_location(m, name, path, blob_sha, "tip")
             # The index's places go through the SAME single writer as tip copies, so one of them
             # naming this module's canonical place (or a place a LATER repo's tip turns out to
@@ -1189,11 +1469,26 @@ def locations_block(m):
     tip = [l for l in m["locations"] if l["origin"] == "tip"]
     omni = [l for l in m["locations"] if l["origin"] == "omni"]
     out = []
+    # "read it, from anywhere" is what this block used to say above the git command, and it was not
+    # true of the one reader that matters: the pair_loop worker is sandboxed to its own worktree and
+    # cannot reach the forge at all (#346). The bytes now travel ON the ticket — see source_block() —
+    # so what this command is FOR depends on whether they all fit, and the block says which. It must
+    # not tell a worker it needs no forge access on the one kind of ticket where it does.
+    if m["embed"]["truncated"]:
+        why = ("  YOU DO NEED THIS COMMAND FOR THIS TICKET — and it is the only ticket kind that\n"
+               "  does. This module is %d bytes, over the %d-byte embedding cap, so THE ORIGINAL\n"
+               "  SOURCE block below carries a TRUNCATED excerpt (its first %d bytes) and the\n"
+               "  complete source exists only here:\n" % (m["embed"]["total"], MAX_EMBED_BYTES,
+                                                          m["embed"]["shown"]))
+    else:
+        why = ("  REFERENCE ONLY — you do NOT need this command. This module's bytes are embedded\n"
+               "  COMPLETE in THE ORIGINAL SOURCE block below, and that is what the rewrite is based\n"
+               "  on. For a reader who does have forge access:\n")
     out.append("CANONICAL SOURCE (the location this ticket is named for):\n"
                "  repo : %s\n  path : %s\n  ref  : %s (%s)\n  blob : %s (git blob sha1)\n"
-               "  read it, from anywhere:\n"
+               "%s"
                "    git --git-dir=%s/%s.git cat-file blob %s"
-               % (m["repo"], m["path"], m["ref"], m["ref_how"], m["blob_sha"],
+               % (m["repo"], m["path"], m["ref"], m["ref_how"], m["blob_sha"], why,
                   REMOTES, m["repo"], m["blob_sha"]))
     others = [l for l in tip if not (l["repo"] == m["repo"] and l["path"] == m["path"])]
     if others:
@@ -1315,14 +1610,38 @@ def behavior_block(m):
     return "\n\n".join(out)
 
 
-def module_body(m):
+def supersedes_block(old_ids):
+    """The preamble a REPLACEMENT unit carries (--patch-bodies only). It names what this ticket
+    replaces and why, so the graft is legible from the replacement alone — the superseded unit's own
+    journal and the `supersedes` edge say the same thing from the other side."""
     return (
-        "Rewrite ONE unique forge module as entirely new, behavior-preserving, installable,\n"
+        "THIS UNIT SUPERSEDES %s — it is the SAME module and the same work, re-filed to be\n"
+        "SELF-CONTAINED. The superseded unit named its source only as a `git cat-file` command\n"
+        "against the forge's bare repos, which the sandboxed pair_loop worker that executes these\n"
+        "tickets cannot run, so it could not be done as filed (#%d; #259 is the proof). A ticket body\n"
+        "is permanent in SQL (tg_tickets_immutable_identity, migrations/0029_ticket_authorization\n"
+        ".sql:111-117), so that body could not be repaired — this ticket carries the fix instead, and\n"
+        "the original is halted by a stop ticket rather than erased. Do the work HERE.\n"
+        % (", ".join("#%d" % i for i in old_ids), FIX_TICKET))
+
+
+def module_body(m, supersedes=None):
+    """One rewrite unit's body. `supersedes` is a list of ticket ids this unit replaces (set only by
+    --patch-bodies); a freshly-filed unit replaces nothing and carries no such preamble.
+
+    The SOURCE goes above the behavior section on purpose: that section tells the reader to "read the
+    source above" for the callables it had to elide and for re-mining exemplars, so the source has to
+    BE above it. Before #346 there was no source in the body at all and those lines pointed at
+    nothing a sandboxed worker could reach."""
+    return (
+        "%sRewrite ONE unique forge module as entirely new, behavior-preserving, installable,\n"
         "control-config'd Python, per the FORGE-wide refactor standard #%d (#std).\n"
         "\n"
         "This ticket covers ONE module — the one identified below — and nothing else. It was filed\n"
         "against the module's DEDUPLICATED identity, so if that module was copy-pasted across the\n"
         "forge, every copy is covered by this single ticket.\n"
+        "\n"
+        "%s\n"
         "\n"
         "%s\n"
         "\n"
@@ -1355,10 +1674,30 @@ def module_body(m):
         "`spawned` edge, so a stop ticket aimed at #%d brakes every rewrite in this programme.\n"
         "\n"
         "Filed mechanically by %s under ticket #%d, from the forge bare repos at\n"
-        "%s."
-        % (STD_TICKET, identity_block(m), locations_block(m), behavior_block(m), STD_TICKET,
-           STD_TICKET, m["ext"] or "(no extension)", STD_TICKET, STD_TICKET, STD_TICKET,
-           SELF_FROM_ROOT, FACTORY_TICKET, REMOTES))
+        "%s. Its original source is embedded above (#%d), so this ticket is complete on its own."
+        % ("" if not supersedes else supersedes_block(supersedes) + "\n",
+           STD_TICKET, identity_block(m), locations_block(m), source_block(m), behavior_block(m),
+           STD_TICKET, STD_TICKET, m["ext"] or "(no extension)", STD_TICKET, STD_TICKET, STD_TICKET,
+           SELF_FROM_ROOT, FACTORY_TICKET, REMOTES, FIX_TICKET))
+
+
+def prepare(m, cw, cm, mine, supersedes=None):
+    """Give one enumerated module everything a ticket needs: its embedded source, its captured
+    behavior, its title and its body. THE ONE place a unit's body is composed, so a freshly-filed
+    unit and a --patch-bodies replacement are the same artifact by construction and cannot drift
+    apart — the replacement differs only by the `supersedes` preamble it is asked for."""
+    m["embed"] = embed_source(m["raw"], m["sha"])
+    m["capture"] = capture_behavior(cw, cm, m["text"], mine)
+    m["title"] = module_title(m)
+    m["body"] = module_body(m, supersedes)
+    return m
+
+
+def embed_tag(m):
+    """The one-column summary of what a unit's source block holds, for the report."""
+    e = m["embed"]
+    return "src %s%s%dB" % ("b64 " if e["binary"] else "", "CUT " if e["truncated"] else "",
+                            e["shown"])
 
 
 def successor_body(chain_repos_left, batch, subset, gen, hwm):
@@ -1516,6 +1855,411 @@ def file_batch(base, key, todo, names, drained_idx, cap_idx, batch, subset, gen,
     return filed
 
 
+# ── --patch-bodies: the already-filed units are SUPERSEDED, not edited (#346) ────────────────────
+# See "--patch-bodies" in the module docstring for why an edit is impossible (a body is immutable in
+# SQL) and why ticket.progress alone would not unblock anything (the worker's prompt is title + body
+# only). What follows is the schema's own remedy: stop + spawn + supersedes-edge = graft.
+def unit_key(title):
+    """The module-sha a rewrite unit's title carries, or None if this title is not a unit. A
+    successor's key is `forge-rw:successor:<chain>:g<N>`, which is not 16 hex characters, so KEY_RE
+    cannot match one: a chain marker is never mistaken for a unit."""
+    m = KEY_RE.search(title or "")
+    return m.group(1) if m else None
+
+
+# The canonical block every unit's body carries (locations_block()), parsed back out. This is the
+# FALLBACK for a lost ledger — and it cannot cause a wrong graft even if it mis-parses, because
+# graft_module() re-derives the module's identity from the bytes it reads and refuses anything that
+# is not the module named in the unit's own title.
+CANON_REPO_RE = re.compile(r"^ {2}repo\s*:\s*(\S+)\s*$", re.M)
+CANON_PATH_RE = re.compile(r"^ {2}path\s*:\s*(\S+)\s*$", re.M)
+CANON_BLOB_RE = re.compile(r"^ {2}blob\s*:\s*([0-9a-f]{40})\b", re.M)
+CANON_REF_RE = re.compile(r"^ {2}ref\s*:\s*(\S+)", re.M)
+
+
+def _ledger_canon(sha):
+    """The canonical location + the CONVERGED location cluster for a module-sha, from this tool's own
+    ledger. None when the ledger is absent, unreadable, or does not know this module.
+
+    The cluster is worth taking from here rather than from the superseded body: `locations` keeps
+    completing as the drain proceeds (see THE CLUSTER KEEPS COMPLETING), so a replacement filed today
+    can list copies that the original's body — a snapshot of one bounded batch — could not know."""
+    if not os.path.isfile(LEDGER):
+        return None
+    try:
+        con = sqlite3.connect("file:%s?immutable=1" % LEDGER, uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute("SELECT repo, path, blob_sha, ref, ext FROM modules WHERE module_sha=?",
+                          (sha,)).fetchone()
+        if not row or not (row[0] and row[1] and row[2]):
+            return None
+        locs = con.execute("SELECT repo, path, blob_sha, origin, ts FROM locations WHERE "
+                           "module_sha=? ORDER BY origin<>'tip', repo, path", (sha,)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return {"repo": row[0], "path": row[1], "blob_sha": row[2], "ref": row[3] or "(unrecorded)",
+            "ext": row[4] or "", "locations": locs, "from": "the ledger"}
+
+
+def _body_canon(body):
+    """The canonical location parsed out of the superseded unit's OWN body — the fallback used when
+    the ledger is gone or never knew this module. No cluster comes with it: the body's copy list is
+    prose, and inventing locations from prose is guessing. The replacement then lists only the
+    canonical tip, which UNDERSTATES the cluster and never overstates it."""
+    b = body or ""
+    r, p, blob = CANON_REPO_RE.search(b), CANON_PATH_RE.search(b), CANON_BLOB_RE.search(b)
+    if not (r and p and blob):
+        return None
+    ref = CANON_REF_RE.search(b)
+    return {"repo": r.group(1), "path": p.group(1), "blob_sha": blob.group(1),
+            "ref": ref.group(1) if ref else "(unrecorded)",
+            "ext": os.path.splitext(p.group(1))[1].lower(), "locations": [],
+            "from": "the superseded unit's own CANONICAL SOURCE block (no ledger row)"}
+
+
+def graft_module(cw, sha, canon):
+    """(module, None) or (None, reason) — read the canonical blob and PROVE it is this module.
+
+    The proof is the point. A replacement embeds bytes that a worker will treat as the whole truth,
+    so the bytes are re-identified with the SAME module_identity() every filing uses, and must equal
+    the module-sha carried in the unit's own title. A blob that will not read, or that identifies as
+    something else, yields a reason and no module — never a guess, and never a fabricated source."""
+    repo_dir = os.path.join(REMOTES, canon["repo"] + ".git")
+    if not os.path.isdir(repo_dir):
+        return None, "forge repo %r is not at %s" % (canon["repo"], repo_dir)
+    raw = blob_bytes(repo_dir, canon["blob_sha"])
+    if raw is None:
+        return None, ("canonical blob %s will not read from %s (cat-file failed)"
+                      % (canon["blob_sha"][:12], canon["repo"]))
+    got, kind, text = module_identity(cw, raw, canon["path"])
+    if got != sha:
+        return None, ("blob %s re-identifies as module %s, not the %s this unit is titled for"
+                      % (canon["blob_sha"][:12], got, sha))
+    m = {"sha": sha, "ident_kind": kind, "repo": canon["repo"], "path": canon["path"],
+         "ext": canon["ext"] or os.path.splitext(canon["path"])[1].lower(),
+         "blob_sha": canon["blob_sha"], "ref": canon["ref"],
+         "ref_how": "as recorded when this module was first filed", "size": len(raw),
+         "text": text, "raw": raw, "locations": []}
+    # Through the SAME single writer the scan uses, so tip-beats-omni holds here too and the body's
+    # two location blocks stay disjoint. The canonical place goes first and is a proven live tip.
+    _add_location(m, m["repo"], m["path"], m["blob_sha"], "tip")
+    for lrepo, lpath, lblob, lorigin, lts in canon["locations"]:
+        _add_location(m, lrepo or "", lpath or "", lblob or "", lorigin or "omni", lts or "")
+    return m, None
+
+
+def plan_grafts(cw, cm, rows, base, key, mine, batch):
+    """(plan, notes, unexamined) — what --patch-bodies would do, deciding nothing by guesswork.
+
+    Units are grouped BY MODULE KEY, because the question "is this module's source already on an open
+    ticket?" is asked per module, not per ticket. Per key:
+      * every open unit whose body already carries the source -> nothing to do.
+      * a sourceless unit with an ACTIVE STOP -> left alone. It is either already grafted, or halted
+        by someone else; either way this tool does not act on a ticket that authorizes nothing.
+      * a sourceless, unhalted unit WITH a self-contained sibling already open -> STOP-ONLY: a
+        replacement exists (this is a graft that died between filing it and stopping the original),
+        so the stop is finished and NO second replacement is filed.
+      * a sourceless, unhalted unit with no such sibling -> GRAFT: file the replacement, then stop it.
+    `unexamined` is how many further keys carry a sourceless open unit that --batch stopped this run
+    from looking at; it is reported, never silently dropped, and a re-run continues from there."""
+    by_key = {}
+    for r in rows or []:
+        k = unit_key(r.get("title"))
+        if k:
+            by_key.setdefault(k, []).append(r)
+    keys = sorted(by_key)
+    plan, notes, unexamined = [], [], 0
+    for i, sha in enumerate(keys):
+        if len(plan) >= batch:
+            unexamined = len([k for k in keys[i:]
+                              if any(not body_has_source(u.get("body")) for u in by_key[k])])
+            break
+        group = by_key[sha]
+        good = [u for u in group if body_has_source(u.get("body"))]
+        bad = [u for u in group if not body_has_source(u.get("body"))]
+        if not bad:
+            notes.append((sha, "self-contained already: %s carries the source"
+                          % ", ".join("#%s" % u["id"] for u in good)))
+            continue
+        live = []
+        for u in bad:
+            n = active_stops(base, key, int(u["id"]))
+            if n is None:
+                notes.append((sha, "#%s: ticket.stops unreadable — leaving a unit whose brake state "
+                                   "is unknown alone" % u["id"]))
+            elif n > 0:
+                notes.append((sha, "#%s: already halted (%d active stop(s)) — already grafted, or "
+                                   "stopped by someone else" % (u["id"], n)))
+            else:
+                live.append(u)
+        if not live:
+            continue
+        olds = [int(u["id"]) for u in live]
+        if good:
+            # No blob is read here: nothing is being embedded, so the module only has to be NAMED on
+            # the stop ticket. Whatever names it — ledger or the unit's own body — is enough, and if
+            # neither does, the stop points at the replacement, which certainly does.
+            c = _ledger_canon(sha) or _body_canon(live[0].get("body")) or {}
+            plan.append({"kind": "stop-only", "sha": sha, "olds": olds, "new": int(good[0]["id"]),
+                         "m": None, "canon_from": "", "repo": c.get("repo", ""),
+                         "path": c.get("path", "")})
+            continue
+        canon = _ledger_canon(sha) or _body_canon(live[0].get("body"))
+        if canon is None:
+            notes.append((sha, "#%d: no canonical source is recorded for this module — no ledger row, "
+                               "and its body names no blob. Refusing to embed a source without "
+                               "knowing which one it is" % olds[0]))
+            continue
+        m, why = graft_module(cw, sha, canon)
+        if m is None:
+            notes.append((sha, "#%d: %s — REFUSED to fabricate" % (olds[0], why)))
+            bug_report("plan_grafts", RuntimeError(why),
+                       "python3 %s --patch-bodies" % SELF_FROM_ROOT,
+                       "the canonical blob of an already-filed unit could not be read and proven — "
+                       "the unit is left exactly as it is, and nothing was filed for it")
+            continue
+        prepare(m, cw, cm, mine, supersedes=olds)
+        plan.append({"kind": "graft", "sha": sha, "olds": olds, "new": None, "m": m,
+                     "canon_from": canon["from"], "repo": m["repo"], "path": m["path"]})
+    return plan, notes, unexamined
+
+
+def stop_title(old_id):
+    """The stop ticket's title. It deliberately carries NO `[forge-rw:<16 hex>]` marker: a module key
+    in this title would make the stop look like a rewrite unit to KEY_RE and pollute the idempotency
+    sources every filing run reads."""
+    return "STOP: #%d — forge rewrite unit names a source its worker cannot read (#%d)" % (old_id,
+                                                                                           FIX_TICKET)
+
+
+def stop_body(old_id, new_id, sha, module_desc):
+    return (
+        "HALT #%d. It cannot be executed as filed, and its body cannot be repaired.\n"
+        "\n"
+        "MODULE        : %s\n"
+        "MODULE KEY    : %s\n"
+        "SUPERSEDED BY : #%d — the same module, the same requirements, plus that module's ORIGINAL\n"
+        "                SOURCE embedded verbatim in the body. THE WORK HAPPENS THERE.\n"
+        "\n"
+        "WHY THIS UNIT IS HALTED. #%d names its module's source only as a\n"
+        "`git --git-dir=<forge>/remotes/<repo>.git cat-file blob <sha>` command. The pair_loop WORKER\n"
+        "that executes these units is spawned into the ticket's own congruency worktree and is\n"
+        "SANDBOXED to it: the forge's bare repos are outside that directory, so it cannot run that\n"
+        "command, and no cached copy exists. The unit blocks with \"canonical source unreadable,\n"
+        "refused to fabricate\" — which is the worker behaving CORRECTLY, because #%d demands\n"
+        "behavior PRESERVED and a source you cannot read cannot be preserved. The pilot #259 proved\n"
+        "it end to end. Ticket #%d is the fix, and #%d above is this module's share of it.\n"
+        "\n"
+        "WHY A STOP AND NOT AN EDIT. A ticket's body is PERMANENT in SQL: tg_tickets_immutable_\n"
+        "identity ABORTs any UPDATE that changes id/ts/title/body/component/kind\n"
+        "(migrations/0029_ticket_authorization.sql:111-117), and no route edits a body. So #%d's body\n"
+        "cannot be given the source it lacks. The schema's own remedy for exactly this case is a\n"
+        "GRAFT — \"stop + spawn + supersedes-edge\" (0029_ticket_authorization.sql:8) — and that is\n"
+        "what happened: #%d was filed carrying the source, a `supersedes` edge runs from #%d to #%d,\n"
+        "and this ticket is the stop.\n"
+        "\n"
+        "NOTHING WAS DELETED. #%d, its journal and its edges stay on the record forever; it is halted,\n"
+        "not erased. To release it, aim a `start` ticket at THIS ticket through a `starts` edge (a\n"
+        "start is aimed at the stop ticket it releases — migrations/0030_pair_loop_routes.sql).\n"
+        "Releasing it hands a sandboxed worker the same unreadable unit again, so prefer #%d.\n"
+        "\n"
+        "Filed mechanically by %s under ticket #%d."
+        % (old_id, module_desc, module_key(sha), new_id, old_id, STD_TICKET, FIX_TICKET, new_id,
+           old_id, new_id, new_id, old_id, old_id, new_id, SELF_FROM_ROOT, FIX_TICKET))
+
+
+def progress_note(new_id, stop_id):
+    """The attributed journal entry appended to the superseded unit. The journal is used here for
+    what it IS good for — recording what happened, on the record, forever. It is NOT where the source
+    goes: pair_loop builds a worker's birth prompt from a ticket's title and body only
+    (pair_loop.py:990-992,1028,448), so a journal event never reaches the agent that needs bytes."""
+    return ("superseded by #%d and halted by stop ticket #%d (ticket #%d). This unit named its "
+            "module's source only as a `git cat-file` command against the forge's bare repos, which "
+            "the sandboxed pair_loop worker that executes it cannot run — it blocks with \"canonical "
+            "source unreadable, refused to fabricate\" (proven by the pilot, #259). A ticket body is "
+            "permanent in SQL (tg_tickets_immutable_identity, migrations/0029_ticket_authorization"
+            ".sql:111-117), so this unit was superseded rather than edited: #%d carries the identical "
+            "requirements plus the module's original source embedded verbatim, and needs no forge "
+            "access. Nothing here is deleted — this ticket and its journal stay on the record. Filed "
+            "mechanically by %s." % (new_id, stop_id, FIX_TICKET, new_id, SELF_FROM_ROOT))
+
+
+def register_ticketer(base, key):
+    """Register the agent this tool journals as, before it appends to any ticket's journal.
+
+    agent.register is INSERT OR REPLACE (migrations/0001_agents.sql:19-25), so re-registering every
+    run is the idempotent, intended thing — pair_loop re-registers its git steward the same way on
+    every round. This agent is REGISTERED but never ticket.assign'd; see TICKETER_AGENT."""
+    rest(base, "agent.register", {
+        "agent_id": TICKETER_AGENT, "parent": "forge_refactor_ticketer",
+        "tools": json.dumps(["git ls-tree", "git cat-file", "rest.php governed routes"]),
+        "prompt": "You are %s, the MECHANICAL forge rewrite-ticket factory (%s, authorized by #%d "
+                  "under the refactor standard #%d). You enumerate the forge's unique modules and "
+                  "file one self-contained rewrite unit per module, each carrying that module's "
+                  "original source verbatim so the sandboxed worker that executes it needs no forge "
+                  "access (#%d). You file tickets and journal what you filed; you never author or "
+                  "judge work product, and you are never assigned to a ticket."
+                  % (TICKETER_AGENT, SELF_FROM_ROOT, FACTORY_TICKET, STD_TICKET, FIX_TICKET)},
+        key=key)
+
+
+def has_edge(base, key, parent, child, kind):
+    """True when this exact parent->child edge of `kind` is already recorded. edge.record has no
+    uniqueness (0012_ticket_edges.sql), so this is what keeps a RESUMED graft — one whose replacement
+    was filed before an earlier run died — from recording its `supersedes` edge a second time. An
+    unreadable route answers False: a duplicate edge is untidy, a missing one loses the provenance."""
+    try:
+        rows = rest(base, "children.list", {"parent_id": parent}, method="GET", key=key).get("rows", [])
+    except Exception:                                     # noqa: BLE001
+        return False
+    return any(int(r.get("child_id") or 0) == child and (r.get("kind") or "") == kind for r in rows)
+
+
+def ledger_graft(con, sha, old, new, stop, reason):
+    """Record ONE supersession — AFTER all three tickets exist, so the ledger can never claim a graft
+    that did not happen. Append-only: `modules.ticket_id` still names the ticket the filing run really
+    created, and nothing here is ever updated or deleted."""
+    con.execute("INSERT INTO grafts (ts, module_sha, old_ticket, new_ticket, stop_ticket, reason) "
+                "VALUES (?,?,?,?,?,?)", (time.time(), sha, old, new, stop, reason))
+    con.commit()
+
+
+def do_grafts(base, key, plan):
+    """Execute the plan: per module, a self-contained replacement (unless one is already open), then
+    per superseded unit a `supersedes` edge, a `stop` ticket, a `stops` edge and a journal note.
+
+    ON THE FIRST FAILURE IT STOPS, the way file_batch() does, and for the same reason: a route that
+    just refused will refuse the next call too, and 30 more attempts buy 30 more bug reports and no
+    tickets. Nothing is lost by stopping — every step of this is idempotent, so a re-run once the
+    route works resumes exactly here, including finishing a graft that died mid-way (the plan's
+    stop-only path)."""
+    con = ledger_rw()
+    register_ticketer(base, key)
+    filed = stopped = 0
+    for e in plan:
+        try:
+            if e["kind"] == "graft":
+                m = e["m"]
+                new_id = file_ticket(base, key, m["title"], m["body"])
+                rest(base, "edge.record", {"parent_id": STD_TICKET, "child_id": new_id,
+                                           "kind": "spawned"}, key=key)
+                filed += 1
+                print("== filed == #%-5s %s  [%s, source from %s]"
+                      % (new_id, m["title"], embed_tag(m), e["canon_from"]))
+            else:
+                new_id = e["new"]
+                step("module %s already has a self-contained OPEN unit (#%d) — a graft that did not "
+                     "finish. Filing no second replacement; completing its stop(s) only"
+                     % (module_key(e["sha"]), new_id))
+            for old in e["olds"]:
+                if not has_edge(base, key, new_id, old, "supersedes"):
+                    rest(base, "edge.record", {"parent_id": new_id, "child_id": old,
+                                               "kind": "supersedes"}, key=key)
+                sid = file_ticket(base, key, stop_title(old),
+                                  stop_body(old, new_id, e["sha"],
+                                            "%s:%s" % (e["repo"], e["path"]) if e["repo"] else
+                                            "the module keyed %s — named on #%d"
+                                            % (module_key(e["sha"]), new_id)),
+                                  kind="stop")
+                rest(base, "edge.record", {"parent_id": sid, "child_id": old, "kind": "stops"},
+                     key=key)
+                rest(base, "ticket.progress", {"ticket_id": old, "agent_id": TICKETER_AGENT,
+                                               "note": progress_note(new_id, sid)}, key=key)
+                ledger_graft(con, e["sha"], old, new_id, sid,
+                             "body carried no embedded source; a body is immutable in SQL, so the "
+                             "unit was superseded (#%d)" % FIX_TICKET)
+                stopped += 1
+                print("== superseded == #%-5s -> #%-5s (stop #%s, journaled)" % (old, new_id, sid))
+        except Exception as exc:                          # noqa: BLE001
+            step("FAILED while grafting %s: %s — stopping here. Nothing is lost: every step is "
+                 "idempotent, so a re-run once the route works resumes at this module and finishes "
+                 "any half-done graft" % (module_key(e["sha"]), exc))
+            bug_report("do_grafts", exc,
+                       "python3 %s --patch-bodies --file-tickets" % SELF_FROM_ROOT, exc)
+            break
+    con.close()
+    step("%d self-contained replacement(s) filed (each edged `spawned` from #%d); %d superseded "
+         "unit(s) halted and journaled" % (filed, STD_TICKET, stopped))
+    return filed, stopped
+
+
+def report_grafts(plan, notes, unexamined, units, batch):
+    print("== forge unit source back-fill (--patch-bodies) ==  %d open forge rewrite unit(s) in the "
+          "queue" % units)
+    if notes:
+        print("\n-- units needing nothing, or deliberately left alone (reported, never silently "
+              "dropped)")
+        for sha, why in notes:
+            print("   %s  %s" % (module_key(sha), why))
+    print("\n-- planned supersessions (%d; --batch %d)" % (len(plan), batch))
+    for e in plan:
+        olds = ", ".join("#%d" % o for o in e["olds"])
+        if e["kind"] == "graft":
+            m = e["m"]
+            print("   %s  %-14s %-22s %s:%s"
+                  % (module_key(e["sha"]), embed_tag(m),
+                     "%s -> new unit" % olds, m["repo"], m["path"]))
+        else:
+            print("   %s  %-14s %-22s %s:%s  (replacement is already open — only the stop is left)"
+                  % (module_key(e["sha"]), "(no re-file)", "%s -> #%d" % (olds, e["new"]),
+                     e["repo"] or "?", e["path"] or "?"))
+    if unexamined:
+        print("\n   ... and at most %d further module key(s) with a sourceless open unit were NOT "
+              "examined\n       this run (--batch %d). Nothing is lost: re-run to continue — this "
+              "mode is idempotent." % (unexamined, batch))
+    print("\n== totals == %d unit(s) would be superseded by %d self-contained replacement(s); %d "
+          "module key(s) need nothing" % (sum(len(e["olds"]) for e in plan),
+                                          len([e for e in plan if e["kind"] == "graft"]), len(notes)))
+
+
+def patch_bodies(a, cw, cm, key, rows):
+    """--patch-bodies, end to end: plan, report, and (only with --file-tickets) graft."""
+    units = len([r for r in rows if unit_key(r.get("title"))])
+    plan, notes, unexamined = plan_grafts(cw, cm, rows, a.base, key, not a.no_exemplars, a.batch)
+    report_grafts(plan, notes, unexamined, units, a.batch)
+
+    if a.json:
+        with open(a.json, "w") as fh:
+            json.dump([{"action": e["kind"], "key": module_key(e["sha"]), "module_sha": e["sha"],
+                        "supersedes": e["olds"], "replacement_already_open": e["new"],
+                        "canonical_source_from": e["canon_from"],
+                        "repo": e["repo"], "path": e["path"],
+                        "blob_sha": (e["m"] or {}).get("blob_sha", ""),
+                        "size": (e["m"] or {}).get("size", 0),
+                        # Same shape the scan's --json uses, so ONE check verifies either: extract
+                        # between the markers, decode if base64, diff against `cat-file blob`.
+                        "source_embedded": bool(e["m"]),
+                        "source_truncated": bool(e["m"] and e["m"]["embed"]["truncated"]),
+                        "source_base64": bool(e["m"] and e["m"]["embed"]["binary"]),
+                        "source_bytes_embedded": (e["m"] or {}).get("embed", {}).get("shown", 0),
+                        "source_begin_marker": (e["m"] or {}).get("embed", {}).get("begin", ""),
+                        "source_end_marker": (e["m"] or {}).get("embed", {}).get("end", ""),
+                        "title": (e["m"] or {}).get("title", ""),
+                        "body": (e["m"] or {}).get("body", "")} for e in plan], fh, indent=2)
+        print("== json == %s" % a.json)
+
+    if not a.file_tickets:
+        print("\n== dry == reported only; no ticket was filed, nothing was stopped, no journal entry "
+              "was appended and no db was written%s. Add --file-tickets to execute the %d "
+              "supersession(s) above."
+              % (" (only the --json dump at %s was created)" % a.json if a.json
+                 else ", and no file was created", len(plan)))
+        return 0
+    if not key:
+        die("no CONGRUENCY_API_KEY (../.secrets/ats.env or the environment) — cannot file")
+    if not plan:
+        print("\n== nothing to patch == every open forge rewrite unit either already carries its "
+              "original source or is already halted; filed 0, stopped 0.")
+        return 0
+    print()
+    do_grafts(a.base, key, plan)
+    return 0
+
+
 # ── report ───────────────────────────────────────────────────────────────────────────────────────
 def report(todo, scanned, skipped, repos, chain, batch, hwm, start_at, dupes, repos_left):
     print("== forge refactor ticketer ==  chain %r: %d repo(s) in scope, resuming at #%d of them "
@@ -1531,20 +2275,27 @@ def report(todo, scanned, skipped, repos, chain, batch, hwm, start_at, dupes, re
               "NOT\n   drained: the mark is kept before it and the next run of this chain re-walks it.")
         for name, why in skipped:
             print("   %-52s %s" % (why, name))
-    print("\n-- unique modules this run would file (%d; --batch %d)" % (len(todo), batch))
+    print("\n-- unique modules this run would file (%d; --batch %d). `src` is what each ticket's\n"
+          "   EMBEDDED SOURCE block carries (#%d): the module's own bytes, so its worker needs no\n"
+          "   forge access. `CUT` marks a blob over the %d-byte cap, embedded truncated."
+          % (len(todo), batch, FIX_TICKET, MAX_EMBED_BYTES))
     for m in todo:
         copies = len([l for l in m["locations"] if l["origin"] == "tip"])
-        print("   [%-6s] %s  %-28s %s:%s"
-              % (m["ident_kind"], module_key(m["sha"]),
+        print("   [%-6s] %s  %-16s %-28s %s:%s"
+              % (m["ident_kind"], module_key(m["sha"]), embed_tag(m),
                  "" if copies < 2 else "(+%d copy/copies -> 1 ticket)" % (copies - 1),
                  m["repo"], m["path"]))
     # `repos_left` here is the SCAN's projection — what would be left if every module below files.
     # It is not the last word: a module that fails to file holds its repo too, so file_batch() prints
     # the mark and the repo count it actually recorded. Saying "would leave" keeps this line from
     # contradicting that one on a run where filing goes wrong.
+    cut = [m for m in todo if m["embed"]["truncated"]]
     print("\n== totals == scanned %d repo(s) -> %d unique un-ticketed module(s) to file; %d file(s) "
-          "collapsed into an existing/earlier ticket by module-sha (the dedup); filing them all would "
-          "leave %d repo(s) for the successor" % (len(scanned), len(todo), dupes, repos_left))
+          "collapsed into an existing/earlier ticket by module-sha (the dedup); %d ticket(s) embed "
+          "their module's COMPLETE source and %d embed a TRUNCATED excerpt (over the %d-byte cap, so "
+          "those DO still need forge access and say so); filing them all would leave %d repo(s) for "
+          "the successor" % (len(scanned), len(todo), dupes, len(todo) - len(cut), len(cut),
+                             MAX_EMBED_BYTES, repos_left))
 
 
 def main():
@@ -1558,9 +2309,23 @@ def main():
                     help="actually file one build ticket per un-ticketed unique module, through "
                          "rest.php's governed ticket.create/ticket.kind/edge.record routes, and "
                          "record them in the ledger (default: report only, no writes, no files)")
+    ap.add_argument("--patch-bodies", action="store_true",
+                    help="BACK-FILL the original source into the forge units ALREADY FILED without "
+                         "it (#%d). It does NOT edit a body — it cannot: a ticket body is immutable "
+                         "in SQL (tg_tickets_immutable_identity, migrations/"
+                         "0029_ticket_authorization.sql:111-117). Per sourceless OPEN unit it does "
+                         "the graft the schema itself prescribes (0029:8): files a self-contained "
+                         "REPLACEMENT carrying the module's source, edges it `supersedes` -> the "
+                         "original, aims a `stop` ticket at the original, and journals why on it "
+                         "(ticket.progress). Idempotent: a unit already carrying its source, or "
+                         "already halted, is left alone. Reports only unless --file-tickets; honors "
+                         "--batch, --no-exemplars and --json; refuses --subset (this mode reads the "
+                         "ticket QUEUE, which is not scoped by forge repo)" % FIX_TICKET)
     ap.add_argument("--batch", type=int, default=25, metavar="N",
                     help="file at most N module tickets this run, then spawn a successor for the "
-                         "rest (the #196 self-repopulating pattern; default 25)")
+                         "rest (the #196 self-repopulating pattern; default 25). Under "
+                         "--patch-bodies it bounds the supersessions per run instead, and no "
+                         "successor is involved: re-run to continue")
     ap.add_argument("--subset", default="", metavar="SPEC",
                     help="only forge repos whose NAME contains SPEC — the acceptance run of #201. It "
                          "also names the drain chain, so a subset drain and a full drain never block "
@@ -1608,6 +2373,13 @@ def main():
         die("--batch must be 1 or more (got %d)" % a.batch)
     if a.gen is not None and a.gen < 0:
         die("--gen must be 0 or more (got %d)" % a.gen)
+    if a.patch_bodies and a.subset:
+        # Refused rather than ignored: --subset LOOKS like it scopes the work, and here it cannot.
+        # --patch-bodies works from the ticket QUEUE, whose units are keyed by module-sha and carry
+        # no forge-repo scope, so honouring it would mean silently doing nothing or silently doing
+        # everything. Both are worse than one line.
+        die("--subset selects forge repos to SCAN; --patch-bodies works from the ticket queue "
+            "instead, which is not scoped by forge repo — re-run --patch-bodies without --subset")
     exts = tuple(e if e.startswith(".") else "." + e
                  for e in (x.strip().lower() for x in a.ext.split(",")) if e) or SOURCE_EXT
 
@@ -1632,6 +2404,15 @@ def main():
     cw, cm = load_codebean()
     step("codebean loaded: _ast_norm + lower_node (#183)%s"
          % ("" if a.no_exemplars else ", criteria_miner.mine (#200 exemplars)"))
+
+    # ── --patch-bodies: a distinct mode. It reads the ticket QUEUE, not the forge's repo list, so it
+    #    never walks the forge, never touches the high-water-mark and never spawns a successor. It
+    #    still reads the forge — one cat-file per module it grafts, to embed the real bytes.
+    if a.patch_bodies:
+        if rows is None:
+            die("cannot read the live ticket.queue at %s — --patch-bodies works FROM the queue (is "
+                "the server up? try --base URL)" % a.base)
+        return patch_bodies(a, cw, cm, key, rows)
 
     repos = forge_repos(a.subset)
     if not repos:
@@ -1693,12 +2474,18 @@ def main():
     new_hwm, _, repos_left = mark_for(names, drained_idx, cap_idx)
 
     for m in todo:
-        m["capture"] = capture_behavior(cw, cm, m["text"], not a.no_exemplars)
-        m["title"] = module_title(m)
-        m["body"] = module_body(m)
+        prepare(m, cw, cm, not a.no_exemplars)
     step("captured behavior for %d module(s): %d with mined IO exemplars, %d with a callable "
          "surface only" % (len(todo), len([m for m in todo if m["capture"]["exemplars"]]),
                            len([m for m in todo if not m["capture"]["exemplars"]])))
+    step("embedded source for %d module(s): %d complete, %d truncated at the %d-byte cap, %d "
+         "base64'd (not UTF-8 text). Every ticket below is readable by a worker with NO forge "
+         "access%s (#%d)"
+         % (len(todo), len([m for m in todo if not m["embed"]["truncated"]]),
+            len([m for m in todo if m["embed"]["truncated"]]), MAX_EMBED_BYTES,
+            len([m for m in todo if m["embed"]["binary"]]),
+            "" if not any(m["embed"]["truncated"] for m in todo) else
+            " EXCEPT the truncated one(s), which say so on their own face", FIX_TICKET))
 
     report(todo, scanned, skipped, repos, chain, a.batch, hwm, start_at, dupes, repos_left)
 
@@ -1707,6 +2494,15 @@ def main():
             json.dump([{"key": module_key(m["sha"]), "module_sha": m["sha"],
                         "ident_kind": m["ident_kind"], "repo": m["repo"], "path": m["path"],
                         "ref": m["ref"], "blob_sha": m["blob_sha"], "size": m["size"],
+                        # The #346 acceptance is checkable straight off this dump: "body" holds the
+                        # module's own bytes between the markers, and these say which of the four
+                        # embedding cases produced them.
+                        "source_embedded": True,
+                        "source_truncated": m["embed"]["truncated"],
+                        "source_base64": m["embed"]["binary"],
+                        "source_bytes_embedded": m["embed"]["shown"],
+                        "source_begin_marker": m["embed"]["begin"],
+                        "source_end_marker": m["embed"]["end"],
                         "locations": m["locations"], "title": m["title"], "body": m["body"],
                         "callables": m["capture"]["callables"],
                         "exemplars": m["capture"]["exemplars"]} for m in todo], fh, indent=2)
