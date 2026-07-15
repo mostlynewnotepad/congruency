@@ -69,6 +69,14 @@
 // server.go:636-670 can be pointed at it by whoever owns that file, in one line, with no change
 // here. Nothing in this package writes to the DB or to disk.
 //
+// "THIS FILE ALONE" IS A PER-TICKET DELIVERABLE RULE, NOT A PACKAGE RULE — and the distinction
+// matters now, so read it before you think two parts of this header disagree. Each of #226 and
+// #281 was scoped to engine.go and could add no second file, which is why the sqlite plumbing is
+// re-derived here and why the invariants live in SelfCheck instead of a _test.go. The PACKAGE has
+// never been limited to one file, and #281 exists precisely to make more files the normal way to
+// grow it: from #246 on, every newly ported tag is its OWN congruency-go/tags/<Tag>.go that
+// self-registers from init() and changes nothing in here. See "The registry" section below.
+//
 // ── RE2 HAS NO LOOKAROUND: three hand-ports, not regex translations ─────────────────────────────
 //
 // Go's regexp is RE2, which by design has no lookahead or lookbehind. Three PHP patterns use them,
@@ -96,8 +104,12 @@
 //     worktree either — .gitignore:11 lists it. No *.sqlite exists anywhere under the repo root.
 //
 // So "renders IDENTICAL HTML to the PHP" is, in this file, a claim derived by PORTING THE SOURCE
-// LINE BY LINE — not a measured result, and it is not reported as one. What WAS actually run here
-// (go1.26.5, this session):
+// LINE BY LINE — not a measured result, and it is not reported as one.
+//
+// Each block below is attributed to the ticket whose session actually ran it. Nothing here is
+// carried forward as "verified" by a later ticket that did not re-run it.
+//
+// WHAT #226 RAN when it wrote this port (go1.26.5):
 //
 //   - `go build` and `go vet` clean.
 //   - SelfCheck() — every parser/engine/PHP-primitive invariant below, computed against values read
@@ -113,14 +125,39 @@
 //     and the flood-grouping folding 3 rows while leaving a one-word 'Research:' stem ungrouped.
 //   - The open-mode side-effect + staleness probe quantified in openDB's comment.
 //
-// NOT run, and therefore NOT claimed: a byte-diff against PHP, for any tag.
+// WHAT #281 RE-RAN for the registry refactor (go1.26.5, this session). #281 changed HOW the
+// registry is filled, so what it had to prove is that the observable surface did not move:
+//
+//   - `go build ./...`, `go vet ./...` and `gofmt -l` clean, before and after the refactor.
+//   - SelfCheck() green, now including the registry invariants at the end of SelfCheck (each of
+//     the 10 present and constructible, PortedTags sorted and deduped, IsPorted's negatives, and
+//     Register's three panics leaving the registry unmutated). Those invariants are deliberately
+//     ADDITIVE-SAFE — subset and floor, never equality — so that #246+ adding a <Tag>.go keeps
+//     SelfCheck green without editing this file; the comment on them says why that is required.
+//   - THE EQUIVALENCE THAT MATTERS: the whole observable registry surface dumped from the
+//     PRE-refactor file and the POST-refactor file and diffed — SelfCheck's result, PortedTags()
+//     in order, IsPorted() over all 45 names Scan lists plus negatives, and newTag()'s (ok,
+//     concrete Go type) for every ported name with both nil and real arguments. The two dumps are
+//     IDENTICAL, which is what "preserve IsPorted/lookup behavior byte-for-byte" means here.
+//   - Scan() against the REAL invocators/tags tree again: still 45, so the COVERAGE arithmetic
+//     below (45 listed, 10 ported, 35 not) still holds after the refactor.
+//   - `go test -race` over concurrent newTag/IsPorted/PortedTags with a Register racing them:
+//     clean, which is the claim registryMu is there to earn.
+//
+// NOT run, and therefore NOT claimed: a byte-diff against PHP, for any tag — by #226 or by #281.
+// #281 also did not re-run #226's synthetic-db RenderTag sweep or its end-to-end Render (both need
+// a DB to be built up first); it proves the registry's own surface instead, which is the only thing
+// it touched. php and congruency.sqlite are both still absent from this checkout, re-checked this
+// session — so that gate is no more runnable now than it was for #226.
 //
 // To CLOSE the gate (the byte-diff #226 actually asks for) once php + the state DB are provisioned:
 //
 //	go run ./tags -equivalence -php http://127.0.0.1:8899 -db <state>/congruency.sqlite
 //
-// ...is NOT provided, because this package is a library and #226 forbids adding a second file to
-// hold a main() or a _test.go. Drive it instead from the repo's established harness pattern — the
+// ...is NOT provided, because this package is a library and neither #226 nor #281 could add a
+// second file to hold a main() or a _test.go (see "THIS FILE ALONE" above — a ticket whose
+// deliverable covers those files may add them). Drive it instead from the repo's established
+// harness pattern — the
 // PHP-vs-Go byte sweep in congruency-go/equivalence_test.go (#227), which fetches each route from
 // the live PHP twice around the Go run (the "stability sandwich", equivalence_test.go:22-27) so a
 // concurrent write reports VOLATILE instead of false-failing. The tag analogue is:
@@ -199,6 +236,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -1251,6 +1289,36 @@ func safeRows(db *sql.DB, query string, args ...any) []map[string]any {
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The registry — the Go stand-in for TAG_LOADER->loadClassByName($n) + `new $n($args)`.
+//
+// ── HOW A TAG GETS IN HERE (#281): ADD A FILE; CHANGE NOTHING CENTRAL ───────────────────────────
+//
+// The registry is a MUTABLE map, populated at process start by Register, which each tag calls from
+// an init() in ITS OWN FILE. To port a tag, add congruency-go/tags/<Tag>.go holding that tag's
+// type, its GetDocument, and its self-registration:
+//
+//	func init() {
+//	    Register("Foo", func(e *Engine, a *TagArguments) Tag { return &FooTag{e: e, args: a} })
+//	}
+//
+// ...and NOTHING in engine.go changes. That is the whole point of #281. This file previously held
+// a hardcoded map literal naming every tag inline, so adding a tag meant EDITING that literal —
+// which would have made the 45 remaining per-tag ports (#246+) all collide on this one file and
+// forced them to serialize. With self-registration they are add-a-file-only, and therefore run
+// fully in parallel.
+//
+// WHY init() IS ENOUGH. Go initializes a package — every init() in it, in every file — before any
+// other code in that package runs (Go spec, "Package initialization"). So the registry is complete
+// before the first newTag/IsPorted/PortedTags call can happen, with no explicit wiring step to
+// forget. Order across files is irrelevant: Register is order-independent (it only inserts) and
+// PortedTags sorts its own output, so the observable surface does not depend on which file's
+// init() ran first.
+//
+// WHY THE 10 EXISTING TAGS ARE STILL REGISTERED HERE. #281's deliverable is engine.go alone
+// ("touch nothing else"), so the tags #226 ported self-register from the single init() below
+// rather than from 10 new files. That init() is the PROOF the mechanism carries the real set —
+// it is not a special case: its Register calls are ordinary ones, and moving any of the 10 into
+// its own <Tag>.go later is a cut-and-paste of that tag's Register line into that file's init(),
+// with no edit to anything here.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 // tagFactory constructs one tag. args mirrors the PHP constructor's $arguments and is NIL when the
@@ -1259,23 +1327,73 @@ func safeRows(db *sql.DB, query string, args ...any) []map[string]any {
 // the way its PHP handles NULL.
 type tagFactory func(e *Engine, args *TagArguments) Tag
 
-var registry = map[string]tagFactory{
-	"TagList":        func(e *Engine, a *TagArguments) Tag { return &TagListTag{e: e, args: a} },
-	"TicketList":     func(e *Engine, a *TagArguments) Tag { return &TicketListTag{e: e, args: a} },
-	"TreeView":       func(e *Engine, a *TagArguments) Tag { return &TreeViewTag{e: e, args: a} },
-	"OmniExplorer":   func(e *Engine, a *TagArguments) Tag { return &OmniExplorerTag{e: e, args: a} },
-	"ForgeView":      func(e *Engine, a *TagArguments) Tag { return &ForgeViewTag{e: e, args: a} },
-	"MemGraph":       func(e *Engine, a *TagArguments) Tag { return &MemGraphTag{e: e, args: a} },
-	"BugCatalog":     func(e *Engine, a *TagArguments) Tag { return &BugCatalogTag{e: e, args: a} },
-	"SemanticSearch": func(e *Engine, a *TagArguments) Tag { return &SemanticSearchTag{e: e, args: a} },
-	"CategoryBrowse": func(e *Engine, a *TagArguments) Tag { return newCategoryBrowseTag(e, a) },
-	"FormTag":        func(e *Engine, a *TagArguments) Tag { return newFormTag(e, a) },
+// registry maps tag name -> factory. NEVER assign to it directly: Register is its only writer, and
+// direct assignment would bypass the duplicate check that stands in for what the compiler used to
+// do (see Register).
+var registry = map[string]tagFactory{}
+
+// registryMu guards registry. The map literal this replaced was fixed at compile time and so was
+// race-free by construction; a map that is written at run time is not, and Register is exported —
+// so the lock KEEPS that property rather than leaving it to callers' discipline. In the intended
+// use (Register from init(), which runs single-threaded before main) it is uncontended, and the
+// read path takes only RLock, which costs nothing beside the SQL every real tag runs.
+var registryMu sync.RWMutex
+
+// Register adds name's factory to the registry, and is the ONLY supported way in. Call it from an
+// init() in the tag's own file (see the section header above); calling it later is allowed and
+// safe, but a tag registered after a render has begun will not appear in a page already served.
+//
+// It PANICS on an empty name, a nil factory, or a name already registered. This is deliberate, and
+// it is NOT in tension with divergence 1 ("a crash is a #226 finding") in the file header: that
+// divergence is about CONTENT — an unknown tag name in a stored document must never take the page
+// down, and it still does not (newTag returns ok=false and the caller emits a marked literal).
+// These three panics are programmer errors in registration code, they are independent of any input
+// or DB state, and they fire during package init — before any request exists to break. A duplicate
+// name in the old map literal was a COMPILE error ("duplicate key in map literal"); two files
+// claiming the same tag is the same mistake, so it stays loud and immediate instead of silently
+// letting one file's factory shadow another's.
+func Register(name string, f func(e *Engine, args *TagArguments) Tag) {
+	if name == "" {
+		panic("tags.Register: empty tag name")
+	}
+	if f == nil {
+		panic("tags.Register: nil factory for tag " + name)
+	}
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	if _, dup := registry[name]; dup {
+		panic("tags.Register: duplicate registration for tag " + name)
+	}
+	registry[name] = f
+}
+
+// init self-registers the 10 tags #226 ported. These lines are the former map literal, one
+// Register call per entry and byte-identical factories — PortedTags/IsPorted/newTag therefore
+// answer exactly as they did before #281. See the section header for why these 10 live here
+// instead of in 10 files, and how to move them out.
+func init() {
+	Register("TagList", func(e *Engine, a *TagArguments) Tag { return &TagListTag{e: e, args: a} })
+	Register("TicketList", func(e *Engine, a *TagArguments) Tag { return &TicketListTag{e: e, args: a} })
+	Register("TreeView", func(e *Engine, a *TagArguments) Tag { return &TreeViewTag{e: e, args: a} })
+	Register("OmniExplorer", func(e *Engine, a *TagArguments) Tag { return &OmniExplorerTag{e: e, args: a} })
+	Register("ForgeView", func(e *Engine, a *TagArguments) Tag { return &ForgeViewTag{e: e, args: a} })
+	Register("MemGraph", func(e *Engine, a *TagArguments) Tag { return &MemGraphTag{e: e, args: a} })
+	Register("BugCatalog", func(e *Engine, a *TagArguments) Tag { return &BugCatalogTag{e: e, args: a} })
+	Register("SemanticSearch", func(e *Engine, a *TagArguments) Tag { return &SemanticSearchTag{e: e, args: a} })
+	Register("CategoryBrowse", func(e *Engine, a *TagArguments) Tag { return newCategoryBrowseTag(e, a) })
+	Register("FormTag", func(e *Engine, a *TagArguments) Tag { return newFormTag(e, a) })
 }
 
 // newTag is `$tag_loader->loadClassByName($n); new $n($args);`. ok=false is "no Go port" — see
 // divergence 1 in the file header for why that is not a panic.
+//
+// The factory is called AFTER the lock is dropped: constructing a tag is the caller's work, it can
+// run arbitrarily long (newFormTag/newCategoryBrowseTag read arguments), and holding the registry
+// lock across it would serialize concurrent renders for no reason.
 func newTag(e *Engine, name string, args *TagArguments) (Tag, bool) {
+	registryMu.RLock()
 	f, ok := registry[name]
+	registryMu.RUnlock()
 	if !ok {
 		return nil, false
 	}
@@ -1286,16 +1404,23 @@ func newTag(e *Engine, name string, args *TagArguments) (Tag, bool) {
 // T for which `?page=tags&tag=<T>` is a meaningful Go-vs-PHP byte diff today; every other name that
 // Scan lists renders as a marked divergence notice instead. See COVERAGE in the file header.
 func PortedTags() []string {
+	registryMu.RLock()
 	out := make([]string, 0, len(registry))
 	for n := range registry {
 		out = append(out, n)
 	}
+	registryMu.RUnlock()
 	sort.Strings(out)
 	return out
 }
 
 // IsPorted reports whether name has a Go port.
-func IsPorted(name string) bool { _, ok := registry[name]; return ok }
+func IsPorted(name string) bool {
+	registryMu.RLock()
+	_, ok := registry[name]
+	registryMu.RUnlock()
+	return ok
+}
 
 // Scan is TagList::scan() (TagList.php:22-37) — the gallery's tag list.
 //
@@ -4228,6 +4353,55 @@ func SelfCheck() error {
 		fails = append(fails, fmt.Sprintf("merge: a both-axis hit must outrank a higher-scoring single-axis hit; got %#v", both))
 	}
 
+	// ── the registry (#281): init()-based self-registration ──
+	//
+	// These pin the property #281 exists to create — the registry is filled by Register from
+	// init(), not by a literal — and the property #281 must NOT change: the tags #226 ported are
+	// still there, still looked up the same way. If a per-tag <Tag>.go is added later and its
+	// init() does not run, these are what say so.
+	//
+	// EVERY CHECK HERE IS ADDITIVE-SAFE, AND THAT IS A HARD REQUIREMENT, NOT A STYLE CHOICE.
+	// #281 exists so that #246+ can each add a <Tag>.go and change NOTHING central. An invariant
+	// that asserts the registry holds EXACTLY these 10 names, or that some specific unported name
+	// is absent, would break the moment the first of those tickets lands — and "fixing" it would
+	// mean editing engine.go, which is the very collision #281 removes. So: the 10 are asserted as
+	// a SUBSET (each present), never as the whole set; the count is a floor, never an equality;
+	// and the negatives below are names that can NEVER be legitimately registered, never merely
+	// names that are unported today. Do not tighten these into equalities.
+	ported := []string{"BugCatalog", "CategoryBrowse", "ForgeView", "FormTag", "MemGraph",
+		"OmniExplorer", "SemanticSearch", "TagList", "TicketList", "TreeView"}
+	check("registry: init() populated it (a literal no longer does)", len(PortedTags()) > 0, true)
+	check("registry: at least the 10 tags #226 ported are registered", len(PortedTags()) >= len(ported), true)
+	for _, n := range ported {
+		check("registry: IsPorted("+n+") — #226's port survives #281", IsPorted(n), true)
+		tg, ok := newTag(NewEngine(Config{}), n, nil)
+		check("registry: newTag("+n+", nil) constructs", ok && tg != nil, true)
+	}
+	// PortedTags must stay sorted and duplicate-free however many files register into it.
+	check("registry: PortedTags is sorted and deduped", sort.StringsAreSorted(PortedTags()) &&
+		len(uniq(PortedTags())) == len(PortedTags()), true)
+	// The negative half of the lookup. Both names are permanently unregisterable: Register panics
+	// on the empty name, and FUNCTION_NAME is [a-zA-Z]+ so a name with a digit can never be
+	// invoked from content — no <Tag>.go will ever claim either, so neither check can rot.
+	for _, n := range []string{"", "ZzzNotARealTag0"} {
+		check("registry: IsPorted("+n+") is false", IsPorted(n), false)
+	}
+	check("registry: newTag of an unregistered name is (nil,false), never a panic",
+		fmt.Sprint(func() (Tag, bool) { return newTag(NewEngine(Config{}), "ZzzNotARealTag0", nil) }()),
+		"<nil> false")
+
+	// Register's three programmer-error panics (see Register). Each must fire BEFORE the write, so
+	// none of them may leave the registry mutated — SelfCheck performs no I/O and no side effects,
+	// and that includes not registering anything itself. The comparison is relative (before vs
+	// after), so it too holds no matter how many tags are registered.
+	before := PortedTags()
+	check("Register: a duplicate name panics (the map literal made it a compile error)",
+		panics(func() { Register("TagList", func(*Engine, *TagArguments) Tag { return literalTag{"x"} }) }), true)
+	check("Register: an empty name panics",
+		panics(func() { Register("", func(*Engine, *TagArguments) Tag { return literalTag{"x"} }) }), true)
+	check("Register: a nil factory panics", panics(func() { Register("NeverRegistered", nil) }), true)
+	check("Register: a rejected registration does not mutate the registry", PortedTags(), before)
+
 	if len(fails) > 0 {
 		return fmt.Errorf("SelfCheck: %d invariant(s) failed:\n%s", len(fails), strings.Join(fails, "\n"))
 	}
@@ -4236,3 +4410,28 @@ func SelfCheck() error {
 
 func mustPop(a *TagArguments) string { v, _ := a.Pop(); return v }
 func mustKey(k string) string        { v, _ := validatePageKey(k); return v }
+
+// uniq returns s with adjacent duplicates dropped. SelfCheck uses it on the already-sorted
+// PortedTags, where adjacent-only is the same as global.
+func uniq(s []string) []string {
+	out := s[:0:0]
+	for i, v := range s {
+		if i == 0 || v != s[i-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// panics reports whether f panicked. It is SelfCheck's way of asserting Register's guard rails
+// without a testing package — #281's deliverable is engine.go alone, so there is no _test.go to
+// put them in (see "THIS FILE ALONE" in the header).
+func panics(f func()) (did bool) {
+	defer func() {
+		if recover() != nil {
+			did = true
+		}
+	}()
+	f()
+	return false
+}
