@@ -92,6 +92,49 @@ forty), each shown with the index's own `ts` for its first row — `ts` is usual
 `occ`; a blob that is absent simply contributes no extra locations (the index is enrichment, and this
 tool runs fine with it missing entirely). It is opened `immutable=1` and NEVER written.
 
+TIP BEATS OMNI — A PLACE IS ONE PLACE, AND 'origin' IS ONLY HOW IT WAS LEARNED. Because the index
+knows ~86% of tip blobs, most of a module's LIVE copies are seen FIRST as index rows: the module is
+met in one repo, the index immediately names the other places that blob sits at, and the scan reaches
+those repos only later. A location is therefore keyed by the PLACE it names — (repo, path) — and
+`origin` records how that place was learned, NOT what it is:
+    'tip'  — a scan ENUMERATED the module there, live, at that repo's tip. It is a source location
+             the rewrite MUST satisfy, it is listed under the ticket body's "ALSO LIVES AT THESE
+             FORGE TIPS", and it counts toward the report's "(+N copy/copies -> 1 ticket)".
+    'omni' — the index records the blob there historically. Context the ticket carries, not work.
+So when the scan enumerates a place the index had already named, the location is UPGRADED 'omni' ->
+'tip' rather than dropped as a duplicate of it — in ONE place for the run (_add_location()) and one
+for the ledger (_ledger_add_location()). The reverse is never applied: an index row for a place
+already proven live adds nothing and is ignored, never a downgrade.
+  This is not a hypothetical tidiness. Matching a location on (repo, path) while IGNORING origin
+  made the enrichment index actively DESTROY truth, and only when it was working: a ticket declared
+  its module "unique to <repo> among the repos scanned so far" while the very same run had already
+  enumerated a byte-identical LIVE copy at another repo's tip, rendered that live copy under
+  "HISTORICAL OCCURRENCES ... Context for the rewrite, not extra work" — directly contradicting the
+  body's own "every location below is satisfied by that one rewrite" — and understated the
+  "(+N copy/copies)" annotation that IS this tool's acceptance evidence for "copies share a ticket,
+  verified". Measured on the real `coupler` subset: NINE of its fourteen tickets carried a live tip
+  of a repo the same run had enumerated, typed 'omni' — so each printed "(+1 copy/copies)" for a
+  module that in fact lives at THREE tips, and now correctly prints "(+2 copy/copies)". Toggling
+  ONLY the index across two otherwise-identical runs used to change those tip facts, which is the
+  plainest statement of the defect: an index documented as pure ENRICHMENT was deciding what the
+  forge's live tips are. The dedup was never affected (one ticket per unique module always held);
+  what was wrong was the ticket CONTENT this tool exists to produce, and the origin the ledger hands
+  to #193/#194.
+  WHAT THE UPGRADE DOES NOT DO, stated because the rule above must not be read as more than it is.
+  A place is matched by the index's own (repo, path) STRINGS, and `occ.repo` is its OWN namespace:
+  it does not always use the forge's remote-directory names (the index says
+  `testmonkeyalpha/audio_tagger` where the forge mirror is `gitlab__testmonkeyalpha__audio_tagger`,
+  though it says plain `coupler` for that one, which is why the demotion bit 9 of 14 coupler
+  tickets). So where the two namespaces disagree, the index's row for a place is not recognised as
+  the live tip it may describe and stays in the HISTORICAL list, possibly naming under another name
+  a repo that also appears above. Reconciling repo identity across namespaces is the UNIVERSAL
+  RESOLVER's job — #193, still REQUESTED — and this tool does not guess at it.
+  This limit is one-directional and cannot cost a rewrite any work: THE TIP LIST IS BUILT SOLELY
+  FROM WHAT THE SCAN ITSELF ENUMERATED, never from the index, so every live copy a run reads is
+  listed as a tip and counted as a copy no matter what the index calls its repo. The worst the
+  mismatch can do is leave a redundant line in the historical list, which is explicitly context and
+  not work. The failure it replaces did the opposite: it took a live copy OUT of the tip list.
+
 BEHAVIORAL EXEMPLARS (#200's "verified, not asserted"). For each module it files, this tool captures:
   * THE CALLABLE SURFACE — every top-level function and class method, lowered with codebean's
     `lower_node` (#183), giving each callable's real name/params/returns. This is the contract the
@@ -116,8 +159,12 @@ IF NOT EXISTS. No RECORD is ever deleted — the one row that is rewritten is th
 what a bookmark is for, and every position it ever held is kept forever in `runs`:
     modules      (module_sha PK, ident_kind, ext, ticket_id, title, canonical repo/path/blob, ...)
                  -- the idempotency ledger the ticket requires: one row per module-sha ever filed
-    locations    (module_sha, repo, path, blob_sha, origin)  -- the cluster: every place it lives,
-                 origin 'tip' (found by a scan) or 'omni' (joined from the blob index)
+    locations    (module_sha, repo, path, blob_sha, origin)  -- the cluster: every PLACE it lives,
+                 ONE row per (repo, path), `origin` recording how that place was learned — 'tip'
+                 (a scan enumerated it live at a repo's tip) or 'omni' (joined from the blob index,
+                 historical only). A place learned BOTH ways is one row, typed 'tip': the live tip
+                 supersedes the historical row rather than adding a second one for the same place.
+                 See TIP BEATS OMNI above, and _ledger_add_location() for the rule.
     chain_state  (chain PK, hwm_repo, ...)  -- the HIGH-WATER-MARK per drain chain. ONE row per
                  chain, REPLACED as the drain advances, and set back (to an earlier repo, or to NULL
                  = nothing proven drained) when a run DISPROVES the standing mark. See THE
@@ -269,7 +316,20 @@ repos and holds ONE ticket (#260), not five. Successors #261 and #264 were filed
 `spawned` from #201. A later run drained `--subset artifact_tree_gen` too (4 tickets, successor
 #274).
 
-  BOTH OF THOSE CHAINS ARE NOW DRAINED. That is not a footnote, it is how to read step A: a drain
+  A LATER ROUND DRAINED `--subset coupler`, and that run is the one to read for TIP BEATS OMNI
+  above, because it is the chain the demotion bug was caught on. `--file-tickets --batch 4` filed
+  #283-#286 and spawned successor #287 (generation 1, edged `spawned` from #201) with all 3 repos
+  still left, exactly as a mid-repo cut should; the successor's own `--batch 20` run then scanned
+  all 3 repos, filed #288-#297, recorded 9 further copy locations of the modules #283-#286 had
+  already ticketed, and drained the chain (mark `gitlab__testmonkeyalpha__coupler`, 0 repos left,
+  no successor — correctly, there is nothing left to file). 37 source files across those 3 repos
+  are only 15 distinct modules, and 14 tickets cover them: the 15th, `coupler/tests/__init__.py`,
+  was ALREADY held by #262 — filed from the audio_tagger chain, whose `audio_tagger/tests/__init__.py`
+  is the same module. That is the dedup reaching ACROSS unrelated repos, and it is why #294's body
+  lists `coupler:coupler/updater.py` and `gitlab__testmonkeyalpha__coupler:coupler/updater.py` as
+  "2 copy/copies" of one ticket rather than the "1 copy/copies" the demotion used to print.
+
+  ALL THREE OF THOSE CHAINS ARE NOW DRAINED. That is not a footnote, it is how to read step A: a drain
   chain is a ONE-WAY street, so an acceptance step that must FILE something cannot name a chain that
   has already been drained — re-run on one, and the honest result is "nothing new", which is step B's
   test, not step A's. ALWAYS dry-run first (no --file-tickets) and read the totals line: a chain
@@ -285,26 +345,36 @@ repos and holds ONE ticket (#260), not five. Successors #261 and #264 were filed
   re-file them and recorded their locations in the ledger instead (`locations` now holds all five
   tips for that module-sha — see THE CLUSTER KEEPS COMPLETING). A ticket's body is a SNAPSHOT of what
   was known when it was filed; the LEDGER is the live cluster. Run with a --batch large enough to
-  cover a subset in one pass (step B's --batch 20 covers its five repos) and the body carries every
-  copy from the start; step A's --batch 4 does NOT — it deliberately stops mid-repo, which is what
-  makes it spawn a successor.
+  cover a subset in one pass (step B's --batch 20 covers all three of its repos) and the body carries
+  every copy from the start — that is how #294 above came to list both of its live tips at filing
+  time; step A's --batch 4 does NOT — it deliberately stops mid-repo, which is what
+  makes it spawn a successor. That snapshot is a bounded batch's honest limit and is NOT the demotion
+  bug of TIP BEATS OMNI: "unique ... among the repos scanned so far" is true of a repo not yet
+  scanned, and false of one the same run has already enumerated. The rule fixes only the second.
 
     A. FILE A BATCH + SPAWN THE SUCCESSOR — on a chain nobody has drained yet (dry-run it first, per
        the paragraph above):
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
-               --subset coupler --file-tickets --batch 4
+               --subset dz_debug --file-tickets --batch 4
        -> one build ticket per UNIQUE module, each referencing its source repo(s)/path(s), #200, the
           control-config + installable requirements, and its captured behavior; each edged `spawned`
-          from #200; then a successor edged `spawned` from #201, primed for the next batch. `coupler`
-          is 3 repos carrying 13 source files in the first alone, so --batch 4 fills MID-REPO: the
-          mark stays before that repo, all 3 repos are reported left, and the successor finishes it.
-          (Run it WITHOUT --file-tickets first to see the same batch and write nothing.)
+          from #200; then a successor edged `spawned` from #201, primed for the next batch. `dz_debug`
+          is 7 repos carrying 8 source files in the first alone, so --batch 4 fills MID-REPO: the
+          mark stays before that repo, all 7 repos are reported left, and the successor finishes it.
+          (Run it WITHOUT --file-tickets first to see the same batch and write nothing. Dry-run
+          verified fresh as this was written: 7 repos scanned, 9 unique un-ticketed modules, 37 of
+          its files collapsed by module-sha. `coupler` — which this step named before the chain was
+          drained — is now step B's example instead, which is the one-way street in action.)
     B. A RE-RUN FILES ZERO — on a drained chain, with --rescan so what is tested is the LEDGER and
        not the bookmark:
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
-               --subset audio_tagger --file-tickets --batch 20 --rescan
-       -> it re-walks all five repos, re-identifies all eighteen files, collapses every one, and
-          prints "== nothing new == every unique module enumerated is already ticketed; filed 0."
+               --subset coupler --file-tickets --batch 20 --rescan
+       -> it re-walks all three repos, re-identifies all thirty-seven source files, collapses every
+          one, and prints "== nothing new == every unique module enumerated is already ticketed;
+          filed 0." It also reports "0 new copy location(s)": the cluster has CONVERGED, so the
+          re-walk is a no-op in the ledger too, not merely in the queue. (`--subset audio_tagger
+          --file-tickets --batch 20 --rescan` is the same test on the older chain: 5 repos, 18
+          files, filed 0.)
           ZERO duplicates. (It still RECORDS any copy location it had not seen before — see THE
           CLUSTER KEEPS COMPLETING — which is knowledge, not a duplicate.)
 
@@ -612,23 +682,24 @@ def module_key(module_sha):
 
 
 # ── the omni-git blob index: extra locations for a blob, joined on the git blob sha1 ─────────────
-def omni_locations(omni, blob_sha, seen):
-    """[(repo, path, ts)] — every OTHER {repo, path, snapshot} this exact blob has appeared at, from
-    omni_index.db's `occ`. Enrichment only: no index (or no row) simply means no extra locations."""
+def omni_locations(omni, blob_sha):
+    """[(repo, path, ts)] — every DISTINCT {repo, path} this exact blob has appeared at, from
+    omni_index.db's `occ`. Enrichment only: no index (or no row) simply means no extra locations.
+
+    `occ` carries one row per SNAPSHOT, so a file recurring across 40 snapshots is reduced here to
+    ONE (repo, path) carrying the index's own earliest `ts` for that place — its first row.
+
+    This reports what the INDEX knows and decides nothing about it: whether a place named here is
+    merely historical or is ALSO a live forge tip is settled by _add_location(), which types it
+    'omni' only while no scan has claimed — or later claims — that same place as a 'tip'."""
     if omni is None:
         return []
-    out = []
     try:
-        rows = omni.execute(
-            "SELECT repo, path, ts FROM occ WHERE sha=? ORDER BY repo, path, ts", (blob_sha,))
+        rows = omni.execute("SELECT repo, path, MIN(ts) FROM occ WHERE sha=? "
+                            "GROUP BY repo, path ORDER BY repo, path", (blob_sha,)).fetchall()
     except sqlite3.Error:
         return []
-    for repo, path, ts in rows:
-        if (repo, path) in seen:
-            continue
-        seen.add((repo, path))
-        out.append((repo or "", path or "", ts or ""))
-    return out
+    return [(repo or "", path or "", ts or "") for repo, path, ts in rows]
 
 
 # ── behavioral exemplars: codebean lower_node (#183) + criteria_miner IO pairs (#200) ────────────
@@ -705,10 +776,18 @@ CREATE TABLE IF NOT EXISTS modules (
   copies      INTEGER,
   filed_ts    REAL
 );
--- `modules.copies` is the number of LOCATIONS recorded for that module-sha below (tip copies +
--- historical omni occurrences), i.e. it always equals the count of this module's `locations` rows.
--- A LATER run that meets another copy of an already-ticketed module adds its location here and
+-- `modules.copies` is the number of PLACES recorded for that module-sha below — DISTINCT
+-- (repo, path) pairs, live tips plus historical omni occurrences. It has exactly ONE definition,
+-- _recount_copies(), which every writing path calls, so `copies` and the rows can never disagree.
+-- A LATER run that meets another copy of an already-ticketed module adds its place here and
 -- re-counts, so the cluster keeps completing as the forge drains — see ledger_record_locations().
+--
+-- `locations` is ONE row per PLACE, with `origin` naming how the place was learned ('tip' = a scan
+-- enumerated it live; 'omni' = the blob index records it historically). origin is PART OF THE
+-- PRIMARY KEY below — the shape the first ledgers shipped with, and CREATE TABLE IF NOT EXISTS
+-- never migrates a table that already exists — so a place learned BOTH ways could hold two rows,
+-- double-counting the place and leaving a live forge tip recorded as historical. It does not: a tip
+-- UPGRADES the historical row for its place rather than adding a second one (_ledger_add_location).
 CREATE TABLE IF NOT EXISTS locations (
   module_sha  TEXT,
   repo        TEXT,
@@ -762,6 +841,42 @@ def ledger_keys_and_hwm(chain):
         raise Fault("ledger at %s is unreadable (%s) — pass --ledger PATH or move it aside" % (LEDGER, e))
 
 
+def _ledger_add_location(con, sha, repo, path, blob_sha, origin, ts):
+    """Write ONE place to `locations`, applying the ledger's copy of _add_location's tip-over-omni
+    rule (TIP BEATS OMNI in the module docstring). Returns 1 when this taught the ledger something
+    new about that place.
+
+    Because `origin` is part of the table's PRIMARY KEY (see the schema), a place learned both ways
+    would otherwise hold TWO rows — one 'tip', one 'omni' — double-counting the place and leaving a
+    live forge tip typed as history for whoever reads the cluster (#193/#194). So a tip UPGRADES the
+    historical row for its place. That is an origin CORRECTION to the one row describing that place:
+    the place, its blob and its module keep their row, and nothing is deleted."""
+    if origin == "tip":
+        # OR IGNORE: on a ledger that already carries BOTH rows for this place (written before this
+        # rule existed), the upgrade would collide with the tip row already there. The tip is then
+        # already recorded — which is the whole point — so the collision is not an error.
+        if con.execute("UPDATE OR IGNORE locations SET origin='tip', blob_sha=?, ts='' "
+                       "WHERE module_sha=? AND repo=? AND path=? AND origin<>'tip'",
+                       (blob_sha, sha, repo, path)).rowcount:
+            return 1
+    elif con.execute("SELECT 1 FROM locations WHERE module_sha=? AND repo=? AND path=? AND "
+                     "origin='tip'", (sha, repo, path)).fetchone():
+        return 0                            # already proven live: a historical row adds nothing
+    return con.execute("INSERT OR IGNORE INTO locations (module_sha, repo, path, blob_sha, origin, "
+                       "ts) VALUES (?,?,?,?,?,?)",
+                       (sha, repo, path, blob_sha, origin, ts)).rowcount
+
+
+def _recount_copies(con, shas):
+    """Re-derive `modules.copies` from the rows — THE one definition of `copies`, called by every
+    path that writes a location, so the count and the rows can never drift apart. It counts PLACES
+    (DISTINCT repo, path), not rows, so it stays true even on a ledger still carrying a pre-rule
+    duplicate pair for one place."""
+    for sha in shas:
+        con.execute("UPDATE modules SET copies=(SELECT COUNT(*) FROM (SELECT DISTINCT repo, path "
+                    "FROM locations WHERE module_sha=?)) WHERE module_sha=?", (sha, sha))
+
+
 def ledger_record(con, m, tid):
     """Record ONE filed module. Called after its ticket exists, so a crash mid-batch can never leave
     the ledger claiming a ticket that was never created."""
@@ -771,10 +886,9 @@ def ledger_record(con, m, tid):
         (m["sha"], m["ident_kind"], m["ext"], tid, m["title"], m["repo"], m["path"], m["blob_sha"],
          m["ref"], m["size"], len(m["locations"]), time.time()))
     for loc in m["locations"]:
-        con.execute("INSERT OR IGNORE INTO locations (module_sha, repo, path, blob_sha, origin, ts) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (m["sha"], loc["repo"], loc["path"], loc.get("blob_sha", ""), loc["origin"],
-                     loc.get("ts", "")))
+        _ledger_add_location(con, m["sha"], loc["repo"], loc["path"], loc.get("blob_sha", ""),
+                             loc["origin"], loc.get("ts", ""))
+    _recount_copies(con, [m["sha"]])        # `copies` always from the rows, never from a guess
     con.commit()
 
 
@@ -785,16 +899,16 @@ def ledger_record_locations(con, extras):
     Why this exists: a batch is bounded, so a module's ticket is filed knowing only the copies seen
     up to that point — later runs meet the rest. Without this, the cluster would freeze at whatever
     the filing run happened to have scanned, and the ledger's claim to hold every duplicate location
-    would be false. `modules.copies` is re-counted from the rows so the two never disagree."""
+    would be false. `modules.copies` is re-counted from the rows so the two never disagree.
+
+    Every place here was ENUMERATED live at a repo's tip by this scan, so each is recorded 'tip' —
+    UPGRADING the historical row when an earlier run had only ever learned that place from the blob
+    index, rather than adding a second row for the one place (_ledger_add_location)."""
     n, touched = 0, set()
     for sha, repo, path, blob_sha in extras:
-        cur = con.execute("INSERT OR IGNORE INTO locations (module_sha, repo, path, blob_sha, "
-                          "origin, ts) VALUES (?,?,?,?,'tip','')", (sha, repo, path, blob_sha))
-        n += cur.rowcount
+        n += _ledger_add_location(con, sha, repo, path, blob_sha, "tip", "")
         touched.add(sha)
-    for sha in touched:
-        con.execute("UPDATE modules SET copies=(SELECT COUNT(*) FROM locations WHERE module_sha=?) "
-                    "WHERE module_sha=?", (sha, sha))
+    _recount_copies(con, touched)
     con.commit()
     return n
 
@@ -1016,10 +1130,11 @@ def scan(cw, omni, repos, start_at, exts, batch, done, old_idx):
                  "repo": name, "repo_idx": i, "path": path, "blob_sha": blob_sha, "ref": ref,
                  "ref_how": how, "size": len(raw), "text": text, "locations": []}
             _add_location(m, name, path, blob_sha, "tip")
-            for orepo, opath, ots in omni_locations(omni, blob_sha,
-                                                    set((l["repo"], l["path"]) for l in m["locations"])):
-                m["locations"].append({"repo": orepo, "path": opath, "blob_sha": blob_sha,
-                                       "origin": "omni", "ts": ots})
+            # The index's places go through the SAME single writer as tip copies, so one of them
+            # naming this module's canonical place (or a place a LATER repo's tip turns out to
+            # carry live) resolves to 'tip' by _add_location's rule instead of masking it.
+            for orepo, opath, ots in omni_locations(omni, blob_sha):
+                _add_location(m, orepo, opath, blob_sha, "omni", ots)
             todo.append(m)
             by_key[key] = m
             done.add(key)
@@ -1042,11 +1157,26 @@ def scan(cw, omni, repos, start_at, exts, batch, done, old_idx):
     return todo, drained_idx, cap_idx, scanned, skipped, dupes, extras
 
 
-def _add_location(m, repo, path, blob_sha, origin):
-    if any(l["repo"] == repo and l["path"] == path for l in m["locations"]):
-        return
+def _add_location(m, repo, path, blob_sha, origin, ts=""):
+    """Record ONE place this module lives. THE ONLY writer of m["locations"], so the tip-over-omni
+    rule is applied in exactly one place and the body's two blocks are disjoint by construction.
+
+    A location is keyed by the PLACE — (repo, path) — and `origin` says how the place was learned:
+    'tip' (a scan enumerated it live at that repo's tip) or 'omni' (the blob index records it there
+    historically). 'tip' is the STRONGER claim — a live source location the rewrite must satisfy,
+    versus context — so meeting a real tip UPGRADES a place already recorded as 'omni' instead of
+    being dropped as a duplicate of it. See TIP BEATS OMNI in the module docstring for why silently
+    dropping it made the index destroy the very truth it was there to enrich. The reverse never
+    applies: an index row for a place already proven live adds nothing, so it is ignored."""
+    for l in m["locations"]:
+        if l["repo"] == repo and l["path"] == path:
+            if origin == "tip" and l["origin"] != "tip":
+                # Same place, stronger evidence. `ts` is the index's `occ.ts` for a historical row
+                # and means nothing for a live tip, so it is cleared to match every other tip.
+                l["origin"], l["blob_sha"], l["ts"] = "tip", blob_sha or l["blob_sha"], ""
+            return
     m["locations"].append({"repo": repo, "path": path, "blob_sha": blob_sha, "origin": origin,
-                           "ts": ""})
+                           "ts": ts})
 
 
 # ── the per-module ticket ────────────────────────────────────────────────────────────────────────
@@ -1085,17 +1215,19 @@ def locations_block(m):
         # a file recurring across snapshots would otherwise repeat identically. `occ.ts` is shown
         # verbatim and labelled: it is USUALLY a snapshot stamp (20260703T062230Z) but ~5k rows carry
         # a source label such as 'gitlab' instead, so it is not presented as if it were always a date.
-        out.append("HISTORICAL OCCURRENCES of this exact blob — every DISTINCT {repo, path} the\n"
-                   "omni-git index (`occ`, joined on the git blob sha1) records this byte-identical\n"
-                   "file at, with the index's own `ts` for the first row of each. Context for the\n"
-                   "rewrite, not extra work:\n%s%s"
+        out.append("HISTORICAL OCCURRENCES of this exact blob — every OTHER DISTINCT {repo, path}\n"
+                   "the omni-git index (`occ`, joined on the git blob sha1) records this\n"
+                   "byte-identical file at, with the index's own `ts` for the first row of each.\n"
+                   "Any place this run enumerated LIVE is listed under the forge tips above, not\n"
+                   "here. Context for the rewrite, not extra work:\n%s%s"
                    % ("\n".join("  %s:%s   [occ.ts %s]" % (l["repo"], l["path"], l["ts"] or "(none)")
                                 for l in shown),
                       "" if len(omni) <= MAX_BODY_LOCATIONS else
                       "\n  ... and %d more" % (len(omni) - MAX_BODY_LOCATIONS)))
     else:
-        out.append("HISTORICAL OCCURRENCES (omni-git `occ`): none recorded for this blob — either it\n"
-                   "is newer than the index's last snapshot, or the index does not cover its repo.")
+        out.append("HISTORICAL OCCURRENCES (omni-git `occ`): none to add — either the index has no\n"
+                   "row for this blob (it is newer than the index's last snapshot, or the index does\n"
+                   "not cover its repo), or every place it records is already listed live above.")
     return "\n\n".join(out)
 
 
