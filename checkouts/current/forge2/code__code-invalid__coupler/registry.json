@@ -1,0 +1,15 @@
+{
+  "_comment": "Configuration registry for the forge2 code__code-invalid__coupler package (ticket #397). Per the congruency repo's note-for-claude, the .json at the root of the folder holds the configuration for all tools in this set of packaging, and a tool that cannot see this registry throws rather than guessing a default. The `coupler` unit walks UP from coupler/_config.py to find this file; set $COUPLER_CONFIG to a file holding just the unit object below to override it.",
+  "schema": 1,
+  "package": "code__code-invalid__coupler",
+  "bug_reports": "logs/bug_reports.jsonl",
+  "forge2": {
+    "code__code-invalid__coupler": {
+      "coupler": {
+        "_comment": "These two values are the ones the ORIGINAL 132-byte forge unit hardcoded: it called importlib.metadata.version(\"coupler\") and fell back to \"0.0.dev0\" when that raised. They are data here rather than source, which is #200 requirement 4. `distribution` is the distribution name looked up and must be a non-empty string; `fallback` is the string __version__ takes when no version can be determined and may be empty. Neither is defaulted in code: remove one and `import coupler` raises ConfigError naming it.",
+        "distribution": "coupler",
+        "fallback": "0.0.dev0"
+      }
+    }
+  }
+}

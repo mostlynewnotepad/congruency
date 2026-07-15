@@ -1,0 +1,16 @@
+# Build artifacts for the forge2 code__code-invalid__coupler package (ticket #397). Any
+# install regenerates these, so they are never committed and are never hand-written.
+#
+# coupler.egg-info/ matters more here than it does for most packages: importlib.metadata
+# reads *.egg-info straight off sys.path, so a committed one would make
+# version("coupler") resolve to the pyproject version for anyone with this directory on
+# their path, whether or not the distribution is installed — silently hiding the unit's
+# fallback path. `pip install -e .` writes it here; leave it uncommitted.
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+# The default bug_reports path from registry.json (see note-for-claude). Runtime output.
+logs/
