@@ -1,0 +1,8 @@
+{
+  "_comment": "Configuration registry for the forge2 gitlab__testmonkeyalpha-group__jazz-forge__dz_debug package. Registry-gated modules walk UP from their own file to find this file and throw if they cannot see it. Each module reads ONLY its own `forge2.gitlab__testmonkeyalpha-group__jazz-forge__dz_debug.<module>` section; sections are disjoint and added additively (see congruency/tools/forge_package.py, #410).",
+  "schema": 1,
+  "bug_reports": "logs/bug_reports.jsonl",
+  "forge2": {
+    "gitlab__testmonkeyalpha-group__jazz-forge__dz_debug": {}
+  }
+}
