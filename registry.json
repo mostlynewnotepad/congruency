@@ -20,5 +20,9 @@
     "interval_hours": 6,
     "cap": 3,
     "timeout": 480
+  },
+  "branch_per_ticket": {
+    "_comment": "Pair-loop worktrees live OUTSIDE .git/: Claude's sensitive-file guard refuses any Write to a path containing '.git/', which was silently blocking every worker from landing its deliverable (ticket #189 built+verified the artifact but could not write it). An absolute sibling path keeps '.git' out of the deliverable's absolute path entirely.",
+    "worktrees": "/Users/stevenpeterson/code/installed/jazz-project/congruency-pair-worktrees"
   }
 }
