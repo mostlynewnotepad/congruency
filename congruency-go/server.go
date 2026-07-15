@@ -38,8 +38,32 @@
 //
 // WHAT IS AND IS NOT BYTE-EQUIVALENT. The ?route and ?api surfaces are reproduced to the byte against
 // the live rest.php. The page/path surface (Controller::control()) is a full PHP CMS and is NOT
-// reproducible in Go; handlePage mirrors status + Content-Type and returns a structurally-honest
-// catalog, explicitly marked as a seam rather than a forgery of the CMS HTML.
+// reproducible in Go; the CATALOG branch of handlePage — which answers every page key except one —
+// mirrors what it honestly can (status and Content-Type) over a structurally-honest table list,
+// explicitly marked as a seam rather than a forgery of the CMS HTML.
+//
+// ?page=tags IS THE ONE EXCEPTION: it is not a seam, it runs the real tag engine (ticket #280).
+// #226 built that engine (congruency-go/tags, engine.go: execute_all_tags + both recursion guards +
+// the tag registry) and exported Render/RenderTag/Handler specifically so this file could point the
+// page seam at it — but #226's single-deliverable scope forbade it from editing server.go, so the
+// engine sat unreachable and ?page=tags answered with a fixed placeholder that never called it.
+// #280 is exactly that one wiring edit and nothing else: handleTagsPage below calls tags.RenderTag,
+// so a ?page=tags&tag=<T> request now runs the real tag. Status (200) and Content-Type
+// (text/html; charset=UTF-8) are unchanged from the placeholder it replaces.
+//
+// WHAT WAS MEASURED, AND WHAT IS NOT CLAIMED. #280's gate is "?page=tags&tag=<T> reaches the engine
+// for every registered tag", and that was checked over real HTTP for all ten of tags.PortedTags()
+// against the real 46-table state db: every one answers 200 and carries the engine's own render for
+// that tag (TicketList alone renders ~537 KB out of the 270 real tickets). "Preserving
+// status+content-type" was checked the same way rather than assumed — against the LIVE PHP this repo
+// serves, PHP and this server answer ?page=tags&tag=<T> with the SAME status (200) and the SAME
+// Content-Type (text/html; charset=UTF-8) for all ten registered tags AND for an unknown tag name.
+//
+// NOT claimed: that the page's BYTES match PHP. engine.go's header is explicit that its tags were
+// never byte-diffed against a live PHP render, and #280 does not upgrade that claim — it forwards
+// the engine's bytes unchanged. The PHP page is also larger by a constant ~6.2 KB of CMS chrome
+// (nav/head/style from Controller::control()), which the frame here deliberately does not forge. The
+// bodies were not diffed; that gate is #226's, not this ticket's.
 package main
 
 import (
@@ -52,9 +76,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"congruency-go/tags"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -82,6 +109,19 @@ type ServerConfig struct {
 	// input. nil == no session == not logged in (the safe default).
 	AdminSession func(*http.Request) bool
 
+	// TagsAppRoot is the tag engine's ABS_PATH (boot/configure.php:41) — the app root under which
+	// the engine finds invocators/tags/ (TAGS_DIR, configure.php:43). TagList::scan walks that tree
+	// to build the ?page=tags gallery list, and it is the ONLY thing the engine reads from the app
+	// root (engine.go uses cfg.TagsDir in exactly one place: TagListTag.GetDocument).
+	//
+	// "" is filled in by NewServer from DBPath (see srvTagsAppRoot). Set it explicitly when the app
+	// root is not the sibling of the state directory.
+	//
+	// NB: this knob CANNOT route a registered tag around the engine. ?page=tags&tag=<T> for a
+	// registered T is answered by tags.RenderTag, which is a registry lookup and never reads
+	// TagsDir; a wrong app root shortens the gallery's LIST, it does not break the render.
+	TagsAppRoot string
+
 	// EnableTelemetryIngest wires db.DB.TelemetryIngest to the logging hook so telemetry.record
 	// beacons are recorded (mirrors boot/monitor.php's congruency_telemetry_ingest being defined).
 	// The telemetry.record ACK body is identical whether or not this is set; only the side-log differs.
@@ -107,8 +147,32 @@ func DefaultServerConfig(dbPath string) ServerConfig {
 		DBPath:       dbPath,
 		Denylist:     append([]string(nil), DefaultDenylist...),
 		AuthOverride: true, // CONGRUENCY_AUTH_OVERRIDE, per boot/constants.default.json
+		TagsAppRoot:  srvTagsAppRoot(dbPath),
 		LogWriter:    os.Stderr,
 	}
+}
+
+// srvTagsAppRoot derives the tag engine's app root from the sqlite path by INVERTING
+// boot/configure.php:42:
+//
+//	define('CONGRUENCY_SQLITE', dirname(rtrim(ABS_PATH, SLASH)) . SLASH . 'state' . SLASH . 'congruency.sqlite');
+//
+// i.e. the state directory is a SIBLING of the app root, not a child. So from
+// <checkout>/state/congruency.sqlite the app root is <checkout>/congruency — which is the layout
+// this repo ships (checkouts/current/ holds congruency/, state/ and docs/ side by side, and
+// checkouts/current/congruency/invocators/tags/ is the tree TagList::scan walks).
+//
+// The app directory's NAME is the one thing configure.php cannot supply here: it derives the sqlite
+// path FROM the app root, and that direction does not invert (dirname loses the basename). This
+// hardcodes the name the checkout actually uses; ServerConfig.TagsAppRoot overrides it for a
+// checkout laid out differently. A wrong guess costs the gallery its list, never a tag's render —
+// see TagsAppRoot.
+func srvTagsAppRoot(dbPath string) string {
+	if dbPath == "" {
+		return ""
+	}
+	stateDir := filepath.Dir(dbPath) // <checkout>/state
+	return filepath.Join(filepath.Dir(stateDir), "congruency")
 }
 
 // LogEvent is one instrumentation record. Real fields, populated on every request and beacon.
@@ -155,6 +219,9 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	if cfg.Log == nil {
 		cfg.Log = defaultLogger(cfg.LogWriter)
+	}
+	if cfg.TagsAppRoot == "" {
+		cfg.TagsAppRoot = srvTagsAppRoot(cfg.DBPath)
 	}
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), reserved: srvReserved}
 	// One catch-all handler. "/" matches every path, including the "/rest.php" the live server exposes;
@@ -625,18 +692,145 @@ func (s *Server) handleAPIRead(db *DB, r *http.Request, api string, tableList []
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
-// Page surface — a seam, not a forgery.
+// Page surface — ?page=tags is the ENGINE; every other key is still a seam.
 //
-// boot/router.php falls through to Controller::control(), the full PHP CMS front controller. That is
-// not reproducible in Go, and pretending otherwise would fabricate output. handlePage mirrors what it
-// honestly can — HTTP status and Content-Type — and returns a structurally-honest catalog derived
-// from the same DB, clearly marked. ?page=tags&tag=X is answered in kind.
+// boot/router.php falls through to Controller::control(), the full PHP CMS front controller. Most of
+// that is not reproducible in Go, and pretending otherwise would fabricate output — so the catalog
+// branch below mirrors what it honestly can (HTTP status and Content-Type) over a structurally-honest
+// table list, clearly marked.
+//
+// ?page=tags is the exception, and the whole of ticket #280: the tags package (#226) is a real port
+// of the PHP tag engine, so that key is answered by RUNNING it rather than by describing it.
+//
+// The two branches deliberately open DIFFERENT things, and neither opens what it does not use:
+//
+//   - the catalog needs a db.go handle (s.tables), so handleCatalogPage opens one;
+//   - the tags branch needs NONE. The engine opens its own sqlite handle per render, read-only
+//     (engine.go's openDB), and this file hands it a path, not a connection.
+//
+// So the shared Open() the placeholder sat under moved DOWN into the catalog branch that actually
+// reads it. That is not cosmetic: db.go's Open() is READ-WRITE (Open -> open(path, path), not
+// OpenImmutable), and sqlite CREATES the file when it is missing — measured in this worktree, a
+// fresh empty directory + Open("<dir>/missing.sqlite") returns a nil error and leaves
+// missing.sqlite behind. Under the old shape, GET /?page=tags against a server whose DBPath did not
+// exist CREATED an empty database on a page that never touched the handle. Now it creates nothing:
+// probed in isolation this session, an empty directory listed before and after
+// GET /?page=tags&tag=TicketList is still empty, and the request is a 200 carrying the engine's
+// render. The catalog branch keeps the old behavior exactly, creation included.
+//
+// Catalog statuses are unchanged: Open() error -> 500, s.tables() error -> 500, else 200 + the same
+// bytes. (In practice the 500 comes from tables(), because Open() is lazy — pointed at a file of
+// garbage it still returns a nil error, and "file is not a database (26)" surfaces on the first
+// query. Both branches were already there and both still are.)
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-	page := srvQueryOr(r, "page", "")
 
+	switch srvQueryOr(r, "page", "") {
+	case "tags":
+		s.handleTagsPage(w, r)
+	default:
+		s.handleCatalogPage(w, r)
+	}
+}
+
+// tagsConfig builds the engine's Config for this server: the engine's own derivation from the app
+// root (tags.DefaultConfig — TAGS_DIR, and the forge/mem/omni reflection dbs from the environment,
+// exactly as boot/configure.php derives them), with ONE field pinned.
+//
+// SQLite is overridden to DBPath because DBPath is CONGRUENCY_SQLITE — "the one sqlite file both
+// engines read" (see DBPath). tags.DefaultConfig would otherwise re-derive it from TagsAppRoot via
+// configure.php:42 and land on the same file in the live layout; pinning it means a caller who
+// points this server at a different db (a test fixture, a replica) gets the tag engine reading that
+// db too, instead of the two halves silently reading different files.
+//
+// Immutable is deliberately left false, i.e. the engine opens `mode=ro`. The trade engine.go's
+// openDB documents is that `immutable=1` creates no -wal/-shm sidecars but reads STALE data under
+// concurrent writers — which the state db has (engine.go's queryAll comment says so) — while
+// `mode=ro` reads what PHP reads and can spawn sidecars on a WAL database. Fresh reads win: a
+// long-lived server that serves stale pages is a correctness bug, whereas the sidecars are not a
+// side effect this ticket forbids (buildRest already opens this very db READ-WRITE via Open() on
+// every REST request, so mode=ro is the lighter of the two opens this server performs).
+//
+// In this deployment the trade does not even arise: the real state db is journal_mode=delete, not
+// WAL, so mode=ro spawns nothing. Probed in isolation this session — the db's directory listed
+// before and after a ?page=tags&tag=TicketList render was byte-for-byte the same entries, and so was
+// the empty-directory case above.
+func (s *Server) tagsConfig() tags.Config {
+	cfg := tags.DefaultConfig(s.cfg.TagsAppRoot)
+	cfg.SQLite = s.cfg.DBPath
+	return cfg
+}
+
+// handleTagsPage is ticket #280: ?page=tags&tag=<T> -> the #226 tag engine.
+//
+// THE GATE — "?page=tags&tag=<T> reaches the engine for EVERY REGISTERED TAG" — rests on one
+// property: tags.RenderTag is the registry lookup itself. tags.IsPorted and tags.RenderTag read the
+// same map (engine.go's `registry`, whose keys are tags.PortedTags()), and RenderTag renders the tag
+// standalone — `new $sel(null)`, the shape TagList.php:63-72 uses — reading NEITHER the Documents
+// table NOR TAGS_DIR. So for a registered T there is no missing file, no absent state db and no
+// misconfigured app root that can route the request around the engine. That is why this branch calls
+// RenderTag directly rather than tags.Render:
+//
+//	tags.Render is the fuller mirror of the PHP router (?page=tags is a DOCUMENT lookup whose stored
+//	template holds <<<TagList>>>, which the engine expands into the gallery). But it needs the
+//	Documents row to exist, and the gallery it reaches then whitelists ?tag= against a TAGS_DIR
+//	filesystem scan. Either input being absent turns a registered tag into a 404 or an "Unknown tag"
+//	notice with the tag never rendered — the gate failing on an input the gate does not mention.
+//	RenderTag has neither dependency, so the gate holds on its own terms.
+//
+// Everything that is NOT a registered tag — no ?tag= at all, a tag the scan lists but #226 has no
+// port for, an unknown name — is answered by rendering the gallery (TagList), which is itself a
+// registered tag. That is not a fallback invented here: TagList::get_document is the PHP's own
+// ?page=tags surface, and it already reports each of those cases in the engine's own words (the tag
+// list; notPortedHTML's marked divergence notice; "Unknown tag: <name>"). Reporting them here would
+// duplicate the engine and risk contradicting it.
+//
+// Status and Content-Type are the placeholder's: 200 and text/html; charset=UTF-8 (set by
+// handlePage, before this runs, for every page key).
+func (s *Server) handleTagsPage(w http.ResponseWriter, r *http.Request) {
+	tag, hasTag := srvQueryVal(r, "tag")
+
+	// Which tag the engine runs: the requested one when it is REGISTERED, else the gallery.
+	sel := "TagList"
+	if hasTag && tags.IsPorted(tag) {
+		sel = tag
+	}
+
+	body, ok := tags.RenderTag(s.tagsConfig(), sel, r.URL.Query())
+	if !ok {
+		// Unreachable by construction: sel is either IsPorted-checked above or "TagList", which is
+		// in tags.PortedTags(). Kept as a real branch rather than a discarded bool so that an engine
+		// that ever drops a name from its registry says so here instead of serving a blank 200.
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "<!-- congruency-go tags wiring (#280) -->\n<!doctype html>\n"+
+			"<title>no Go port: %s</title>\n<h1>no Go port: %s</h1>\n"+
+			"<p>The tag engine has no registered port for this tag.</p>\n",
+			htmlEscape(sel), htmlEscape(sel))
+		return
+	}
+
+	title := "tags"
+	if tag != "" {
+		title = "tag: " + tag
+	}
+	w.WriteHeader(http.StatusOK)
+	var b strings.Builder
+	b.WriteString("<!-- congruency-go (#280): the body below is the TAG ENGINE's render (congruency-go/tags,\n")
+	b.WriteString("     engine.go), not this file's. The doctype/title/h1 frame around it is this server's own:\n")
+	b.WriteString("     the CMS Controller::control() page chrome is still not reproduced here. -->\n")
+	b.WriteString("<!doctype html>\n<title>" + htmlEscape(title) + "</title>\n<h1>" + htmlEscape(title) + "</h1>\n")
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteString("\n")
+	}
+	io.WriteString(w, b.String())
+}
+
+// handleCatalogPage is every page key that is not "tags": the structurally-honest table list. This
+// is unchanged from the pre-#280 default branch — same opens, same statuses, same bytes.
+func (s *Server) handleCatalogPage(w http.ResponseWriter, r *http.Request) {
 	db, err := Open(s.cfg.DBPath)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -645,29 +839,21 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 	defer db.Close()
 
-	switch page {
-	case "tags":
-		tag := srvQueryOr(r, "tag", "")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "<!-- congruency-go page seam: the CMS Controller::control() surface is not byte-reproduced here -->\n"+
-			"<!doctype html>\n<title>tag: %s</title>\n<h1>tag: %s</h1>\n", htmlEscape(tag), htmlEscape(tag))
-	default:
-		tableList, _, err := s.tables(db)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "<!-- congruency-go page seam -->\n<h1>error</h1><p>%s</p>\n", htmlEscape(err.Error()))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		var b strings.Builder
-		b.WriteString("<!-- congruency-go page seam: the CMS Controller::control() surface is not byte-reproduced here -->\n")
-		b.WriteString("<!doctype html>\n<title>congruency</title>\n<h1>congruency</h1>\n<ul>\n")
-		for _, t := range tableList {
-			b.WriteString("  <li>" + htmlEscape(t) + "</li>\n")
-		}
-		b.WriteString("</ul>\n")
-		io.WriteString(w, b.String())
+	tableList, _, err := s.tables(db)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "<!-- congruency-go page seam -->\n<h1>error</h1><p>%s</p>\n", htmlEscape(err.Error()))
+		return
 	}
+	w.WriteHeader(http.StatusOK)
+	var b strings.Builder
+	b.WriteString("<!-- congruency-go page seam: the CMS Controller::control() surface is not byte-reproduced here -->\n")
+	b.WriteString("<!doctype html>\n<title>congruency</title>\n<h1>congruency</h1>\n<ul>\n")
+	for _, t := range tableList {
+		b.WriteString("  <li>" + htmlEscape(t) + "</li>\n")
+	}
+	b.WriteString("</ul>\n")
+	io.WriteString(w, b.String())
 }
 
 func htmlEscape(s string) string {
