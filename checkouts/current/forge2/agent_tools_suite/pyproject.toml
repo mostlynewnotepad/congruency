@@ -21,7 +21,9 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.scripts]
+forge2-ats-http = "agent_tools_suite.ats_http:main"
 forge2-ats-service = "agent_tools_suite.ats_service:main"
+forge2-audit-guard = "agent_tools_suite.audit_guard:main"
 
 [tool.setuptools]
 packages = ["agent_tools_suite"]
