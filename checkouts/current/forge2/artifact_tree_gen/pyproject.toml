@@ -24,6 +24,7 @@ dependencies = []
 forge2-add = "artifact_tree_gen.add:main"
 forge2-clamp = "artifact_tree_gen.clamp:main"
 forge2-fib = "artifact_tree_gen.fib:main"
+forge2-slugify = "artifact_tree_gen.slugify:main"
 
 [tool.setuptools]
 packages = ["artifact_tree_gen"]
