@@ -1,0 +1,10 @@
+# Build artifacts for the forge2 code__code__jazz__litellm__dz_debug package (ticket #361). Any
+# install regenerates these, so they are never committed and are never hand-written.
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+
+# The default bug_reports path from registry.json (see note-for-claude). Runtime output.
+logs/

@@ -1,0 +1,27 @@
+{
+  "_comment": "Configuration registry for the forge2 code__code__jazz__litellm__dz_debug package. Per the congruency repo's note-for-claude, the .json at the root of the folder holds the configuration for all tools in this set of packaging, and a tool that cannot see this registry throws rather than guessing a default. Registry-gated modules walk UP from their own file to find it. Each module reads ONLY its own `forge2.code__code__jazz__litellm__dz_debug.<module>` section; sections are disjoint and added additively (see congruency/tools/forge_package.py, #410). Set $DZ_DEBUG_CONFIG to a file holding just the `dz_debug` object below to override it.",
+  "schema": 1,
+  "package": "code__code__jazz__litellm__dz_debug",
+  "bug_reports": "logs/bug_reports.jsonl",
+  "forge2": {
+    "code__code__jazz__litellm__dz_debug": {
+      "dz_debug": {
+        "_comment": "This IS the ORIGINAL 115-byte forge unit, transcribed from source into data (#200 requirement 4). The original module hardcoded exactly this: `from .logger import debug_decorator, save`, `from .log import Logger`, and `__all__ = [\"debug_decorator\", \"save\", \"Logger\"]`. One `exports` entry per name, in the original's order — which is __all__'s order, and so is behavior. `source` is spelled \"module:attr\" in full: the module to import (relative to the dz_debug package, or absolute) and the name to lift out of it. Nothing here is defaulted in code: remove `exports` and `import dz_debug` still works, but every touch of the surface raises ConfigError naming this key. NOTE: `.logger` and `.log` are SEPARATE forge rewrite units that have not landed in this package yet, so touching the surface today raises ModuleNotFoundError — exactly what the original raised in the same situation. See THE MISSING SIBLINGS in dz_debug/__init__.py.",
+        "exports": [
+          {
+            "name": "debug_decorator",
+            "source": ".logger:debug_decorator"
+          },
+          {
+            "name": "save",
+            "source": ".logger:save"
+          },
+          {
+            "name": "Logger",
+            "source": ".log:Logger"
+          }
+        ]
+      }
+    }
+  }
+}

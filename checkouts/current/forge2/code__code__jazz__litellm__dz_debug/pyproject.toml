@@ -1,0 +1,43 @@
+# Installable package for the forge2 rewrite of the forge repo `code__code__jazz__litellm__dz_debug`
+# (#200 req 3: a proper package — pyproject.toml, `pip install -e .` works, console entry points
+# where applicable). Ticket #361.
+#
+# THE IMPORT PACKAGE IS `dz_debug`, NOT THE DIRECTORY THIS FILE SITS IN. That is a deliberate
+# divergence from the shape congruency/tools/forge_package.py (#410) generates for the other forge2
+# packages, and it is worth the paragraph:
+#
+#   forge_package.py maps the repo directory itself onto the import package ('package-dir' pointing
+#   the repo name at "."), which is right for a repo whose rewrite units are FILES at its root
+#   (artifact_tree_gen/add.py -> artifact_tree_gen.add). This repo is not that shape: its unit is
+#   `dz_debug/__init__.py`, a real subdirectory, and the forge unit was always addressed as
+#   `dz_debug` — the module's whole job is to be what `import dz_debug` gives you. Generating the
+#   other shape here would make the unit import as
+#   `code__code__jazz__litellm__dz_debug.dz_debug`, so `from dz_debug import debug_decorator, save,
+#   Logger` — every existing caller — would break, and #361's acceptance item (b) with it.
+#
+# So the layout below mirrors the forge repo exactly: this directory is the project root (it holds
+# pyproject.toml and the registry), and `dz_debug/` beside it is the import package. `dz_debug`
+# needs no package-dir entry: with none given, setuptools looks for it in ./dz_debug, which is
+# where it is. `dz_debug/__init__.py selftest` proves this file's claims by reading it back.
+#
+# One module of `dz_debug` has landed so far — `__init__.py`, ticket #361. Its siblings `logger.py`
+# and `log.py` are separate forge rewrite units; when they land in this same directory, setuptools
+# picks them up with no edit here, because a package is declared once and carries every module in
+# it. That is #410's additive property, kept.
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge2-code-code-jazz-litellm-dz-debug"
+version = "1.0.0"
+description = "forge2 rewrite of the forge repo code__code__jazz__litellm__dz_debug — behavior-preserving, installable, control-config'd Python (refactor standard #200)"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+forge2-dz-debug = "dz_debug:main"
+
+[tool.setuptools]
+packages = ["dz_debug"]
