@@ -31,3 +31,6 @@ tracker/project.db.superseded
 tooling/congruencey-harness/wiz.txt
 
 .DS_Store
+.claude/
+congruency-go/congruency-go
+congruency-pair-worktrees/
