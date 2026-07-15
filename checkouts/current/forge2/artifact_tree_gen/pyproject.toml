@@ -1,0 +1,38 @@
+# Installable package for the forge2 rewrite of the forge repo `artifact_tree_gen`
+# (#200's requirement 3: "a proper package: pyproject.toml, `pip install -e .` works,
+# console entry points where applicable").
+#
+# From THIS directory:
+#     pip install -e .
+#     forge2-fib fib 10        # -> 55
+#
+# Layout note: this directory IS the import package, so `package-dir` maps the package name
+# `artifact_tree_gen` onto "." rather than nesting a second directory of the same name. An
+# installed copy therefore imports as `from artifact_tree_gen.fib import fib`, which is the
+# path the forge unit was originally addressed by (repo `artifact_tree_gen`, path `fib.py`).
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge2-artifact-tree-gen"
+version = "1.0.0"
+description = "forge2 rewrite of the forge repo artifact_tree_gen — behavior-preserving, installable, control-config'd Python (refactor standard #200)"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+forge2-fib = "artifact_tree_gen.fib:main"
+
+[tool.setuptools]
+packages = ["artifact_tree_gen"]
+
+[tool.setuptools.package-dir]
+artifact_tree_gen = "."
+
+# The configuration registry ships WITH the package, so a non-editable install can still
+# see its config object by walking up from the installed module. Without it an installed
+# copy would throw — correct behavior, but not useful behavior.
+[tool.setuptools.package-data]
+artifact_tree_gen = ["registry.json"]
