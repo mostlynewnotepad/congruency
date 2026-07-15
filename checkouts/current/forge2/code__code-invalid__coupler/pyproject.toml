@@ -1,0 +1,41 @@
+# Installable packaging for the forge2 rewrite of the forge unit
+# code__code-invalid__coupler:coupler/__init__.py (module key forge-rw:d80efda05c1fe99b),
+# ticket #397, against the FORGE-wide refactor standard #200 requirement 3 ("INSTALLABLE — a
+# proper package: pyproject.toml, `pip install -e .` works, console entry points where
+# applicable").
+#
+# WHY THE DISTRIBUTION IS NAMED `coupler`
+# --------------------------------------
+# The unit's whole behavior is `importlib.metadata.version("coupler")` — it reports the
+# version of the distribution named `coupler`, which is the distribution the original module
+# shipped in. Naming this distribution `coupler` is what makes the rewrite's success path
+# reachable at all: install it and `coupler.__version__` becomes the `version` below;
+# uninstall it and `coupler.__version__` becomes the configured fallback, `0.0.dev0`. Both
+# are the original's designed behavior and `coupler_tool.py selftest` exercises both.
+#
+# The name here and the `distribution` key in registry.json are INDEPENDENT knobs that
+# happen to agree. Nothing in the Python source hardcodes either: install under some other
+# name and you point registry.json's `distribution` at that name instead.
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coupler"
+version = "1.0.0"
+description = "forge2 rewrite of the forge unit code__code-invalid__coupler:coupler/__init__.py (module key forge-rw:d80efda05c1fe99b, ticket #397)"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+# The entry module is the TOP-LEVEL `coupler_tool`, not something under `coupler/`. Importing
+# any module inside the package runs coupler/__init__.py first, which is config-gated by
+# design, so a console script rooted inside the package would die with a traceback on exactly
+# the misconfiguration it needs to report as one clean line. See coupler_tool.py's docstring.
+coupler-version = "coupler_tool:main"
+
+[tool.setuptools]
+packages = ["coupler"]
+py-modules = ["coupler_tool"]
