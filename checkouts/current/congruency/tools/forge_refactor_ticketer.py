@@ -112,13 +112,19 @@ BEHAVIORAL EXEMPLARS (#200's "verified, not asserted"). For each module it files
 
 THE LEDGER — WHAT IT WRITES. Its own sqlite db, a SIBLING of omni_index.db by default
 (`forge_refactor_ledger.db`; --ledger or $FORGE_REFACTOR_LEDGER overrides). Four tables, all
-IF NOT EXISTS, nothing ever deleted:
+IF NOT EXISTS. No RECORD is ever deleted — the one row that is rewritten is the bookmark, which is
+what a bookmark is for, and every position it ever held is kept forever in `runs`:
     modules      (module_sha PK, ident_kind, ext, ticket_id, title, canonical repo/path/blob, ...)
                  -- the idempotency ledger the ticket requires: one row per module-sha ever filed
     locations    (module_sha, repo, path, blob_sha, origin)  -- the cluster: every place it lives,
                  origin 'tip' (found by a scan) or 'omni' (joined from the blob index)
-    chain_state  (chain PK, hwm_repo, ...)                   -- the HIGH-WATER-MARK per drain chain
-    runs         (ts, chain, scanned, filed, hwm)            -- one append-only row per filing run
+    chain_state  (chain PK, hwm_repo, ...)  -- the HIGH-WATER-MARK per drain chain. ONE row per
+                 chain, REPLACED as the drain advances, and set back (to an earlier repo, or to NULL
+                 = nothing proven drained) when a run DISPROVES the standing mark. See THE
+                 HIGH-WATER-MARK: a mark that could only ever move forward could not be corrected,
+                 and an uncorrectable wrong mark is exactly how modules get orphaned.
+    runs         (ts, chain, scanned, filed, hwm)            -- one append-only row per filing run,
+                 including the mark that run resolved: the audit trail of every mark ever held
 THE CLUSTER KEEPS COMPLETING. A batch is bounded, so a module's ticket is filed knowing only the
 copies scanned up to that point; later runs meet the rest. A --file-tickets run therefore records the
 locations of copies of ALREADY-ticketed modules too — it does not re-file them (that is the whole
@@ -147,13 +153,49 @@ ANY of three sources, and the union is what makes it airtight:
 
 THE HIGH-WATER-MARK IS A BOOKMARK, NOT THE GUARANTEE — AND THE DIFFERENCE IS TESTABLE. Walking 262
 repos every run to re-derive work already done is waste, so each chain records `hwm_repo`: the last
-repo it has FULLY drained. The next run resumes at the repo after it. The mark advances ONLY past a
-repo whose every module was filed or already ticketed — a run that fills its batch mid-repo leaves
-the mark BEFORE that repo, so the repo is finished next run rather than skipped. Correctness never
-rests on the bookmark: `--rescan` ignores the high-water-mark and re-walks from the first repo, and a
+repo it has FULLY drained. The next run resumes at the repo after it, and (absent --rescan) NEVER
+looks at a repo at or below the mark again — which is exactly why the mark's meaning has to be exact,
+and why it is decided in ONE function, mark_for(), and nowhere else.
+
+  THE INVARIANT. A repo is DRAINED only when (1) its tip enumerated, (2) EVERY blob at that tip was
+  read, and (3) every module in it was already ticketed or was FILED by this run. The mark names the
+  last repo in the drained PREFIX — every repo at or below it satisfies all three.
+
+  A repo that fails ANY of the three is HELD, and the mark stays BELOW it no matter what comes after.
+  The four ways to fail, all of them real:
+      * the tip will not enumerate (`ls-tree` non-zero: a corrupt or partial mirror)
+      * a blob will not read (`cat-file` non-zero on a path `ls-tree` listed)
+      * the batch filled mid-repo, so the rest of its modules were never looked at
+      * a module's ticket.create / ticket.kind / edge.record was REFUSED, so it was never ticketed
+  The last is the one a long drain actually meets: across 262 repos and thousands of tickets over
+  many unattended scheduled runs, one transient route refusal is near-certain.
+
+  WHY A "HOLD" AND NOT A "STOP". The mark is a MINIMUM of two independent numbers — the highest repo
+  proven drained, and one below the FIRST repo held (mark_for()). A hold can therefore never be
+  lifted by a later repo draining cleanly. That is the trap an earlier version of this tool fell into
+  at two separate sites: it tracked the mark as a single NAME that the next healthy repo simply
+  overwrote, and advanced it from what was SCANNED rather than what was FILED. A repo whose tip
+  failed, or whose module's ticket.create was refused, was left behind while the mark sailed past it
+  — and since resumption is POSITIONAL, "past it" means "never revisited". Those modules were
+  orphaned silently, with exit 0 and a success message, and only a --rescan nobody schedules would
+  ever have found them. A held repo instead costs one thing and loses nothing: the next run re-walks
+  it (and the healthy repos after it, which re-file NOTHING — the module-sha union collapses them),
+  and the modules that were missed are filed then. A run that files a PARTIAL batch still spawns its
+  successor, so the hold is worked off by the chain itself with no human in the loop.
+
+  THE MARK NEVER MOVES ON A LIE. A run where EVERY ticket.create failed leaves the mark exactly where
+  it was and spawns no successor — the route is down, a successor would need that same route to file
+  anything, and a chain of successors that can never file is a runaway. A re-run once the route works
+  resumes at that identical batch.
+
+Correctness never rests on the bookmark: `--rescan` re-walks from the first repo in scope, and a
 re-run with --rescan STILL files zero, because the module-sha union above is what suppresses a
 duplicate. That is the honest way to prove the idempotency claim — it exercises the ledger, not the
-bookmark. (See ACCEPTANCE at the bottom.)
+bookmark. (See ACCEPTANCE at the bottom.) A --rescan KEEPS the mark it re-walks under unless the
+re-walk DISPROVES it — meeting a repo that is not drained after all pulls the mark back below that
+repo, while repos the bounded re-walk never reached keep the standing claim of the runs that did
+drain them. A rescan therefore cannot lose the drain progress of 200 earlier runs, and cannot
+preserve a mark it has just caught being wrong.
 
 BATCHED + SELF-REPOPULATING, AND THE CHAIN DOES NOT STALL (#196, and #245's fix). Append-only
 governance means a ticket cannot reopen, so the work perpetuates by SPAWNING a successor. Successors
@@ -184,9 +226,15 @@ off #201 by exactly such an edge — so ONE stop ticket aimed at #201 halts the 
 a stop aimed at a single successor halts that one. An active stop prints HALT and exits 3, filing
 nothing.
 
-SAFE BY DEFAULT: run with no flags this tool only REPORTS — it writes to no db and CREATES NO FILE
-(verified before/after in isolation: the forge dir, the state dir and the ledger's directory gain
-nothing, no `-wal`/`-shm` appears, and no ledger is brought into being by a read). Module source is
+SAFE BY DEFAULT: run with no flags this tool only REPORTS — it writes to no db, and on a forge it can
+read it creates NO FILE (verified before/after in isolation: the forge dir, the state dir and the
+ledger's directory gain nothing, no `-wal`/`-shm` appears, and no ledger is brought into being by a
+read). THE ONE EXCEPTION, stated because a claim this tool's own behavior can falsify is worse than
+no claim: if the scan meets something unexpected — a tip that will not enumerate, a blob that will
+not read — it APPENDS a Variant-A bug report to the registry's bug_reports sink, on a dry run too.
+That is the ticket's own requirement ("Variant-A bug report on any unexpected outcome"), it appends
+only when something is genuinely wrong, and it is the same sink every tool here shares; it is not a
+by-product of reporting. A dry run over a healthy forge writes nothing at all. Module source is
 read through `git cat-file` into memory and normalized/mined AS TEXT — codebean's `_ast_norm`,
 `lower_node` and criteria_miner's `mine` all take source, so not even a temp file is created. It
 writes exactly three things, each only when asked: --file-tickets POSTs through the governed rest.php
@@ -213,37 +261,52 @@ checkouts/current/congruency, so that shorter form only resolves from the CMS ap
     python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py --json /tmp/mods.json
         # dump the enumeration (keys, locations, exemplars, bodies) as JSON
 
-ACCEPTANCE (#201) — a SUBSET of the forge, end to end. #201'S OWN ACCEPTANCE RUN IS ON THE RECORD, so
-read it before re-running it: `--subset audio_tagger` filed FIVE rewrite tickets — #259, #260, #262,
-#263, #265 — for the 18 source files those five repos carry at their tips. THIRTEEN of the eighteen
-collapsed as copies: audio_tagger/tagger.py, for instance, is identical in all five repos and holds
-ONE ticket (#260), not five. Successors #261 and #264 were filed, each edged `spawned` from #201.
-THAT CHAIN IS NOW DRAINED, which is exactly why re-running it is step B.
+ACCEPTANCE (#201) — a SUBSET of the forge, end to end. #201'S OWN ACCEPTANCE RUNS ARE ON THE RECORD,
+so read them before re-running anything: `--subset audio_tagger` filed FIVE rewrite tickets — #259,
+#260, #262, #263, #265 — for the 18 source files those five repos carry at their tips. THIRTEEN of
+the eighteen collapsed as copies: audio_tagger/tagger.py, for instance, is identical in all five
+repos and holds ONE ticket (#260), not five. Successors #261 and #264 were filed, each edged
+`spawned` from #201. A later run drained `--subset artifact_tree_gen` too (4 tickets, successor
+#274).
 
-  A CAVEAT WORTH READING, because it is the honest shape of a BOUNDED batch: that run used --batch 2,
-  so #260 was filed while only the FIRST of the five repos had been scanned — and its body therefore
-  says this module is "unique to audio_tagger among the repos scanned so far", because at filing time
-  that was true. The other four copies were met by later runs, which correctly did NOT re-file them
-  and recorded their locations in the ledger instead (`locations` now holds all five tips for that
-  module-sha — see THE CLUSTER KEEPS COMPLETING). A ticket's body is a SNAPSHOT of what was known
-  when it was filed; the LEDGER is the live cluster. Run with a --batch large enough to cover a
-  subset in one pass (as step A does) and the body carries every copy from the start.
+  BOTH OF THOSE CHAINS ARE NOW DRAINED. That is not a footnote, it is how to read step A: a drain
+  chain is a ONE-WAY street, so an acceptance step that must FILE something cannot name a chain that
+  has already been drained — re-run on one, and the honest result is "nothing new", which is step B's
+  test, not step A's. ALWAYS dry-run first (no --file-tickets) and read the totals line: a chain
+  reporting "0 unique un-ticketed module(s) to file" and "0 repo(s) left" is drained — pick another
+  --subset for step A. The chain named below was dry-run-verified FRESH as this was written, and the
+  same one-way logic means it may not be by the time you read this. The dry run is the check; this
+  paragraph is not.
 
-    A. FILE A BATCH — on a chain nobody has drained yet:
+  A CAVEAT WORTH READING, because it is the honest shape of a BOUNDED batch: the audio_tagger run
+  used --batch 2, so #260 was filed while only the FIRST of the five repos had been scanned — and its
+  body therefore says this module is "unique to audio_tagger among the repos scanned so far", because
+  at filing time that was true. The other four copies were met by later runs, which correctly did NOT
+  re-file them and recorded their locations in the ledger instead (`locations` now holds all five
+  tips for that module-sha — see THE CLUSTER KEEPS COMPLETING). A ticket's body is a SNAPSHOT of what
+  was known when it was filed; the LEDGER is the live cluster. Run with a --batch large enough to
+  cover a subset in one pass (step B's --batch 20 covers its five repos) and the body carries every
+  copy from the start; step A's --batch 4 does NOT — it deliberately stops mid-repo, which is what
+  makes it spawn a successor.
+
+    A. FILE A BATCH + SPAWN THE SUCCESSOR — on a chain nobody has drained yet (dry-run it first, per
+       the paragraph above):
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
-               --subset artifact_tree_gen --file-tickets --batch 4
+               --subset coupler --file-tickets --batch 4
        -> one build ticket per UNIQUE module, each referencing its source repo(s)/path(s), #200, the
-          control-config + installable requirements, and its captured IO exemplars; each edged
-          `spawned` from #200; then a successor edged `spawned` from #201, primed for the next batch.
+          control-config + installable requirements, and its captured behavior; each edged `spawned`
+          from #200; then a successor edged `spawned` from #201, primed for the next batch. `coupler`
+          is 3 repos carrying 13 source files in the first alone, so --batch 4 fills MID-REPO: the
+          mark stays before that repo, all 3 repos are reported left, and the successor finishes it.
           (Run it WITHOUT --file-tickets first to see the same batch and write nothing.)
-    B. A RE-RUN FILES ZERO — on the drained chain, with --rescan so what is tested is the LEDGER and
+    B. A RE-RUN FILES ZERO — on a drained chain, with --rescan so what is tested is the LEDGER and
        not the bookmark:
            python3 checkouts/current/congruency/tools/forge_refactor_ticketer.py \
                --subset audio_tagger --file-tickets --batch 20 --rescan
        -> it re-walks all five repos, re-identifies all eighteen files, collapses every one, and
-          prints "== nothing new == every unique module enumerated is already ticketed; filed 0,
-          spawned 0." ZERO duplicates. (It still RECORDS any copy location it had not seen before —
-          see THE CLUSTER KEEPS COMPLETING — which is knowledge, not a duplicate.)
+          prints "== nothing new == every unique module enumerated is already ticketed; filed 0."
+          ZERO duplicates. (It still RECORDS any copy location it had not seen before — see THE
+          CLUSTER KEEPS COMPLETING — which is knowledge, not a duplicate.)
 
 Exit 0 on a clean run (including "nothing new to file", the expected result of a re-run). Exit 2 with
 a one-line message (never a traceback) on a bad invocation or an unusable environment. Exit 3 when an
@@ -737,9 +800,17 @@ def ledger_record_locations(con, extras):
 
 
 def ledger_mark(con, chain, hwm, scanned, filed):
-    if hwm:
-        con.execute("INSERT OR REPLACE INTO chain_state (chain, hwm_repo, updated) VALUES (?,?,?)",
-                    (chain, hwm, time.time()))
+    """Append this run to `runs`, and SET the chain's mark to `hwm` — including UNSETTING it.
+
+    The mark is written UNCONDITIONALLY, never only-when-truthy. A run can resolve the mark to "no
+    repo is proven drained" (mark_for() returning None) after DISPROVING the standing mark — a
+    --rescan that meets a held repo below it. Dropping that resolution because it is falsy would
+    leave the stale row in place and resume the next run PAST the repo just held, which is the
+    orphaning bug of THE HIGH-WATER-MARK in a third disguise: the mark would move on a lie by not
+    moving at all. `runs` is the append-only record of what happened; `chain_state` is a bookmark,
+    and a bookmark is meant to move — in BOTH directions."""
+    con.execute("INSERT OR REPLACE INTO chain_state (chain, hwm_repo, updated) VALUES (?,?,?)",
+                (chain, hwm, time.time()))                # hwm None -> SQL NULL: the mark is unset
     con.execute("INSERT INTO runs (ts, chain, scanned, filed, hwm_repo) VALUES (?,?,?,?,?)",
                 (time.time(), chain, scanned, filed, hwm or ""))
     con.commit()
@@ -853,44 +924,81 @@ def successor_ticket_id(rows, subset):
     return best
 
 
+# ── THE MARK RULE — the one place the high-water-mark is decided ─────────────────────────────────
+def mark_for(names, drained_idx, cap_idx):
+    """(hwm_name_or_None, mark_idx, repos_left) — THE high-water-mark rule, in ONE place because two
+    code sites once each got it wrong in a different way (see THE HIGH-WATER-MARK in the docstring).
+
+    Two INDEPENDENT numbers decide the mark, and the mark is the MINIMUM of them:
+
+      drained_idx — the HIGHEST repo index this run can assert is fully drained. It is a max() over
+                    repos proven drained, seeded with the mark's OWN index, so a bounded run never
+                    forgets what earlier runs proved.
+      cap_idx     — one BEFORE the FIRST repo this run PROVED is NOT drained (its tip would not
+                    enumerate, one of its blobs would not read, the batch cut it short, or one of its
+                    modules failed to file). It is a min() over every such hold.
+
+    The minimum is what makes a HOLD absolute: nothing a later repo proves can lift a cap an earlier
+    repo set, because these are two separate accumulators and the cap always wins. A held repo is
+    therefore re-walked next run — which costs a re-scan and orphans nothing, the trade this tool
+    always takes. A `mark_idx` below 0 means "no repo is proven drained", and the mark is UNSET —
+    which ledger_mark() writes as NULL rather than skipping, so it can pull a disproven mark back."""
+    # drained_idx is a max() over real repo indices (and the standing mark's own index), so it is
+    # always <= len(names)-1: the min() below can never name a repo that does not exist.
+    idx = min(drained_idx, cap_idx)
+    return (names[idx] if 0 <= idx < len(names) else None), idx, len(names) - (idx + 1)
+
+
 # ── the scan: bounded, resumable, deduplicating ──────────────────────────────────────────────────
-def scan(cw, omni, repos, start_at, exts, batch, done):
+def scan(cw, omni, repos, start_at, exts, batch, done, old_idx):
     """Walk repos from `start_at`, building this run's batch of UN-TICKETED unique modules.
 
-    Returns (todo, new_hwm, scanned, skipped, dupes_collapsed, extras). What is left for the
-    successor is derived from `new_hwm` by the caller, not counted here — the scan is bounded and so
-    has NOT seen the repos past its stopping point.
+    Returns (todo, drained_idx, cap_idx, scanned, skipped, dupes_collapsed, extras). The two indices
+    are the scan's HALF of the mark rule — the caller applies the other half (a module that failed to
+    file) and resolves both through mark_for(). The scan NEVER decides the mark itself.
 
     The scan is BOUNDED: it stops as soon as `batch` new modules are found, so a run never reads the
-    whole forge. The high-water-mark advances ONLY past a repo whose every module was filed or
-    already ticketed — a repo the batch cut short is left BEFORE the mark, so it is finished next
-    run rather than skipped. `done` is the union of the three idempotency sources and is added to as
-    the scan runs, so a module recurring later in the SAME run collapses into the first ticket.
+    whole forge. `done` is the union of the three idempotency sources and is added to as the scan
+    runs, so a module recurring later in the SAME run collapses into the first ticket.
+
+    A repo is DRAINED only when its tip enumerated, EVERY blob at that tip read, and every module in
+    it was either already ticketed or is in this run's `todo`. Anything less HOLDS the cap at that
+    repo (mark_for()), so the mark can never land past it — including the case where a LATER repo
+    drains cleanly, which is precisely the bug this shape exists to make unrepresentable.
 
     `extras` is [(module_sha, repo, path, blob_sha)] for every copy of an ALREADY-ticketed module
     met this scan. They are not re-filed (that is the whole point), but they ARE new knowledge about
     where that module lives, so a --file-tickets run records them — see ledger_record_locations()."""
     todo, scanned, skipped, dupes, extras = [], [], [], 0, []
-    new_hwm = None
+    drained_idx = old_idx                                 # what earlier runs already proved
+    cap_idx = len(repos)                                  # nothing proven un-drained yet
     by_key = {}
-    for repo in repos[start_at:]:
-        name = repo_name(repo)
+    for i in range(start_at, len(repos)):
+        repo, name = repos[i], repo_name(repos[i])
         if len(todo) >= batch:
             break
         ref, how = resolve_tip(repo)
         if ref is None:
             skipped.append((name, how))
-            new_hwm = name                                # an empty mirror IS fully drained
+            drained_idx = max(drained_idx, i)             # an empty mirror IS fully drained
             continue
         blobs = tip_blobs(repo, ref, exts)
         if blobs is None:
-            skipped.append((name, "ls-tree failed at %s" % ref))
-            continue                                      # NOT drained: do not advance the mark
+            # The tip would not enumerate: this repo's modules are UNKNOWN, so it is not drained and
+            # the mark is held before it — no later repo can lift that hold.
+            skipped.append((name, "ls-tree FAILED at %s — repo HELD, mark kept before it" % ref))
+            cap_idx = min(cap_idx, i - 1)
+            bug_report("scan", RuntimeError("ls-tree failed at %s in %s" % (ref, name)),
+                       "python3 %s --subset %s" % (SELF_FROM_ROOT, name),
+                       "unreadable tip (corrupt/partial mirror?) — repo held, mark not advanced past "
+                       "it; its modules stay un-enumerated until the tip reads")
+            continue
         scanned.append((name, ref, how, len(blobs)))
-        complete = True
+        unread, filled = [], False
         for blob_sha, path in blobs:
             raw = blob_bytes(repo, blob_sha)
             if raw is None:
+                unread.append(path)                       # a module we could not even identify
                 continue
             sha, kind, text = module_identity(cw, raw, path)
             key = module_key(sha)
@@ -902,11 +1010,11 @@ def scan(cw, omni, repos, start_at, exts, batch, done):
                     extras.append((sha, name, path, blob_sha))                # goes in the ledger
                 continue
             if len(todo) >= batch:
-                complete = False
+                filled = True
                 break
             m = {"sha": sha, "ident_kind": kind, "ext": os.path.splitext(path)[1].lower(),
-                 "repo": name, "path": path, "blob_sha": blob_sha, "ref": ref, "ref_how": how,
-                 "size": len(raw), "text": text, "locations": []}
+                 "repo": name, "repo_idx": i, "path": path, "blob_sha": blob_sha, "ref": ref,
+                 "ref_how": how, "size": len(raw), "text": text, "locations": []}
             _add_location(m, name, path, blob_sha, "tip")
             for orepo, opath, ots in omni_locations(omni, blob_sha,
                                                     set((l["repo"], l["path"]) for l in m["locations"])):
@@ -915,11 +1023,23 @@ def scan(cw, omni, repos, start_at, exts, batch, done):
             todo.append(m)
             by_key[key] = m
             done.add(key)
-        if complete:
-            new_hwm = name
-        else:
-            break                                         # batch filled mid-repo: mark stays BEFORE it
-    return todo, new_hwm, scanned, skipped, dupes, extras
+        if unread:
+            # cat-file failed on a blob ls-tree listed. That module cannot be identified, so it cannot
+            # be ticketed, so this repo is NOT drained — the same hold as a failed tip.
+            skipped.append((name, "%d blob(s) UNREADABLE (cat-file) — repo HELD, mark kept before it"
+                            % len(unread)))
+            cap_idx = min(cap_idx, i - 1)
+            bug_report("scan", RuntimeError("cat-file failed for %d blob(s) in %s: %s"
+                                            % (len(unread), name, ", ".join(unread[:5]))),
+                       "python3 %s --subset %s" % (SELF_FROM_ROOT, name),
+                       "blob(s) listed by ls-tree but unreadable — repo held, mark not advanced past "
+                       "it; those modules stay un-enumerated until they read")
+        if filled:
+            cap_idx = min(cap_idx, i - 1)                 # batch cut this repo short: NOT drained
+            break
+        if not unread:
+            drained_idx = max(drained_idx, i)
+    return todo, drained_idx, cap_idx, scanned, skipped, dupes, extras
 
 
 def _add_location(m, repo, path, blob_sha, origin):
@@ -1166,11 +1286,19 @@ def file_ticket(base, key, title, body, kind="build"):
     return tid
 
 
-def file_batch(base, key, todo, repos_left, batch, subset, gen, ever_hi, spawn, chain, new_hwm,
-               scanned_n):
-    """File this run's batch, record it in the ledger, then keep the chain alive."""
+def file_batch(base, key, todo, names, drained_idx, cap_idx, batch, subset, gen, ever_hi, spawn,
+               chain, scanned_n):
+    """File this run's batch, record what is PROVEN drained in the ledger, then keep the chain alive.
+
+    THE MARK IS CAPPED BY WHAT WAS FILED, NOT BY WHAT WAS SCANNED. The filing loop stops at the first
+    module it cannot file (a route refusal, a server blip — near-certain at least once across a
+    262-repo drain of unattended scheduled runs). Every module from that one on is UN-filed, and
+    `todo` is in scan order, so the un-filed remainder starts at that module's repo: its `repo_idx`
+    holds the cap, the mark stays BEHIND that repo, and the successor re-walks it and files what was
+    missed. Without the cap a partial batch would advance the mark past modules that were never
+    ticketed and orphan them permanently — with a success exit code and no signal."""
     con = ledger_rw()
-    filed = []
+    filed, failed = [], None
     for m in todo:
         try:
             tid = file_ticket(base, key, m["title"], m["body"])
@@ -1178,24 +1306,44 @@ def file_batch(base, key, todo, repos_left, batch, subset, gen, ever_hi, spawn, 
                  key=key)
             ledger_record(con, m, tid)
         except Exception as e:                            # noqa: BLE001
-            step("FAILED to file %s: %s" % (module_key(m["sha"]), e))
+            step("FAILED to file %s (%s:%s): %s" % (module_key(m["sha"]), m["repo"], m["path"], e))
             bug_report("file_batch", e, "python3 %s --file-tickets" % SELF_FROM_ROOT, e)
+            failed = m
             break
         filed.append((tid, m))
         print("== filed == #%-5s %s" % (tid, m["title"]))
-    step("%d rewrite ticket(s) filed, each edged `spawned` from #%d (#std)" % (len(filed), STD_TICKET))
+    if todo:
+        step("%d rewrite ticket(s) filed, each edged `spawned` from #%d (#std)"
+             % (len(filed), STD_TICKET))
 
-    # The mark is recorded from what was actually scanned, and only when something was filed — a run
-    # that filed nothing has proven nothing about the repos it walked.
-    if filed:
-        ledger_mark(con, chain, new_hwm, scanned_n, len(filed))
-        step("ledger: high-water-mark for chain %r is now %r" % (chain, new_hwm or "(unset)"))
+    if failed is not None:
+        # The mark may not pass the repo holding the first un-filed module. This is a HOLD, not a
+        # loss: the repo is re-walked next run and its un-filed modules are filed then.
+        cap_idx = min(cap_idx, failed["repo_idx"] - 1)
+        # Says only what is true either way: the NEXT run of this chain re-walks the held repo,
+        # whether that run comes from the successor spawned below or from a plain re-run. Promising
+        # a successor here would contradict the total-failure branch, which spawns none.
+        step("%d module(s) of this batch were NOT filed — repo %r is HELD and the mark is kept "
+             "BEFORE it, so the next run of this chain re-walks it and files them. Nothing is "
+             "orphaned; no --rescan is needed" % (len(todo) - len(filed), failed["repo"]))
+
+    if todo and not filed:
+        # Every attempt failed, so the route itself is down and a successor would need the SAME route
+        # to be filed and to file anything. Spawning here would mint successors that can never file —
+        # a runaway. The mark did not move (the cap sits before the first module's repo), so a re-run
+        # once the route works picks up exactly this batch. Nothing is lost; nothing is stacked.
+        con.close()
+        step("nothing filed — no successor spawned and the high-water-mark did NOT move (every "
+             "ticket.create failed; the chain resumes at this same batch on a re-run once the route "
+             "works)")
+        return filed
+
+    new_hwm, _, repos_left = mark_for(names, drained_idx, cap_idx)
+    ledger_mark(con, chain, new_hwm, scanned_n, len(filed))
+    step("ledger: high-water-mark for chain %r is now %r — every repo through it is drained, %d "
+         "repo(s) remain" % (chain, new_hwm or "(unset — no repo proven drained)", repos_left))
     con.close()
 
-    if not filed:
-        step("nothing filed — no successor spawned (every ticket.create failed; the chain needs a "
-             "re-run once the route works)")
-        return filed
     if repos_left <= 0:
         step("every repo in chain %r is enumerated — the chain is drained; no successor spawned" % chain)
         return filed
@@ -1247,9 +1395,10 @@ def report(todo, scanned, skipped, repos, chain, batch, hwm, start_at, dupes, re
         for name, ref, how, n in scanned:
             print("   %4d source file(s)  %-23s %-18s %s" % (n, how, ref, name))
     if skipped:
-        print("\n-- repos SKIPPED this run (reported, never silently dropped)")
+        print("\n-- repos SKIPPED this run (reported, never silently dropped). A repo marked HELD is "
+              "NOT\n   drained: the mark is kept before it and the next run of this chain re-walks it.")
         for name, why in skipped:
-            print("   %-42s %s" % (why, name))
+            print("   %-52s %s" % (why, name))
     print("\n-- unique modules this run would file (%d; --batch %d)" % (len(todo), batch))
     for m in todo:
         copies = len([l for l in m["locations"] if l["origin"] == "tip"])
@@ -1257,9 +1406,13 @@ def report(todo, scanned, skipped, repos, chain, batch, hwm, start_at, dupes, re
               % (m["ident_kind"], module_key(m["sha"]),
                  "" if copies < 2 else "(+%d copy/copies -> 1 ticket)" % (copies - 1),
                  m["repo"], m["path"]))
+    # `repos_left` here is the SCAN's projection — what would be left if every module below files.
+    # It is not the last word: a module that fails to file holds its repo too, so file_batch() prints
+    # the mark and the repo count it actually recorded. Saying "would leave" keeps this line from
+    # contradicting that one on a run where filing goes wrong.
     print("\n== totals == scanned %d repo(s) -> %d unique un-ticketed module(s) to file; %d file(s) "
-          "collapsed into an existing/earlier ticket by module-sha (the dedup); %d repo(s) left for "
-          "the successor" % (len(scanned), len(todo), dupes, repos_left))
+          "collapsed into an existing/earlier ticket by module-sha (the dedup); filing them all would "
+          "leave %d repo(s) for the successor" % (len(scanned), len(todo), dupes, repos_left))
 
 
 def main():
@@ -1281,9 +1434,12 @@ def main():
                          "also names the drain chain, so a subset drain and a full drain never block "
                          "each other's successors or share a high-water-mark")
     ap.add_argument("--rescan", action="store_true",
-                    help="ignore the high-water-mark and re-walk from the first repo in scope. The "
-                         "honest idempotency proof: a re-run with --rescan still files ZERO, because "
-                         "the module-sha ledger — not the bookmark — is what suppresses duplicates")
+                    help="re-walk from the FIRST repo in scope instead of resuming at the "
+                         "high-water-mark. The honest idempotency proof: a re-run with --rescan "
+                         "still files ZERO, because the module-sha ledger — not the bookmark — is "
+                         "what suppresses duplicates. The mark is kept unless the re-walk disproves "
+                         "it (meets a repo that is not drained after all), so a rescan cannot throw "
+                         "away the drain progress of the runs before it")
     ap.add_argument("--no-exemplars", action="store_true",
                     help="skip criteria_miner IO-exemplar mining (which execs only the pure "
                          "functions criteria_miner itself certifies inert). Tickets are still filed, "
@@ -1375,13 +1531,15 @@ def main():
 
     # ── resume point ────────────────────────────────────────────────────────────────────────────
     names = [repo_name(r) for r in repos]
-    start_at = 0
+    old_idx = names.index(hwm) if (hwm and hwm in names) else -1
+    start_at = old_idx + 1
     if a.rescan:
-        step("--rescan: ignoring the high-water-mark %r — re-walking from repo 1. Duplicates are "
-             "suppressed by the module-sha union, not by the bookmark" % (hwm or "(none)"))
-    elif hwm and hwm in names:
-        start_at = names.index(hwm) + 1
-    elif hwm:
+        start_at = 0
+        step("--rescan: re-walking from repo 1. Duplicates are suppressed by the module-sha union, "
+             "not by the bookmark. The mark %r is KEPT unless this re-walk DISPROVES it by meeting a "
+             "repo that is not drained after all — a claim about repos this bounded run never "
+             "reaches is not evidence against them" % (hwm or "(none)"))
+    elif hwm and hwm not in names:
         step("high-water-mark %r is not among the %d repo(s) in scope (renamed or removed) — "
              "restarting this chain from repo 1; the module-sha union still suppresses duplicates"
              % (hwm, len(repos)))
@@ -1394,14 +1552,13 @@ def main():
         step("%s — continuing without historical occurrences (the index is enrichment; tip "
              "locations are unaffected)" % e)
 
-    todo, new_hwm, scanned, skipped, dupes, extras = scan(
-        cw, omni, repos, start_at, exts, a.batch, done)
-    # A repo is "left" when it is at or past the mark this run ends on. The mark only advances past a
-    # fully drained repo, so a repo the batch cut short is counted as left and finished next run.
-    end_at = (names.index(new_hwm) + 1) if new_hwm in names else start_at
-    repos_left = len(repos) - end_at
-    if new_hwm is None:
-        new_hwm = hwm if not a.rescan else None
+    todo, drained_idx, cap_idx, scanned, skipped, dupes, extras = scan(
+        cw, omni, repos, start_at, exts, a.batch, done, old_idx)
+    # What this run WOULD mark if every module in `todo` files. A repo is "left" when it is at or past
+    # that mark: the mark lands only past a proven-drained repo, so a repo the batch cut short, or one
+    # this run could not read, is counted as left and finished next run. file_batch() re-resolves the
+    # same rule with the filing outcome folded in — a module that fails to file holds the mark too.
+    new_hwm, _, repos_left = mark_for(names, drained_idx, cap_idx)
 
     for m in todo:
         m["capture"] = capture_behavior(cw, cm, m["text"], not a.no_exemplars)
@@ -1424,8 +1581,13 @@ def main():
         print("== json == %s" % a.json)
 
     if not a.file_tickets:
-        print("\n== dry == reported only; nothing was written and no file was created. Add "
-              "--file-tickets to file the %d rewrite ticket(s) above." % len(todo))
+        # Says what THIS run did, not what the flagless run does: --json just wrote a file, and a
+        # blanket "no file was created" here would be contradicted by the "== json ==" line directly
+        # above it.
+        print("\n== dry == reported only; no ticket was filed and no db was written%s. Add "
+              "--file-tickets to file the %d rewrite ticket(s) above."
+              % (" (only the --json dump at %s was created)" % a.json if a.json
+                 else ", and no file was created", len(todo)))
         return 0
     if not key:
         die("no CONGRUENCY_API_KEY (../.secrets/ats.env or the environment) — cannot file")
@@ -1440,17 +1602,22 @@ def main():
              "seen, the rest already known)" % (added, len(extras)))
 
     if not todo:
-        print("\n== nothing new == every unique module enumerated is already ticketed; filed 0, "
-              "spawned 0.%s"
+        print("\n== nothing new == every unique module enumerated is already ticketed; filed 0.%s"
               % ("" if repos_left <= 0 else
-                 "\n   (%d repo(s) remain past the high-water-mark %r — this run found nothing new "
-                 "in\n    the repos it walked. Re-run to continue, or --rescan to re-walk from the "
-                 "start.)" % (repos_left, new_hwm or "(none)")))
-        return 0
+                 "\n   (%d repo(s) remain un-drained past the high-water-mark %r — this run found "
+                 "nothing new\n    in the repos it walked, and any repo it could not read is HELD "
+                 "below the mark. A\n    successor is spawned below to walk them; nothing is "
+                 "orphaned.)" % (repos_left, new_hwm or "(none)")))
+        if repos_left <= 0:
+            return 0                                      # chain drained: no mark to move, none to spawn
 
     print()
-    file_batch(a.base, key, todo, repos_left, a.batch, a.subset, gen, ever_hi, not a.no_spawn,
-               chain, new_hwm, len(scanned))
+    # Called even with an EMPTY batch when repos remain: a repo HELD by an unreadable tip or blob
+    # leaves work behind while filing nothing, and the chain must still spawn a successor to revisit
+    # it. Returning early there would end the drain with those modules un-ticketed — the same silent
+    # loss as an over-advanced mark, wearing a success message.
+    file_batch(a.base, key, todo, names, drained_idx, cap_idx, a.batch, a.subset, gen, ever_hi,
+               not a.no_spawn, chain, len(scanned))
     return 0
 
 
