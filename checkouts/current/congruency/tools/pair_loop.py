@@ -9,35 +9,24 @@ One iteration of the adversarial network, harnessed:
     2. OPEN      create branch `ticket/<id>` off the base branch and check it out in a dedicated
                  git WORKTREE (a second working directory driven by the same .git, so the base
                  tree is never touched). The pair runs with its cwd IN that worktree.
-    3. PAIR      mark the ticket ACTIVE and name this round's FRESH worker + adversary. Each agent is
-                 registered (agent.register, carrying the full birth prompt it actually ran) and
-                 authorized on the ticket (ticket.assign) immediately BEFORE it is spawned — which is
-                 also the only way a re-asked agent can be recorded at all, since its id and its
-                 prompt do not exist until its predecessor has been rejected (#279). Fresh spawns ARE
+    3. PAIR      register a FRESH worker + adversary for this ticket/round (agent.register, full
+                 birth prompts) and authorize both on the ticket (ticket.assign). Fresh spawns ARE
                  the memory clear: a new agent has no context; the OLD agents' trails stay on the
                  record forever (the journal is append-only — nothing is erased).
     4. WORK      spawn the worker (`claude -p`, tools limited to reading + writing the deliverable)
-                 in the worktree; it reports {"done":true,"ref":...} on its last line, under the same
-                 forced schema the adversary gets (a worker that reports nothing readable fails the
-                 ROUND, like any other mute agent — THE VERDICT CONTRACT). The HARNESS then COMMITS
-                 the work onto `ticket/<id>` (the worker holds no git pen) — the single --deliverable
-                 file by default, or its WHOLE PACKAGE when the deliverable is a forge module (see
-                 policy 8, COMMIT SCOPE).
+                 in the worktree; it reports {"done":true,"ref":...} on its last line. The HARNESS
+                 then COMMITS the work onto `ticket/<id>` (the worker holds no git pen) — the single
+                 --deliverable file by default, or its WHOLE PACKAGE when the deliverable is a forge
+                 module (see policy 8, COMMIT SCOPE).
     5. VALIDATE  spawn the adversary in the same worktree, BLIND to the worker's reasoning (it sees
                  the ticket + the artifact, never the worker's transcript); it reports
-                 {"verdict":"pass"|"fail","findings":[...]} on its last line. That reply is SCHEMA-
-                 FORCED on the way out and schema-checked on the way in; an adversary that emits no
-                 readable verdict fails the ROUND and never kills the pair (#279 — see THE VERDICT
-                 CONTRACT below).
+                 {"verdict":"pass"|"fail","findings":[...]} on its last line.
     6. SETTLE    pass -> MERGE `ticket/<id>` into the base branch; only if the merge REALLY happened
                  (a new merge commit exists — see merge_to_base): work.record the artifact (permanent
                  UID), status DONE (the db itself refuses DONE without two distinct agents in two
                  distinct roles), then REAP the worktree.
                  fail -> journal the findings and re-run with a FRESH worker (--rounds), findings
                  appended to the new worker's birth prompt; the branch keeps every round's commits.
-                 NO READABLE VERDICT -> the round fails too, but nothing is adjudicated: the commit
-                 stands, any standing findings stay standing, and a fresh adversary judges the same
-                 branch next round (#279, THE VERDICT CONTRACT). Never a crash.
                  merge conflict -> the merge is ABORTED, the branch and worktree PERSIST, and the
                  ticket stays open (never DONE) — nothing is silently clobbered.
                  EMPTY branch (no commits the base lacks — e.g. the worker rewrote the file already
@@ -105,47 +94,6 @@ THE SETTLED BRANCH-PER-TICKET DEFAULTS (RFC #220's open spec questions, answered
       it, the base tree is drifted, and policy 3's #213 guard REFUSES every subsequent merge. They are
       skipped and NAMED on the journal, never dropped silently.
 
-THE VERDICT CONTRACT (#279, applying #175's structured-output findings):
-
-  An agent's last line is the ONLY channel this harness reads. #179 proved what leaving that channel
-  to chance costs: a worker's self-verified deliverable (66/66 selftest) was already COMMITTED on its
-  branch, the blind tester answered in prose instead of JSON, pair_loop raised UNEXPECTED, and the
-  pair process DIED — abandoning committed, probably-passing work. A rambling adversary is not a
-  harness fault. It is a bad round. So:
-
-  (a) FORCE the shape. Each of the pair's two envelopes is a JSON Schema (ENVELOPES), handed to the
-      CLI as `claude --json-schema <schema>`, which constrains the reply to that shape. Measured on
-      the installed CLI: a prompt that BEGS for prose ("write several paragraphs, do NOT print JSON")
-      yields an unparseable essay without the flag and exactly
-      {"verdict":"fail","findings":["..."]} with it — tool use (--allowedTools) unaffected. This is
-      #175/R4's primary recommendation (a schema-constrained channel), and the repo's ollama_agent.py
-      already applies it to these same envelopes (its ENVELOPES/validate()/constrained()). The flag
-      is passed only when the installed CLI advertises it (claude_supports()), so an older CLI
-      degrades to the prompt plus the ladder below instead of failing on an unknown option.
-  (b) READ generously. extract_envelope() is an extractor LADDER (ollama_agent.extract_json()'s
-      pattern): the whole stdout as one object (the --json-schema shape), then the LAST balanced
-      {...} anywhere in the output (catching a pretty-printed or ```json-fenced verdict that a
-      last-line scan alone misses), then the last line starting with '{' — the rung pair_loop has
-      always had, kept LAST so nothing that parses today stops parsing tomorrow.
-  (c) VALIDATE what was read — but only as far as the harness actually reads it. `verdict` must be
-      "pass" or "fail" (so a malformed verdict is re-asked, never silently taken as a fail) and
-      `done` must be a boolean. The keys main() already defaults — findings, ref, note — stay
-      OPTIONAL, so no reply that works today is rejected tomorrow.
-  (d) RE-ASK, then fail the ROUND — never the pair. A rejected reply costs one FRESH agent
-      (--verdict-attempts, default 2), whose birth prompt quotes the parser's own reason back at it
-      (ollama_agent.constrained()'s corrective turn, adapted: a `claude -p` run is one-shot, so the
-      correction is spliced into a NEW agent's birth prompt instead of appended to a conversation).
-      Every attempt is a distinct registered agent, so the mute one's trail stays on the record.
-      When every attempt is mute, the ROUND fails: the outcome is journaled, the deliverable STAYS
-      committed on the branch, and `findings` are left STANDING — a mute adversary adjudicated
-      nothing, so nothing is invented for the next worker to "address". A fresh pair runs the next
-      round, up to --rounds. Rounds exhausted is exit 1 (the ordinary "never passed" exit, branch and
-      worktree kept), never exit 2.
-      A mute WORKER gets the same treatment — it is the identical raise on the identical code path:
-      its round fails, its worktree persists with whatever it wrote, and a fresh worker retries.
-      --dispatch is deliberately UNCHANGED: dispatch-01 routes a queue, holds no committed work, and
-      a plan the harness cannot read stays a Variant-A bug report and exit 2.
-
 PARALLEL PAIRS: N tickets => N branches => N worktrees, with zero tree contention (that is the
 whole point of worktrees). `--dispatch N --parallel K` runs up to K pairs at once, each a child
 process on its own ticket. The only shared resource is the repo's .git (branch refs, the worktree
@@ -164,8 +112,7 @@ Usage (every form needs CONGRUENCY_API_KEY, from the env or .secrets/ats.env, EX
     python3 pair_loop.py --dispatch 3 --parallel 2                 # route the queue, 2 pairs at once
     python3 pair_loop.py --selftest                                # prove the git layer; no db, no agents
     python3 pair_loop.py --selftest --install-check                 # ...and pip-install the merged package
-    ... [--rounds 2] [--verdict-attempts 2] [--timeout 480] [--base main] [--keep-worktree]
-    ... [--package-commit auto|on|off]
+    ... [--rounds 2] [--timeout 480] [--base main] [--keep-worktree] [--package-commit auto|on|off]
 
 --selftest builds a THROWAWAY git repo in a temp dir, runs the whole branch/worktree/commit/merge/
 reap flow through it (including two pairs in parallel, a deliberate merge conflict, and a forge
@@ -181,12 +128,9 @@ reports SKIP, never FAIL: an unreachable index says nothing about the package.
 
 Exit codes:
     0  settled — the branch merged into the base and the ticket is DONE (--selftest: all checks passed)
-    1  rounds exhausted — the adversary never passed: it failed the work, or it emitted no readable
-       verdict at all (#279, THE VERDICT CONTRACT). Branch + worktree kept, ticket stays open
+    1  rounds exhausted — the adversary never passed; branch + worktree kept, ticket stays open
        (--selftest: at least one check FAILED)
-    2  unexpected — a Variant-A bug report was filed to the registry's bug_reports sink. NOT the
-       pair's mute-agent case: an agent that prints no readable JSON envelope fails its ROUND (#279),
-       it does not crash the pair
+    2  unexpected — a Variant-A bug report was filed to the registry's bug_reports sink
     3  halted — an active stop ticket aims at this ticket or an ancestor; nothing was done
     4  passed review but the MERGE was refused — a conflict, a drifted base tree (#213), or an EMPTY
        branch with no commits the base lacks (the deliverable was never committed, or a prior run
@@ -255,24 +199,6 @@ def bug_report(fn, exc, repro, cause):
 
 class Unexpected(RuntimeError):
     pass
-
-
-class NoVerdict(Unexpected):
-    """An agent spawn FINISHED cleanly but printed no schema-conformant JSON envelope (#279).
-
-    A subclass of Unexpected on purpose. The one path that has always treated an unreadable agent as
-    fatal — --dispatch, which routes a queue and holds no committed work — keeps that behavior
-    unchanged, because it catches Unexpected. The PAIR path catches NoVerdict *specifically* and
-    turns it into a round outcome instead, which is the whole of #279: a rambling adversary must not
-    kill a pair that has already committed a deliverable.
-
-    Carries the parser's own rejection (`error`) so the re-ask can quote it back at a fresh agent,
-    and the output `tail` so a human reading the record can see what the agent actually said.
-    """
-
-    def __init__(self, error, tail=""):
-        super().__init__("%s (tail: %r)" % (error, (tail or "")[-200:]))
-        self.error, self.tail = error, tail or ""
 
 
 # ── REST (all writes go through the governed surface) ─────────────────────────────────────────────
@@ -694,9 +620,8 @@ TICKET: %(title)s
 Deliverable: %(worker_scope)s
 %(worker_focus)s Your counterpart will adversarially audit this with no access to your
 reasoning, so the artifact must stand alone.
-%(workspace)s%(playbook)s%(findings)s%(reask)s
-When the deliverable is written, print as your LAST line ONE JSON object and NOTHING after it — no
-prose, no code fences, no sign-off:
+%(workspace)s%(playbook)s%(findings)s
+When the deliverable is written, print as your LAST line:
 {"done": true, "ref": "%(deliverable)s", "note": "<one line on what you produced>"}
 """ + GOVERNANCE
 
@@ -707,11 +632,9 @@ TICKET: %(title)s
 
 The worker produced %(auditor_scope)s You did NOT see the worker's reasoning — judge the artifact
 alone: no context, no charity. %(audit_focus)s Nitpicks are not findings.
-%(workspace)s%(reask)s
-Print as your LAST line ONE JSON object and NOTHING after it — no prose, no code fences, no
-sign-off. Your verdict IS that line: a run that ends in anything else is thrown away and re-run,
-and your reasoning goes with it (#279).
-%(envelope)s
+%(workspace)s
+Print as your LAST line:
+{"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}
 """ + GOVERNANCE
 
 
@@ -797,291 +720,25 @@ FOCUS = {
 FOCUS["bug"] = FOCUS["build"]
 
 
-# ── the verdict contract (#279 + #175): the envelope is a SCHEMA — forced out, validated in ────────
-# One schema per envelope the PAIR exchanges. Each is BOTH the `--json-schema` grammar handed to the
-# CLI (a) and the checker the reply is validated against (c). `required` names ONLY what the harness
-# cannot proceed without, so validation is never stricter than the code that consumes it — see each
-# entry's note for the line that reads it. ollama_agent.py carries the same three envelopes for the
-# Ollama engine (its ENVELOPES); this is pair_loop's own copy for the `claude -p` engine, because the
-# base harness must not depend on an optional engine module to read its own agents.
-ENVELOPES = {
-    # main() reads wres.get("done") and defaults BOTH of the others: wres.get("ref", a.deliverable)
-    # and wres.get("note", ""). So `done` is required and ref/note are described-but-optional: the
-    # schema asks the CLI for all three, and the validator rejects only what main() could not use.
-    "worker": {
-        "schema": {"type": "object",
-                   "properties": {"done": {"type": "boolean"},
-                                  "ref": {"type": "string"},
-                                  "note": {"type": "string"}},
-                   "required": ["done"]},
-        "describe": '{"done": true, "ref": "<the deliverable path>", "note": "<one line on what you produced>"}',
-    },
-    # main() reads vres.get("verdict") == "pass" and vres.get("findings", ["(none given)"]). The enum
-    # is the load-bearing rule: without it {"verdict": "maybe"} is silently a FAIL, which is exactly
-    # the "malformed verdict" #279 says must be re-asked instead of believed.
-    "adversary": {
-        "schema": {"type": "object",
-                   "properties": {"verdict": {"type": "string", "enum": ["pass", "fail"]},
-                                  "findings": {"type": "array", "items": {"type": "string"}}},
-                   "required": ["verdict"]},
-        "describe": '{"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}',
-    },
-}
-
-
-def validate(obj, schema, path="envelope"):
-    """Check `obj` against one of the ENVELOPES schemas. Returns an error STRING for the corrective
-    re-ask, or None when the object conforms.
-
-    Deliberately a small, exact checker for the shapes above rather than a general JSON-Schema
-    engine — the same call ollama_agent.validate() makes, for the same reason: every tool here runs
-    on a bare python3 with nothing extra to install, and every rule enforced is one this module
-    actually emits.
-    """
-    t = (schema or {}).get("type")
-    if t == "object":
-        if not isinstance(obj, dict):
-            return "%s: expected a JSON object, got %s" % (path, type(obj).__name__)
-        for k in schema.get("required", []):
-            if k not in obj:
-                return "%s: missing required key %r" % (path, k)
-        props = schema.get("properties") or {}
-        for k, v in obj.items():
-            if k in props:
-                err = validate(v, props[k], "%s.%s" % (path, k))
-                if err:
-                    return err
-        return None
-    if t == "array":
-        if not isinstance(obj, list):
-            return "%s: expected an array, got %s" % (path, type(obj).__name__)
-        for i, v in enumerate(obj):
-            err = validate(v, schema.get("items") or {}, "%s[%d]" % (path, i))
-            if err:
-                return err
-        return None
-    if t == "string":
-        if not isinstance(obj, str):
-            return "%s: expected a string, got %s (%r)" % (path, type(obj).__name__, obj)
-        if schema.get("enum") and obj not in schema["enum"]:
-            return "%s: %r is not one of %s" % (path, obj, schema["enum"])
-        return None
-    if t == "boolean":
-        # a bool is what `done` must be; note isinstance(True, int) is True, so order matters if this
-        # ever grows an "integer" arm (ollama_agent.validate() has one, and guards it for that reason)
-        if not isinstance(obj, bool):
-            return "%s: expected a boolean (true/false), got %s (%r)" % (path, type(obj).__name__, obj)
-        return None
-    return None
-
-
-def balanced_objects(text):
-    """Every balanced top-level {...} span in `text`, in the order they appear.
-
-    String- and escape-aware, because a brace inside a JSON string is not structure: a finding that
-    says `the file has a {literal brace}` must not truncate the object that carries it. A span whose
-    braces never close (truncated output) is not a candidate at all.
-    """
-    out, depth, start, in_str, esc = [], 0, None, False, False
-    for i, ch in enumerate(text):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth:
-            depth -= 1
-            if depth == 0:
-                out.append(text[start:i + 1])
-    return out
-
-
-def extract_envelope(text, schema=None, label="envelope"):
-    """The extractor LADDER (#279(b), ollama_agent.extract_json()'s pattern). Returns (obj, error).
-
-    The rungs, in order — each candidate must PARSE and (when a schema is given) VALIDATE, so a rung
-    can only ever rescue a reply, never hijack one:
-
-      1. the whole stdout as one object — the `--json-schema` shape, where the CLI emits the object
-         and nothing else;
-      2. the last line starting with '{' — the rung pair_loop has always had, kept AHEAD of the new
-         one so that what parses today parses identically tomorrow. This matters most where there is
-         no schema to discriminate with (--dispatch passes envelope=None): a plan on its own line
-         must keep winning over some inline {...} the model mentions in a later sentence;
-      3. the LAST balanced {...} anywhere in the output — the new reach, and a rescue rather than a
-         rewrite: it finds a pretty-printed or ```json-fenced verdict that no line-scan can see.
-         LAST-in-output, so an agent that revises itself is taken at its final word.
-
-    (None, error) means no rung produced a conformant object: the agent said nothing the harness can
-    act on. That is a ROUND outcome (#279), and the error is what the re-ask quotes back.
-    """
-    text = text or ""
-    cands = [text.strip()]
-    cands += [l.strip() for l in reversed(text.splitlines()) if l.strip().startswith("{")]
-    cands += list(reversed(balanced_objects(text)))
-    best = None
-    for cand in cands:
-        if not (cand.startswith("{") and cand.endswith("}")):
-            continue
-        try:
-            obj = json.loads(cand)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        err = validate(obj, schema, label) if schema else None
-        if err is None:
-            return obj, None
-        best = best or err      # the first (i.e. LAST-in-output) object that parsed but did not conform
-    if best:
-        return None, best
-    return None, "no JSON object on the agent's last line (tail: %r)" % text[-200:]
-
-
-def supports_flag(help_text, flag):
-    """Does this CLI's --help advertise `flag`? Split out from claude_supports() so --selftest can
-    check the rule against fixed text without executing the CLI (the selftest spawns no agents)."""
-    return flag in (help_text or "")
-
-
-def claude_help(_cache=[]):
-    """`claude --help`, read ONCE per process. Failure to run it is not fatal: it only costs the
-    capability, and the caller degrades to the prompt + the extractor ladder."""
-    if not _cache:
-        try:
-            r = subprocess.run(["claude", "--help"], capture_output=True, text=True, timeout=30)
-            _cache.append((r.stdout or "") + (r.stderr or ""))
-        except (OSError, subprocess.SubprocessError):
-            _cache.append("")
-    return _cache[0]
-
-
-def claude_supports(flag):
-    """True if the INSTALLED claude CLI takes `flag`. #279(a): --json-schema is only passed when the
-    CLI advertises it, so an older CLI degrades to the prompt instead of dying on an unknown option."""
-    return supports_flag(claude_help(), flag)
-
-
-def claude_stdout(prompt, allowed_tools, timeout, cwd=None, schema=None):
-    """Run ONE `claude -p` to completion and return its stdout.
-
-    Raises Unexpected (fatal, as it always has) when the CLI itself fails — a non-zero exit or an
-    overrun budget is not an agent saying something unreadable, it is the tool not running.
-
-    When `schema` is given AND the installed CLI advertises --json-schema, the reply is constrained
-    to that schema (#175/R4's schema-constrained channel; #279(a)).
-    """
-    argv = ["claude", "-p", prompt, "--allowedTools", allowed_tools]
-    if schema and claude_supports("--json-schema"):
-        argv += ["--json-schema", json.dumps(schema)]
+def spawn_claude(prompt, allowed_tools, timeout, cwd=None):
+    """One fresh-context agent run, IN the ticket's worktree. Fresh spawn = clean memory; the db
+    keeps the durable trail."""
     try:
-        r = subprocess.run(argv, cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(["claude", "-p", prompt, "--allowedTools", allowed_tools],
+                           cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
+        # a spawn overrunning its budget is a ROUND OUTCOME, not a harness crash — journal + bug-report
         raise Unexpected("agent spawn exceeded its %ss budget (raise --timeout for heavier tickets)" % timeout)
     if r.returncode != 0:
         raise Unexpected("claude exited %s: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
-    return r.stdout or ""
-
-
-def spawn_claude(prompt, allowed_tools, timeout, cwd=None, envelope=None, run=None):
-    """One fresh-context agent run, IN the ticket's worktree. Fresh spawn = clean memory; the db
-    keeps the durable trail. Returns the agent's parsed envelope.
-
-    `envelope` names an ENVELOPES entry, whose schema is both forced on the CLI and validated here.
-    Passing None (what --dispatch does) keeps the pre-#279 behavior exactly: no schema is forced, any
-    JSON object on the last line is accepted, and an unreadable reply is fatal.
-
-    Raises NoVerdict when the agent finished but said nothing conformant. For the PAIR that is a
-    caught, journaled round outcome (#279); for --dispatch, NoVerdict IS an Unexpected and stays
-    fatal. `run` injects the subprocess call, so --selftest can drive this whole path — ladder,
-    validator, retry — against canned agent output without spawning an agent.
-    """
-    schema = (ENVELOPES.get(envelope) or {}).get("schema")
-    out = (run or claude_stdout)(prompt, allowed_tools, timeout, cwd, schema)
-    obj, err = extract_envelope(out, schema, envelope or "envelope")
-    if obj is None:
-        raise NoVerdict(err, out)
-    return obj
-
-
-REASK = """
-YOUR PREDECESSOR'S ANSWER WAS THROWN AWAY. A fresh agent (%(prev)s) was given this exact job and its
-whole run was discarded, because the harness could not read a decision out of it: %(error)s
-The harness reads NOTHING else. Do the work, then print ONE JSON object as your
-LAST line and NOTHING after it — no prose, no code fences, no sign-off, no "let me know if":
-%(describe)s
-"""
-
-
-def agent_id(role, tid, rnd, attempt=1):
-    """This round's agent id — and a DISTINCT id for each re-ask attempt (#279): every attempt is a
-    fresh agent whose trail stays on the append-only record, so a mute agent is retired, never
-    overwritten. `tester-t279r1` then `tester-t279r1v2`."""
-    return "%s-t%dr%d%s" % (role, int(tid), int(rnd), "" if int(attempt) <= 1 else "v%d" % int(attempt))
-
-
-def ask_envelope(agent_of, build, register, tools, timeout, cwd, envelope, attempts, run=None):
-    """Spawn up to `attempts` FRESH agents until one emits a conformant envelope (#279(d)).
-
-    Never raises NoVerdict: an agent with nothing readable to say is a ROUND OUTCOME the caller
-    journals, not a crash. That is the entire ticket — a rambling adversary must not abandon a
-    deliverable that is already committed on its branch.
-
-      agent_of(n)          -> the nth attempt's agent id (see agent_id())
-      build(agent, reask)  -> that agent's birth prompt; `reask` is "" first time and the parser's
-                              OWN rejection on every retry (ollama_agent.constrained()'s corrective
-                              turn, adapted: `claude -p` is one-shot, so the correction goes into a
-                              NEW agent's birth prompt rather than onto a conversation)
-      register(agent, pmt) -> put the agent and the prompt it really ran on the record, before it runs
-
-    Returns {"obj", "agent", "tried"}: obj is the envelope, or None when every attempt was mute or
-    malformed; `tried` is one {"agent","error"} per rejected attempt, for the journal.
-    """
-    tried, reask = [], ""
-    for n in range(1, max(1, int(attempts)) + 1):
-        agent = agent_of(n)
-        prompt = build(agent, reask)
-        register(agent, prompt)
-        try:
-            obj = spawn_claude(prompt, tools, timeout, cwd, envelope, run)
-        except NoVerdict as e:
-            tried.append({"agent": agent, "error": e.error})
-            print("   ! %s attempt %d/%d rejected: %s" % (agent, n, max(1, int(attempts)), e.error))
-            reask = REASK % {"prev": agent, "error": e.error,
-                             "describe": (ENVELOPES.get(envelope) or {}).get("describe", "one JSON object")}
-            continue
-        return {"obj": obj, "agent": agent, "tried": tried}
-    return {"obj": None, "agent": tried[-1]["agent"] if tried else None, "tried": tried}
-
-
-def why_mute(ask):
-    """One line naming every attempt that was thrown away and why — for the journal, which is the
-    only place a human can later see what the mute agents actually did."""
-    return "; ".join("%s: %s" % (t["agent"], t["error"]) for t in ask["tried"]) or "(no attempt made)"
-
-
-def prompt_ctx(tid, kind, title, body, deliverable, pkg, playbook_line, workspace, branch, focus):
-    """Every %(slot)s the pair's two birth-prompt templates read, built in ONE place.
-
-    Both templates are formatted with `%`, so a slot the caller forgets is a KeyError at spawn time —
-    in production, mid-round. Building the dict here lets --selftest format both templates from the
-    same builder main() uses and catch that at the bench instead. `agent`, `role`, `findings` and
-    `reask` are per-attempt and are overlaid by the caller.
-    """
-    return dict(tid=tid, kind=kind, title=title, body=body, deliverable=deliverable,
-                playbook=playbook_line, workspace=workspace, branch=branch,
-                worker_scope=worker_scope(deliverable, pkg), auditor_scope=auditor_scope(deliverable, pkg),
-                worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"],
-                envelope=ENVELOPES["adversary"]["describe"], findings="", reask="")
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    raise Unexpected("no JSON verdict on the agent's last line; tail: %r" % (r.stdout or "")[-200:])
 
 
 DISPATCH_RULES = """
@@ -1102,8 +759,7 @@ def child_cmd(tid, deliverable, a):
     """The `--ticket` child a dispatched "run" becomes: its own process, its own branch+worktree."""
     cmd = [sys.executable, os.path.abspath(__file__), "--ticket", str(tid),
            "--deliverable", deliverable, "--rounds", str(a.rounds), "--timeout", str(a.timeout),
-           "--package-commit", a.package_commit,     # the child decides nothing the parent didn't
-           "--verdict-attempts", str(a.verdict_attempts)]
+           "--package-commit", a.package_commit]     # the child decides nothing the parent didn't
     if a.base:
         cmd += ["--base", a.base]
     if a.keep_worktree:
@@ -1719,157 +1375,6 @@ def selftest(install_check_too=False):
            c411b["package"] == "tools" and "tools/sibling.py" in c411b["files"], str(c411b))
         f.reap_worktree(411)
 
-        # ── #279: an unreadable verdict FAILS THE ROUND; it never kills the pair ──────────────────
-        # Everything here drives the REAL envelope layer (ladder -> validator -> NoVerdict -> re-ask)
-        # and, for the acceptance, the REAL git layer. Only the subprocess is faked, through
-        # spawn_claude's `run` seam, so --selftest still spawns no agent and touches no network.
-        print("-- #279/#175: the verdict contract — schema, ladder, re-ask, round failure")
-        adv = ENVELOPES["adversary"]["schema"]
-        wrk = ENVELOPES["worker"]["schema"]
-
-        # (c) VALIDATE: exactly as far as main() reads, and no further
-        ck("a pass verdict validates", validate({"verdict": "pass", "findings": []}, adv) is None)
-        ck("a fail verdict with findings validates",
-           validate({"verdict": "fail", "findings": ["a", "b"]}, adv) is None)
-        ck("findings may be OMITTED — main() defaults it, so the validator must not reject it",
-           validate({"verdict": "pass"}, adv) is None, str(validate({"verdict": "pass"}, adv)))
-        ck("a MALFORMED verdict value is rejected, not silently taken as a fail (#279)",
-           validate({"verdict": "maybe"}, adv) is not None, str(validate({"verdict": "maybe"}, adv)))
-        ck("a verdict-less object is rejected", validate({"findings": []}, adv) is not None)
-        ck("a finding that is not a string is rejected",
-           validate({"verdict": "fail", "findings": [{"oops": 1}]}, adv) is not None)
-        ck("a worker envelope validates, and `done` must be a boolean",
-           validate({"done": True, "ref": "x", "note": "n"}, wrk) is None
-           and validate({"done": "yes"}, wrk) is not None)
-        ck("ref/note may be omitted — main() defaults both", validate({"done": True}, wrk) is None)
-
-        # (b) the extractor LADDER. The repro fixture is a real rambling non-verdict.
-        rambling = ("The verdict holds: `thing.py` defines `add(a, b)` and returns `a - b`. It "
-                    "subtracts. Fail is correct.\n\nI'm not going to write several paragraphs about "
-                    "it, though. The file is two lines, and the entire finding is in the sentence "
-                    "above.\n\nIf there's something specific you want beyond the verdict:")
-        obj, err = extract_envelope(rambling, adv, "adversary")
-        ck("THE REPRO: a prose-only adversary yields NO verdict (#179's rambling non-verdict)",
-           obj is None and "no JSON object" in (err or ""), str(err))
-        o, _ = extract_envelope('{"verdict":"pass","findings":[]}\n', adv, "adversary")
-        ck("rung 1: the --json-schema shape (stdout IS the object) parses",
-           o == {"verdict": "pass", "findings": []}, str(o))
-        o, _ = extract_envelope('blah blah\n{"verdict": "fail", "findings": ["a"]}\n', adv, "adversary")
-        ck("rung 2: prose then a last-line verdict still parses (the pre-#279 rung, kept)",
-           o == {"verdict": "fail", "findings": ["a"]}, str(o))
-        o, _ = extract_envelope('Verdict:\n\n{\n  "verdict": "fail",\n  "findings": [\n    "one"\n  ]\n}\n',
-                                adv, "adversary")
-        ck("rung 3: a PRETTY-PRINTED verdict parses (a last-line scan alone misses it)",
-           o == {"verdict": "fail", "findings": ["one"]}, str(o))
-        o, _ = extract_envelope('Here:\n```json\n{"verdict": "pass", "findings": []}\n```\n', adv, "adversary")
-        ck("a ```json-fenced verdict parses", o == {"verdict": "pass", "findings": []}, str(o))
-        o, _ = extract_envelope('{"verdict": "pass", "findings": []}\nThanks, let me know!\n', adv, "adversary")
-        ck("a verdict with a sign-off printed AFTER it parses", o == {"verdict": "pass", "findings": []}, str(o))
-        # NO SCHEMA (--dispatch's envelope=None): with nothing to validate against, rung order is the
-        # only thing keeping the real answer ahead of an inline {...} mentioned in a later sentence.
-        o, _ = extract_envelope('Routing.\n{"plan": [{"ticket": 5, "action": "skip", "reason": "x"}]}\n'
-                                'Note: each entry uses the shape {"ticket": N}.\n', None, "envelope")
-        ck("no-schema reading (--dispatch) is UNCHANGED: the last-LINE object still wins",
-           o and o.get("plan") and o["plan"][0]["ticket"] == 5, str(o))
-        o, _ = extract_envelope('{"verdict": "fail", "findings": ["it holds a {literal brace} here"]}',
-                                adv, "adversary")
-        ck("a brace inside a finding string does not truncate the object",
-           o and o["findings"] == ["it holds a {literal brace} here"], str(o))
-        o, _ = extract_envelope('{"verdict": "fail", "findings": ["draft"]}\nOn reflection:\n'
-                                '{"verdict": "pass", "findings": []}\n', adv, "adversary")
-        ck("the LAST conformant verdict wins when the agent revises itself",
-           o == {"verdict": "pass", "findings": []}, str(o))
-        o, e = extract_envelope('{"verdict": "maybe", "findings": []}\n', adv, "adversary")
-        ck("a malformed verdict is refused WITH the parser's reason (what the re-ask quotes back)",
-           o is None and "maybe" in (e or ""), str(e))
-        o, _ = extract_envelope('I judged it.\n{"note": "not a verdict"}\n', adv, "adversary")
-        ck("a JSON object that is not a verdict is not mistaken for one", o is None, str(o))
-        ck("agent ids: attempt 1 keeps the round's name, a retry is a DISTINCT agent",
-           agent_id("tester", 279, 1) == "tester-t279r1"
-           and agent_id("tester", 279, 1, 2) == "tester-t279r1v2", agent_id("tester", 279, 1, 2))
-        ck("(a) the --json-schema capability is read from the CLI's OWN help, not assumed",
-           supports_flag("  --json-schema <schema>  JSON Schema for structured output", "--json-schema")
-           and not supports_flag("  --allowedTools <tools>  ...", "--json-schema"))
-
-        # both birth prompts must format from the slots prompt_ctx() supplies — a missing slot is a
-        # KeyError at spawn time, in production, mid-round.
-        sctx = prompt_ctx(279, "build", "T", "B", "tools/fix.py", None, "", "WS", "ticket/279", FOCUS["build"])
-        wtext = WORKER_PROMPT % {**sctx, "agent": "coder-t279r1", "role": "coder"}
-        atext = AUDITOR_PROMPT % {**sctx, "agent": "tester-t279r1", "role": "tester"}
-        ck("both birth prompts format from prompt_ctx()'s slots (no KeyError at spawn time)",
-           "coder-t279r1" in wtext and "tester-t279r1" in atext)
-        ck("the adversary's prompt shows the EXACT envelope its schema demands (#175: no drift)",
-           ENVELOPES["adversary"]["describe"] in atext and "no prose" in atext, atext[-160:])
-
-        # (d) RE-ASK, then fail the round — driven through the real ask_envelope/spawn_claude path.
-        registered, prompts = [], []
-
-        def reg(agent, prompt):
-            registered.append(agent)
-            prompts.append(prompt)
-
-        def mute_run(*_a, **_kw):
-            return rambling                        # every attempt: prose, no verdict
-
-        r = ask_envelope(lambda n: agent_id("tester", 279, 1, n), lambda agent, reask: "AUDIT" + reask,
-                         reg, "Read", 5, repo, "adversary", 2, run=mute_run)
-        ck("THE TICKET: a mute adversary RETURNS no verdict instead of raising (no UNEXPECTED)",
-           r["obj"] is None and len(r["tried"]) == 2, str(r))
-        ck("...having spent one FRESH, DISTINCT, REGISTERED agent per attempt",
-           registered == ["tester-t279r1", "tester-t279r1v2"], str(registered))
-        ck("...and the re-ask quoted the parser's OWN reason back at the fresh agent",
-           "no JSON object" in prompts[1] and "LAST line" in prompts[1] and prompts[0] == "AUDIT",
-           prompts[1][:120])
-        ck("...and the registered prompt is the one that actually ran (re-ask included)",
-           len(prompts) == 2 and prompts[1].startswith("AUDIT"), str(len(prompts)))
-
-        calls = []
-
-        def recover_run(prompt, *_a, **_kw):
-            calls.append(prompt)
-            return rambling if len(calls) == 1 else '{"verdict": "pass", "findings": []}\n'
-
-        r2 = ask_envelope(lambda n: agent_id("tester", 279, 2, n), lambda agent, reask: "AUDIT" + reask,
-                          reg, "Read", 5, repo, "adversary", 2, run=recover_run)
-        ck("a re-asked adversary that answers on attempt 2 is taken, and names the agent that spoke",
-           r2["obj"] == {"verdict": "pass", "findings": []} and r2["agent"] == "tester-t279r2v2", str(r2))
-        one = ask_envelope(lambda n: agent_id("tester", 279, 3, n), lambda agent, reask: "AUDIT",
-                           reg, "Read", 5, repo, "adversary", 1, run=mute_run)
-        ck("--verdict-attempts 1 spends exactly one agent and still refuses to raise",
-           one["obj"] is None and len(one["tried"]) == 1, str(one))
-        first = ask_envelope(lambda n: agent_id("tester", 279, 4, n), lambda agent, reask: "AUDIT",
-                             reg, "Read", 5, repo, "adversary", 2,
-                             run=lambda *_a, **_kw: '{"verdict": "fail", "findings": ["real"]}')
-        ck("an adversary that answers first time costs exactly ONE spawn (no gratuitous retry)",
-           first["obj"]["findings"] == ["real"] and first["tried"] == [], str(first))
-
-        # THE ACCEPTANCE (#279): the committed deliverable #179 lost must survive a mute adversary
-        # and settle on the next round. Real branch, real commit, real merge; faked agents only.
-        print("-- #279 acceptance: a committed deliverable survives a mute adversary and settles next round")
-        w279 = f.open_worktree(279, base)
-        open(os.path.join(w279["path"], "tools", "fix.py"), "w").write("print('66/66 selftest')\n")
-        c279 = f.commit_deliverable(279, "tools/fix.py", "ticket #279: round 1 (self-verified 66/66)")
-        ck("round 1: the worker's deliverable is committed on the branch", c279["committed"], str(c279))
-        mute1 = ask_envelope(lambda n: agent_id("tester", 279, 11, n), lambda agent, reask: "AUDIT",
-                             reg, "Read", 5, w279["path"], "adversary", 2, run=mute_run)
-        ck("round 1's adversary rambles: NO verdict, and NO exception escapes", mute1["obj"] is None)
-        ck("...the deliverable is STILL committed on ticket/279 (it is NOT abandoned — the #179 loss)",
-           f.ahead_of(279, base) == 1
-           and "tools/fix.py" in f.git("show", "--name-only", "--format=", "ticket/279"))
-        ck("...the branch and its worktree PERSIST for a fresh adversary",
-           f.branch_exists("ticket/279") and os.path.exists(f.worktree_of(279)))
-        ck("...and NOTHING was merged on the strength of a silence",
-           not os.path.isfile(os.path.join(repo, "tools", "fix.py")))
-        pass2 = ask_envelope(lambda n: agent_id("tester", 279, 12, n), lambda agent, reask: "AUDIT",
-                             reg, "Read", 5, w279["path"], "adversary", 2,
-                             run=lambda *_a, **_kw: '{"verdict": "pass", "findings": []}')
-        ck("round 2: a fresh adversary judges the SAME branch and passes it", pass2["obj"]["verdict"] == "pass")
-        m279 = f.merge_to_base(279, base, "merge ticket/279")
-        ck("THE ACCEPTANCE: the work #179 would have thrown away now SETTLES", m279.get("ok"),
-           m279.get("reason", ""))
-        ck("...and it landed on the base, whole", os.path.isfile(os.path.join(repo, "tools", "fix.py")))
-        f.reap_worktree(279)
-
         # ── the acceptance criterion itself: `pip install -e .` from the MERGED tree (opt-in) ──
         # LAST on purpose: it is the only step that touches the network, and pip writes an .egg-info
         # into the base tree it installs from — which the checks above must not see.
@@ -1912,13 +1417,6 @@ def main():
     ap.add_argument("--title"), ap.add_argument("--body", default=""), ap.add_argument("--component", default="congruency")
     ap.add_argument("--deliverable", help="repo-relative path the worker must produce")
     ap.add_argument("--rounds", type=int, default=2, help="max worker rounds before giving up")
-    ap.add_argument("--verdict-attempts", type=int, default=2, metavar="N",
-                    help="how many FRESH agents one round may spend getting a schema-conformant JSON "
-                         "envelope out of a side of the pair (#279; default 2 = one re-ask, whose "
-                         "birth prompt quotes the parser's own rejection back at it). When all N are "
-                         "mute or malformed the ROUND fails — the deliverable stays committed on the "
-                         "branch and a fresh pair runs the next round, up to --rounds — instead of "
-                         "the pair dying with a fatal UNEXPECTED")
     ap.add_argument("--timeout", type=int, default=480, help="seconds per agent spawn")
     ap.add_argument("--harvest", type=int, metavar="TICKET", help="retro-harvest a settled ticket's lesson, then exit")
     ap.add_argument("--dispatch", type=int, nargs="?", const=5, metavar="N",
@@ -1955,9 +1453,6 @@ def main():
         return selftest(install_check_too=a.install_check)
     if a.install_check:
         ap.error("--install-check only means anything with --selftest")
-    if a.verdict_attempts < 1:
-        ap.error("--verdict-attempts must be at least 1: a round has to spend one agent to find out "
-                 "what it says (got %d)" % a.verdict_attempts)
 
     if not API_KEY:
         raise Unexpected("no CONGRUENCY_API_KEY (secrets or env) — token routes need it")
@@ -2039,53 +1534,31 @@ def main():
 
     findings, history = [], []
     for rnd in range(1, a.rounds + 1):
+        worker = "%s-t%dr%d" % (w_role, tid, rnd)
+        auditor = "%s-t%dr%d" % (a_role, tid, rnd)
         focus = FOCUS.get(kind, FOCUS["documentation"])
-        ctx = prompt_ctx(tid, kind, title, body, a.deliverable, pkg, pb_line, workspace, wt["branch"], focus)
-        worker, auditor = agent_id(w_role, tid, rnd), agent_id(a_role, tid, rnd)
+        ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable, playbook=pb_line,
+                   workspace=workspace, branch=wt["branch"],
+                   worker_scope=worker_scope(a.deliverable, pkg), auditor_scope=auditor_scope(a.deliverable, pkg),
+                   worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"])
 
-        # Each attempt is a FRESH agent, REGISTERED with the birth prompt it actually ran (re-ask and
-        # all) and authorized on the ticket, immediately before it runs — fresh spawn = cleared
-        # memory, and every attempt's trail stays on the append-only record. Registering at spawn
-        # time rather than up-front is what lets a re-asked agent exist at all (#279): its id and its
-        # prompt are not known until its predecessor has been rejected.
-        def registrar(role):
-            def register(agent, prompt):
-                rest("agent.register", {"agent_id": agent, "parent": "pair_loop", "prompt": prompt,
+        # fresh pair, registered + authorized (fresh spawn = cleared memory; trails persist)
+        def pair():
+            for agent, role, tmpl in ((worker, w_role, WORKER_PROMPT), (auditor, a_role, AUDITOR_PROMPT)):
+                fx = "\nPrior adversary findings to address:\n- " + "\n- ".join(findings) + "\n" if (findings and role == w_role) else ""
+                rest("agent.register", {"agent_id": agent, "parent": "pair_loop",
+                                        "prompt": tmpl % {**ctx, "agent": agent, "role": role, "findings": fx},
                                         "tools": json.dumps(["claude -p"])})
                 rest("ticket.assign", {"ticket_id": tid, "agent_id": agent, "role": role})
-            return register
-
-        def pair():
             rest("process_status", {"id": tid, "status": "ACTIVE"})
-            return {"worker": worker, "auditor": auditor, "branch": wt["branch"],
-                    "attempts_each": max(1, a.verdict_attempts)}
+            return {"worker": worker, "auditor": auditor, "branch": wt["branch"]}
         step("pair (round %d)" % rnd, pair)
 
         fx = "\nPrior adversary findings to address:\n- " + "\n- ".join(findings) + "\n" if findings else ""
-        wask = step("work: %s" % worker, ask_envelope,
-                    lambda n, r=rnd: agent_id(w_role, tid, r, n),
-                    lambda agent, reask: WORKER_PROMPT % {**ctx, "agent": agent, "role": w_role,
-                                                          "findings": fx, "reask": reask},
-                    registrar(w_role), focus["worker_tools"], a.timeout, wt["path"], "worker",
-                    a.verdict_attempts)
-        wres = wask["obj"]
-        if wres is None or not wres.get("done"):
-            # #279: a worker that says nothing readable (or says done=false) FAILS THE ROUND. It does
-            # not crash the pair: the worktree persists with whatever it wrote, and a fresh worker
-            # gets the next round. `findings` are left standing — nothing was adjudicated here.
-            why = why_mute(wask) if wres is None else "reported %s (done is not true)" % json.dumps(wres)
-            spent = len(wask["tried"]) + (0 if wres is None else 1)     # spawns actually made
-            note = ("round %d: NO USABLE WORK from the %s in %d attempt(s) — %s. ROUND FAILED "
-                    "(#279): the pair is NOT killed, nothing is invented, and %s + its worktree "
-                    "persist with whatever was written; a FRESH %s runs the next round if --rounds "
-                    "allows." % (rnd, w_role, spent, why, wt["branch"], w_role))
-            rest("ticket.progress", {"ticket_id": tid, "agent_id": wask["agent"] or fid,
-                                     "note": note, "steps_remaining": 3})
-            history.append({"round": rnd, "findings": ["no usable envelope from the %s — %s" % (w_role, why)]})
-            print("== round %d failed == the %s produced no usable envelope in %d attempt(s) (%s); "
-                  "%d round(s) left" % (rnd, w_role, spent, why, a.rounds - rnd))
-            continue
-        worker = wask["agent"]      # the attempt that actually answered is the one on the record
+        wp = WORKER_PROMPT % {**ctx, "agent": worker, "role": w_role, "findings": fx}
+        wres = step("work: %s" % worker, spawn_claude, wp, focus["worker_tools"], a.timeout, wt["path"])
+        if not wres.get("done"):
+            raise Unexpected("worker did not report done: %s" % wres)
         rest("ticket.progress", {"ticket_id": tid, "agent_id": worker,
                                  "note": "round %d: produced %s — %s" % (rnd, wres.get("ref"), wres.get("note", "")),
                                  "steps_remaining": 2})
@@ -2099,36 +1572,8 @@ def main():
         rest("ticket.progress", {"ticket_id": tid, "agent_id": fid,
                                  "note": commit_note(rnd, a.deliverable, cm)})
 
-        aask = step("validate: %s" % auditor, ask_envelope,
-                    lambda n, r=rnd: agent_id(a_role, tid, r, n),
-                    lambda agent, reask: AUDITOR_PROMPT % {**ctx, "agent": agent, "role": a_role,
-                                                           "reask": reask},
-                    registrar(a_role), focus["auditor_tools"], a.timeout, wt["path"], "adversary",
-                    a.verdict_attempts)
-        vres = aask["obj"]
-        if vres is None:
-            # ── #279, THE TICKET ──────────────────────────────────────────────────────────────────
-            # The adversary emitted no readable verdict. This used to raise UNEXPECTED and KILL the
-            # pair process, abandoning the deliverable that is — right now, two statements above —
-            # committed on the branch (#179: a 66/66 worker lost to a rambling non-verdict). It is a
-            # ROUND FAILURE instead: journal what the mute agents said, keep the commit, invent no
-            # verdict, and let a fresh adversary judge the same branch next round. Rounds exhausted
-            # then exits 1 (never passed), never 2 (harness fault).
-            spent = len(aask["tried"])      # every attempt was rejected, or obj would not be None
-            note = ("round %d: NO VERDICT — the %s emitted no schema-conformant JSON verdict in %d "
-                    "attempt(s) [%s]. ROUND FAILED (#279): the deliverable STAYS committed on %s @ "
-                    "%s, the pair is not killed, and no verdict is inferred from silence; a FRESH %s "
-                    "judges this same branch next round if --rounds allows."
-                    % (rnd, a_role, spent, why_mute(aask), wt["branch"], cm["sha"][:10], a_role))
-            rest("ticket.progress", {"ticket_id": tid, "agent_id": aask["agent"] or fid,
-                                     "note": note, "steps_remaining": 3})
-            history.append({"round": rnd, "findings": ["no verdict from the %s after %d attempt(s) — "
-                                                       "the round was never adjudicated" % (a_role, spent)]})
-            print("== round %d failed == NO VERDICT from the %s after %d attempt(s); the committed "
-                  "deliverable is kept on %s @ %s and a FRESH %s is respawned (%d round(s) left)"
-                  % (rnd, a_role, spent, wt["branch"], cm["sha"][:10], a_role, a.rounds - rnd))
-            continue        # `findings` deliberately UNCHANGED: a mute adversary adjudicated nothing.
-        auditor = aask["agent"]
+        aprompt = AUDITOR_PROMPT % {**ctx, "agent": auditor, "role": a_role}
+        vres = step("validate: %s" % auditor, spawn_claude, aprompt, focus["auditor_tools"], a.timeout, wt["path"])
         rest("ticket.progress", {"ticket_id": tid, "agent_id": auditor,
                                  "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
                                         ("; findings: " + "; ".join(vres.get("findings", []))) if vres.get("findings") else ""),
