@@ -1412,6 +1412,13 @@ func runSelftest() int {
 	// json_encode of a double: serialize_precision=-1, threshold 17, lowercase 'e', forced ".0"
 	// mantissa in exponential form, unpadded exponent. The lines Go's encoding/json would fail are
 	// marked; they are why phpGcvt exists.
+	//
+	// f01f02 is the runtime double 0.1+0.2 (0x3fd3333333333334, prints "0.30000000000000004"), the
+	// famous value PHP's json_encode(0.1+0.2) emits. It MUST be computed from float64 VARIABLES: the
+	// constant expression `0.1 + 0.2` is folded by Go at arbitrary precision to the *different* double
+	// nearest 0.3 (0x3fd3333333333333, prints "0.3"), which would silently test the wrong number.
+	f01, f02 := 0.1, 0.2
+	f01f02 := f01 + f02
 	for _, c := range []struct {
 		in   float64
 		want string
@@ -1427,7 +1434,7 @@ func runSelftest() int {
 		{1e100, "1.0e+100"}, // Go's encoding/json: 1e+100
 		{1e-100, "1.0e-100"},
 		{1.0 / 3.0, "0.3333333333333333"}, {2.0 / 3.0, "0.6666666666666666"},
-		{0.1, "0.1"}, {0.2, "0.2"}, {0.1 + 0.2, "0.30000000000000004"},
+		{0.1, "0.1"}, {0.2, "0.2"}, {f01f02, "0.30000000000000004"},
 		{1e6, "1000000"}, {1e7, "10000000"},
 		{12345678901234567890.0, "1.2345678901234567e+19"},
 		{9007199254740993.0, "9007199254740992"},
