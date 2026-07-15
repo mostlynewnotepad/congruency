@@ -29,3 +29,5 @@ tracker/project.db.superseded
 
 # misc
 tooling/congruencey-harness/wiz.txt
+
+.DS_Store
