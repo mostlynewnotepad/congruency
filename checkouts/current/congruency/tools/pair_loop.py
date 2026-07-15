@@ -15,7 +15,9 @@ One iteration of the adversarial network, harnessed:
                  record forever (the journal is append-only — nothing is erased).
     4. WORK      spawn the worker (`claude -p`, tools limited to reading + writing the deliverable)
                  in the worktree; it reports {"done":true,"ref":...} on its last line. The HARNESS
-                 then COMMITS the deliverable onto `ticket/<id>` (the worker holds no git pen).
+                 then COMMITS the work onto `ticket/<id>` (the worker holds no git pen) — the single
+                 --deliverable file by default, or its WHOLE PACKAGE when the deliverable is a forge
+                 module (see policy 8, COMMIT SCOPE).
     5. VALIDATE  spawn the adversary in the same worktree, BLIND to the worker's reasoning (it sees
                  the ticket + the artifact, never the worker's transcript); it reports
                  {"verdict":"pass"|"fail","findings":[...]} on its last line.
@@ -71,6 +73,26 @@ THE SETTLED BRANCH-PER-TICKET DEFAULTS (RFC #220's open spec questions, answered
       the ticket and never authors work product. It journals without being ticket.assign'd, exactly
       as dispatch-01 already does; see forge_agent() for why assigning it would hollow out the db's
       own pair-completion backstop.
+  (8) COMMIT SCOPE (#409) — what the harness stages is the DELIVERABLE FILE, except for one case:
+      a FORGE deliverable, whose scope is its whole PACKAGE DIRECTORY. A forge-rewrite unit must
+      land a package `pip install -e .` can install (the FORGE refactor standard's requirement 3),
+      and a package is never one file: it is the module PLUS its pyproject.toml, its config, its
+      entry points and its submodules. Committing only the --deliverable landed the module alone
+      and left the rest to be reported as strays and reaped — which is exactly what happened to the
+      forge pilot #401: `checkouts/current/forge2/artifact_tree_gen/add.py` merged, its
+      pyproject.toml never did, and the landed package is NOT installable.
+      So: when the deliverable's path holds a `forge2` component with a package directory under it
+      (package_root_of(): `<...>/forge2/<repo>/<anything>` => package root `<...>/forge2/<repo>`),
+      the harness stages that WHOLE directory's new/modified/deleted fileset. Everything else — the
+      tags, the tools, the docs — keeps the single-file behavior UNCHANGED, because the gate is the
+      path and nothing else. `--package-commit on|off` overrides the gate; `auto` (the default) is
+      the path gate above.
+      Build artifacts under the package root are the one exclusion (is_build_artifact(): `.egg-info`,
+      `build/`, `dist/`, `__pycache__`, ...). They are not source — validating installability with
+      `pip install -e .` is what CREATES them — and committing them would be actively harmful: once
+      `<repo>.egg-info` is TRACKED on the base, any later `pip install -e .` in the base tree rewrites
+      it, the base tree is drifted, and policy 3's #213 guard REFUSES every subsequent merge. They are
+      skipped and NAMED on the journal, never dropped silently.
 
 PARALLEL PAIRS: N tickets => N branches => N worktrees, with zero tree contention (that is the
 whole point of worktrees). `--dispatch N --parallel K` runs up to K pairs at once, each a child
@@ -89,11 +111,20 @@ Usage (every form needs CONGRUENCY_API_KEY, from the env or .secrets/ats.env, EX
     python3 pair_loop.py --file documentation --title "..." --body "..." --deliverable docs/X.md
     python3 pair_loop.py --dispatch 3 --parallel 2                 # route the queue, 2 pairs at once
     python3 pair_loop.py --selftest                                # prove the git layer; no db, no agents
-    ... [--rounds 2] [--timeout 480] [--base main] [--keep-worktree]
+    python3 pair_loop.py --selftest --install-check                 # ...and pip-install the merged package
+    ... [--rounds 2] [--timeout 480] [--base main] [--keep-worktree] [--package-commit auto|on|off]
 
 --selftest builds a THROWAWAY git repo in a temp dir, runs the whole branch/worktree/commit/merge/
-reap flow through it (including two pairs in parallel and a deliberate merge conflict), then deletes
-it. It never touches this repo, the db, or the network, and spawns no agents.
+reap flow through it (including two pairs in parallel, a deliberate merge conflict, and a forge
+PACKAGE deliverable per policy 8), then deletes it. It never touches this repo or the db and spawns
+no agents; and unless you add --install-check below, it never touches the network either.
+
+--install-check (only with --selftest) adds ONE further check, the last one to run: it builds a
+throwaway venv and runs a real `pip install -e .` against the forge package the selftest merged onto
+its throwaway base, proving the landed tree is installable — #409's acceptance criterion. It is
+opt-in and not part of --selftest precisely because it is the one check that USES THE NETWORK (pip
+fetches the PEP 517 build backend named by the package's pyproject.toml). Without a network it
+reports SKIP, never FAIL: an unreachable index says nothing about the package.
 
 Exit codes:
     0  settled — the branch merged into the base and the ticket is DONE (--selftest: all checks passed)
@@ -190,6 +221,71 @@ def rows(route, params):
     return rest(route, params, method="GET").get("rows", [])
 
 
+# ── commit scope: which fileset a deliverable stands for (#409, policy 8) ─────────────────────────
+PACKAGE_MARKER = "forge2"          # a path component; the directory UNDER it is a package root
+
+# Not source, and not ours to land: every one of these is REGENERATED by the act of building or
+# validating a package (`pip install -e .` writes <name>.egg-info; importing writes __pycache__), so
+# committing them would track files that rewrite themselves and drift the base tree (#213).
+PACKAGE_EXCLUDE_DIRS = ("__pycache__", "build", "dist", ".eggs", ".tox", ".nox",
+                        ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache")
+PACKAGE_EXCLUDE_ENDS = (".egg-info", ".dist-info", ".egg")     # directory OR file names
+PACKAGE_EXCLUDE_FILES = (".pyc", ".pyo", ".pyd")
+
+
+def _parts(path):
+    """A repo-relative path as its components, normalized ('./a//b' -> ['a', 'b']). git always
+    speaks '/', os.path.normpath speaks os.sep; this reconciles them once, here."""
+    return [p for p in os.path.normpath(path).replace(os.sep, "/").split("/") if p not in ("", ".")]
+
+
+def package_root_of(deliverable, marker=PACKAGE_MARKER):
+    """The PACKAGE directory a forge deliverable belongs to — `<...>/forge2/<repo>` — else None.
+
+    None means "this deliverable is a lone file" and the caller keeps the single-file commit; that is
+    the answer for every tag, tool and doc, whose paths hold no `forge2` component at all.
+
+    The marker is matched as a path COMPONENT, anywhere in the path — not as a prefix. It has to be:
+    the forge units' deliverables live at `checkouts/current/forge2/<repo>/<module>.py`, so `forge2`
+    is the THIRD component, and a startswith("forge2/") test would miss every one of them. The last
+    matching component wins, so a package that itself contains a `forge2` directory resolves to the
+    innermost package rather than the outermost.
+
+    A package root needs a directory of its own: there must be at least one component between the
+    marker and the deliverable's filename (`forge2/<repo>/add.py` -> `forge2/<repo>`, but bare
+    `forge2/add.py` -> None, because a file sitting directly in forge2/ is in no package and
+    `git add forge2/` would sweep every OTHER repo in the forge into this ticket's commit).
+    """
+    parts = _parts(deliverable)
+    for i in range(len(parts) - 1, -1, -1):        # last marker component wins (innermost package)
+        if parts[i] == marker and len(parts) - i >= 3:
+            return "/".join(parts[: i + 2])
+    return None
+
+
+def is_build_artifact(path):
+    """True if `path` is a build/cache artifact rather than package source (policy 8's exclusion).
+
+    Matched per COMPONENT, so it catches both the directory itself and everything under it:
+    `forge2/x/x.egg-info` and `forge2/x/x.egg-info/PKG-INFO` are both artifacts.
+    """
+    for part in _parts(path):
+        if part in PACKAGE_EXCLUDE_DIRS or part.endswith(PACKAGE_EXCLUDE_ENDS):
+            return True
+    return path.endswith(PACKAGE_EXCLUDE_FILES)
+
+
+def under(path, scope):
+    """Is `path` inside `scope` (or scope itself)? A PATH comparison, never a string prefix compare:
+    `docs/xx.md`.startswith("docs/x") is True and would be a lie. Both sides must already be
+    normpath'd by the caller — see commit_deliverable() on why a false answer here is unrecoverable.
+
+    When `scope` is a FILE (the single-file default) only the equality arm can ever fire, since no
+    path can live under a file — which is why that default's behavior is unchanged by #409.
+    """
+    return path == scope or path.startswith(scope + os.sep)
+
+
 # ── the forge: branch-per-ticket git, scoped to one repo (so --selftest can drive a throwaway) ────
 class Forge:
     """Every git act the branch-per-ticket flow performs, against one repo root.
@@ -203,11 +299,12 @@ class Forge:
     file description of the same file blocks the same process (self-deadlock).
     """
 
-    def __init__(self, root, worktrees=None):
+    def __init__(self, root, worktrees=None, package_marker=PACKAGE_MARKER):
         self.root = os.path.abspath(root)
         wt = worktrees or os.path.join(".git", "pair-worktrees")
         self.worktrees = wt if os.path.isabs(wt) else os.path.join(self.root, wt)
         self.lockfile = os.path.join(self.root, ".git", "pair-loop.lock")
+        self.package_marker = package_marker    # policy 8's gate; see package_root_of()
 
     # ── plumbing ─────────────────────────────────────────────────────────────
     def _run(self, args, cwd=None):
@@ -258,8 +355,12 @@ class Forge:
     def branch_exists(self, br):
         return self._run(["show-ref", "--verify", "--quiet", "refs/heads/" + br]).returncode == 0
 
-    def porcelain(self, cwd=None):
+    def porcelain(self, cwd=None, extra=()):
         """`git status --porcelain -z` parsed into [(xy, path)]; paths are repo-relative and RAW.
+
+        `extra` appends further arguments (a `-uall`, a `--` pathspec) for callers that need a
+        narrower or deeper listing; the default () is the whole-worktree listing every caller before
+        #409 got, unchanged.
 
         -z, never the plain form. In plain `--porcelain`, git C-QUOTES any path holding a space,
         a quote, or a non-ascii byte — `docs/naïve.md` is printed as `"docs/na\\303\\257ve.md"`
@@ -269,7 +370,7 @@ class Forge:
         SECOND NUL field (the source path); it is consumed here so it can never be mistaken for
         an entry of its own.
         """
-        raw = self.git("status", "--porcelain", "-z", cwd=cwd).split("\0")
+        raw = self.git("status", "--porcelain", "-z", *extra, cwd=cwd).split("\0")
         fields, i = [], 0
         while i < len(raw):
             entry = raw[i]
@@ -286,6 +387,35 @@ class Forge:
         """Paths with uncommitted TRACKED changes (untracked '??' entries ignored) — the #213 drift
         check, mirroring mint_crank.py's guard."""
         return [p for xy, p in self.porcelain(cwd) if xy != "??"]
+
+    def staged(self, cwd=None):
+        """The fileset the next commit will carry: the INDEX against HEAD, `git diff --cached
+        --name-only -z`. ASKED of git rather than assembled from what we staged, so what gets
+        journaled is what actually landed and not what we intended to land.
+
+        -z for porcelain()'s reason: plain `--name-only` C-quotes exotic paths, and this list is
+        written to the append-only record.
+        """
+        return [p for p in self.git("diff", "--cached", "--name-only", "-z", cwd=cwd).split("\0") if p]
+
+    # ── commit scope (#409, policy 8) ────────────────────────────────────────
+    def package_root(self, deliverable, package="auto"):
+        """This commit's scope: the deliverable's package root, or None for the single-file default.
+
+        `package` is the --package-commit gate, in three explicit states:
+          "auto" (default) — the PATH decides: a forge deliverable gets its package, everything else
+                             (tags, tools, docs) gets the unchanged single-file commit.
+          "on"             — force a package commit. If the path names no forge package, the scope
+                             falls back to the deliverable's own DIRECTORY: an explicit request to
+                             commit a directory, honored literally.
+          "off"            — force the single-file commit, even for a forge deliverable.
+        """
+        if package == "off":
+            return None
+        root = package_root_of(deliverable, self.package_marker)
+        if root is None and package == "on":
+            root = "/".join(_parts(deliverable)[:-1]) or None
+        return root
 
     def registered_worktrees(self):
         """Parse `git worktree list --porcelain` into [{path, branch}] (branch '' if detached)."""
@@ -324,33 +454,72 @@ class Forge:
             return {"branch": br, "path": path, "created": True, "base": base}
 
     # ── i1: the deliverable is committed ON the branch (the harness holds the git pen) ──
-    def commit_deliverable(self, tid, deliverable, message):
-        """Stage ONLY the deliverable and commit it on the ticket's branch.
+    def commit_deliverable(self, tid, deliverable, message, package="auto"):
+        """Stage the deliverable's SCOPE and commit it on the ticket's branch. Returns what landed.
 
-        Only the deliverable: the worker's mandate is "create or overwrite that file; touch nothing
-        else", so `add -A` would sweep in anything else the worktree happens to hold. Anything else
-        that IS dirty is returned as `strays` so the caller can put it on the record rather than let
-        it vanish unmentioned at reap time.
+        The scope is the single deliverable FILE — except for a forge deliverable, whose scope is its
+        whole PACKAGE DIRECTORY (policy 8; package_root() decides, `package` is the --package-commit
+        override). Never `add -A`: the scope is bounded either way, because the worker's mandate is
+        bounded either way. Anything dirty OUTSIDE the scope is returned as `strays` so the caller
+        can put it on the record rather than let it vanish unmentioned at reap time.
 
-        A stray is every dirty path that is NOT the deliverable, and deciding "is not the
-        deliverable" is a PATH comparison, not a string comparison — get it wrong in the false-
-        positive direction and the caller journals, permanently and append-only, that the delivered
-        file was abandoned uncommitted. Two ways the naive compare lies, both proven in --selftest:
-        git C-quotes exotic paths in plain `--porcelain` (hence porcelain()'s -z), and one path has
-        many spellings (`./docs/x.md` and `docs/x.md` are the same file; git prints the second).
-        So: raw paths from -z, os.path.normpath applied to BOTH sides.
+        Why a package cannot be committed one file at a time: a forge unit must land something
+        `pip install -e .` installs, so the module without its pyproject.toml is not a smaller
+        deliverable — it is a broken one. #401 proved it by landing exactly that.
+
+        Deciding "is / is not in scope" is a PATH comparison, not a string comparison — get it wrong
+        in the false-positive direction and the caller journals, permanently and append-only, that
+        the delivered file was abandoned uncommitted. Two ways the naive compare lies, both proven in
+        --selftest: git C-quotes exotic paths in plain `--porcelain` (hence porcelain()'s -z), and
+        one path has many spellings (`./docs/x.md` and `docs/x.md` are the same file; git prints the
+        second). So: raw paths from -z, os.path.normpath applied to BOTH sides, via under().
+
+        Returns {committed, sha, branch, package, files, skipped, strays}:
+          package  the package root this commit's scope was, or None for a single-file commit
+          files    the fileset ACTUALLY committed (git's own answer — Forge.staged())
+          skipped  build artifacts under the package root, deliberately not committed
+          strays   dirty paths outside the scope entirely
         """
         wt = self.worktree_of(tid)
         if not os.path.isfile(os.path.join(wt, deliverable)):
             raise Unexpected("no deliverable at %s in the worktree %s — the worker reported done "
                              "but produced no file" % (deliverable, wt))
+        # The deliverable itself, always and first — unchanged, and unconditional. A package add is
+        # a directory add, which git silently narrows by .gitignore; the deliverable is never allowed
+        # to go missing that quietly, so it is staged by name and any refusal raises here.
         self.git("add", "--", deliverable, cwd=wt)
-        want = os.path.normpath(deliverable)
-        strays = [p for _, p in self.porcelain(cwd=wt) if os.path.normpath(p) != want]
-        if not self.git("diff", "--cached", "--name-only", cwd=wt).strip():
-            return {"committed": False, "sha": self.head(wt), "branch": self.branch_of(tid), "strays": strays}
+
+        pkg, skipped = self.package_root(deliverable, package), []
+        if pkg:
+            # -uall: a wholly-untracked directory collapses to one 'forge2/x/' entry in the default
+            # listing, and this needs the FILES. The '--' pathspec scopes the listing to the package,
+            # so nothing outside it can be swept in by a glob or a rename.
+            add = []
+            for _, p in self.porcelain(cwd=wt, extra=("-uall", "--", pkg)):
+                (skipped if is_build_artifact(p) else add).append(p)
+            if add:
+                # Staged by explicit path rather than `add <dir>` so the artifacts above stay out.
+                # A DELETED file in `add` stages its deletion, which is correct: the package's real
+                # fileset is what the worker left, and a rewrite may retire a module it replaced.
+                self.git("add", "--", *add, cwd=wt)
+
+        scope = os.path.normpath(pkg or deliverable)
+        strays = [p for _, p in self.porcelain(cwd=wt) if not under(os.path.normpath(p), scope)]
+        files = self.staged(cwd=wt)
+        if not files:
+            return {"committed": False, "sha": self.head(wt), "branch": self.branch_of(tid),
+                    "package": pkg, "files": [], "skipped": skipped, "strays": strays}
+        if pkg:
+            # The commit log names the fileset, so `git show` alone answers "did the package land
+            # whole?" — the question #401 could only be answered by discovering the absence.
+            message += ("\n\nPackage commit (#409): %s/ — %d file(s)\n%s"
+                        % (pkg, len(files), "\n".join("  " + f for f in files)))
+            if skipped:
+                message += ("\nBuild artifacts skipped (regenerated by any install): %s"
+                            % ", ".join(skipped))
         self.git("commit", "--quiet", "-m", message, cwd=wt)
-        return {"committed": True, "sha": self.head(wt), "branch": self.branch_of(tid), "strays": strays}
+        return {"committed": True, "sha": self.head(wt), "branch": self.branch_of(tid),
+                "package": pkg, "files": files, "skipped": skipped, "strays": strays}
 
     # ── i2: merge the branch into the base (--no-ff); a conflict is an OUTCOME, not a crash ──
     def ahead_of(self, tid, base):
@@ -425,8 +594,9 @@ class Forge:
 
 
 def forge_for(root=None):
-    cfg = (REGISTRY.get("branch_per_ticket") or {}).get("worktrees")
-    return Forge(root or ROOT, worktrees=cfg)
+    cfg = REGISTRY.get("branch_per_ticket") or {}
+    return Forge(root or ROOT, worktrees=cfg.get("worktrees"),
+                 package_marker=cfg.get("package_marker") or PACKAGE_MARKER)
 
 
 # ── the pair's birth prompts ───────────────────────────────────────────────────────────────────────
@@ -447,7 +617,7 @@ WORKER_PROMPT = """You are %(agent)s, the %(role)s — the worker of a %(kind)s 
 TICKET: %(title)s
 %(body)s
 
-Deliverable: write it to %(deliverable)s (create or overwrite that file; touch nothing else).
+Deliverable: %(worker_scope)s
 %(worker_focus)s Your counterpart will adversarially audit this with no access to your
 reasoning, so the artifact must stand alone.
 %(workspace)s%(playbook)s%(findings)s
@@ -460,12 +630,65 @@ AUDITOR_PROMPT = """You are %(agent)s, the %(role)s — the adversary of a %(kin
 TICKET: %(title)s
 %(body)s
 
-The worker produced %(deliverable)s. You did NOT see the worker's reasoning — judge the artifact
+The worker produced %(auditor_scope)s You did NOT see the worker's reasoning — judge the artifact
 alone: no context, no charity. %(audit_focus)s Nitpicks are not findings.
 %(workspace)s
 Print as your LAST line:
 {"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}
 """ + GOVERNANCE
+
+
+# The two prompt slots that must agree with what commit_deliverable() actually stages (#409, policy
+# 8). A prompt is a promise: telling a forge worker to "touch nothing else" while the harness commits
+# its whole package would be a promise the harness breaks, and telling it the opposite while the
+# harness commits one file is how #401's pyproject.toml was written and then reaped. Both slots are
+# derived from the same package root the commit uses, so the three can never drift apart.
+def worker_scope(deliverable, pkg):
+    """The worker's deliverable line: what to write, and what the harness will commit."""
+    if not pkg:
+        return "write it to %s (create or overwrite that file; touch nothing else)." % deliverable
+    return ("write it to %s. That file is one module of the PACKAGE %s/, and the harness commits the "
+            "WHOLE of %s/ — so build the package there in full (its pyproject.toml, its config, its "
+            "console entry points, any submodules) and every part of it lands together. Create "
+            "nothing OUTSIDE %s/: anything you leave elsewhere is a stray, is NOT committed, and "
+            "does not survive. Build artifacts (%s.egg-info/, build/, dist/, __pycache__) are not "
+            "committed either — they are regenerated by any install, so do not hand-write them."
+            % (deliverable, pkg, pkg, pkg, pkg.rsplit("/", 1)[-1]))
+
+
+def auditor_scope(deliverable, pkg):
+    """The adversary's target line: the artifact it must judge is the package, not just the module."""
+    if not pkg:
+        return "%s." % deliverable
+    return ("the PACKAGE %s/, whose module %s is the ticket's named deliverable. The whole package "
+            "is the artifact and the whole package is what gets committed — judge it as one."
+            % (pkg, deliverable))
+
+
+def commit_note(rnd, deliverable, cm):
+    """The journal line for one round's commit. It names the fileset that ACTUALLY landed (#409).
+
+    Before #409 this line could only name the --deliverable, and every other file of a forge package
+    was journaled as an UNCOMMITTED stray — which was, permanently and append-only, the true record
+    of a package that never landed installable. #401 reads exactly that way. Now a package commit
+    names its root and its every file, and `strays` is back to meaning what it says: work left
+    outside the commit's scope that will not survive the reap.
+    """
+    if not cm["committed"]:
+        what = "no change to commit for %s" % deliverable
+    elif cm["package"]:
+        what = ("committed the PACKAGE %s/ — %d file(s): %s"
+                % (cm["package"], len(cm["files"]), ", ".join(cm["files"])))
+    else:
+        what = "committed %s" % deliverable
+    note = "round %d: %s on %s @ %s" % (rnd, what, cm["branch"], cm["sha"][:10])
+    if cm["skipped"]:
+        note += ("; build artifacts under the package NOT committed (any install regenerates them; "
+                 "committing them would drift the base tree, #213): " + ", ".join(cm["skipped"][:5]))
+    if cm["strays"]:
+        note += ("; UNCOMMITTED strays left in the worktree (the mandate forbids them; they will not "
+                 "survive the reap): " + ", ".join(cm["strays"][:5]))
+    return note
 
 
 # per-kind focus: what the worker optimizes for, how the adversary attacks, and each side's tools.
@@ -535,7 +758,8 @@ You route; you never author work product. Print as your LAST line ONLY this JSON
 def child_cmd(tid, deliverable, a):
     """The `--ticket` child a dispatched "run" becomes: its own process, its own branch+worktree."""
     cmd = [sys.executable, os.path.abspath(__file__), "--ticket", str(tid),
-           "--deliverable", deliverable, "--rounds", str(a.rounds), "--timeout", str(a.timeout)]
+           "--deliverable", deliverable, "--rounds", str(a.rounds), "--timeout", str(a.timeout),
+           "--package-commit", a.package_commit]     # the child decides nothing the parent didn't
     if a.base:
         cmd += ["--base", a.base]
     if a.keep_worktree:
@@ -707,14 +931,118 @@ def _st_repo(base):
     return repo
 
 
-def selftest():
+# The fixture package the #409 checks build, laid out the way a real forge unit is: the module sits
+# DIRECTLY in the package root (#401's deliverable was forge2/artifact_tree_gen/add.py) with its
+# pyproject.toml beside it, so that root is both the project root and the thing `pip install -e .`
+# is run from. Hence py-modules for the flat module and packages for the submodule package.
+FORGE_PYPROJECT = """[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "%(name)s"
+version = "0.1.0"
+description = "selftest forge package (#409 fixture)"
+
+[project.scripts]
+%(name)s = "add:main"
+
+[tool.setuptools]
+py-modules = ["add"]
+packages = ["sub"]
+"""
+
+
+def _st_forge_package(wt, pkg, name):
+    """Write what a forge unit's worker actually leaves in its worktree: the --deliverable MODULE,
+    plus everything else the package needs to be installable (#409). Returns the fileset it wrote.
+
+    Every part beyond add.py is one the ticket names — pyproject.toml, config, entry points,
+    submodules — and every one of them is what #401 lost: a package whose pyproject.toml is not
+    committed is not a package, and a check that only proved add.py lands would prove nothing new.
+    """
+    d = os.path.join(wt, pkg)
+    os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+    files = {
+        "add.py": "from sub.helper import bump\n\n\ndef add(a, b):\n    return bump(a + b, 0)\n\n\n"
+                  "def main():\n    print(add(2, 3))\n",
+        "pyproject.toml": FORGE_PYPROJECT % {"name": name},
+        "config.json": '{"schema": 1, "offset": 0}\n',
+        "sub/__init__.py": "",
+        "sub/helper.py": "def bump(v, by):\n    return v + by\n",
+    }
+    for rel, text in files.items():
+        open(os.path.join(d, rel), "w").write(text)
+    return sorted("%s/%s" % (pkg, r) for r in files)
+
+
+def install_check(base_dir, pkg_dir):
+    """`pip install -e .` on a package, in a THROWAWAY venv — #409's acceptance criterion, run
+    against the tree the selftest actually merged. Returns (status, detail) with status one of:
+
+      "PASS"  pip installed it AND the installed package imports and runs from the venv.
+      "FAIL"  pip rejected the package, or it installed but could not be imported. A real defect.
+      "SKIP"  the fixture could not be built: no venv, or pip could not obtain the PEP 517 build
+              backend the pyproject.toml names (which needs the network — see --install-check).
+              An unreachable index is a fact about this host, never about the package, so it must
+              not be reported as a failure of the package.
+    """
+    venv = os.path.join(base_dir, "install-check-venv")
+    r = subprocess.run([sys.executable, "-m", "venv", venv], capture_output=True, text=True)
+    if r.returncode != 0:
+        return "SKIP", "no venv available: %s" % (r.stderr or r.stdout).strip()[-160:]
+    py = os.path.join(venv, "bin", "python")
+    if not os.path.isfile(py):
+        py = os.path.join(venv, "Scripts", "python.exe")
+    if not os.path.isfile(py):
+        return "SKIP", "venv built no interpreter at %s" % venv
+    env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1")
+    try:
+        r = subprocess.run([py, "-m", "pip", "install", "-e", ".", "-q"], cwd=pkg_dir,
+                           capture_output=True, text=True, env=env, timeout=300)
+    except subprocess.TimeoutExpired:
+        return "SKIP", "pip did not finish in 300s (a slow or absent network)"
+    out = ((r.stderr or "") + (r.stdout or "")).strip()
+    if r.returncode != 0:
+        # Distinguish "the package is broken" from "this host could not fetch a build backend".
+        low = out.lower()
+        if any(s in low for s in ("no matching distribution found", "could not find a version",
+                                 "backendunavailable", "cannot import", "network is unreachable",
+                                 "temporary failure in name resolution", "connection", "retries exceeded",
+                                 "proxy", "ssl")):
+            return "SKIP", "pip could not obtain the build backend (no network?): %s" % out[-200:]
+        return "FAIL", "pip install -e . exited %s: %s" % (r.returncode, out[-300:])
+    # Installed is not the same as usable. Import the module and its submodule from the VENV — and
+    # from a cwd outside the package, so it is the install being tested and not the current
+    # directory happening to hold add.py.
+    r = subprocess.run([py, "-c", "from add import add; print(add(2, 3))"],
+                       capture_output=True, text=True, cwd=base_dir)
+    if r.returncode != 0 or r.stdout.strip() != "5":
+        return "FAIL", "installed but not importable/usable: %s" % ((r.stderr or r.stdout).strip()[-250:])
+    # "console entry points where applicable" is part of what a forge package must land, so the
+    # pyproject declares one and this proves the install actually created it.
+    script = os.path.join(os.path.dirname(py), "selftest_forge")
+    if not (os.path.isfile(script) or os.path.isfile(script + ".exe")):
+        return "FAIL", "installed but its console entry point was not created at %s" % script
+    return "PASS", "pip install -e . clean; `from add import add; add(2,3)` -> 5; entry point created"
+
+
+def selftest(install_check_too=False):
     """Drive the whole branch-per-ticket flow against a temp repo and CHECK each acceptance claim.
-    Prints one PASS/FAIL line per check; returns 0 only if every check passed."""
-    checks = []
+    Prints one PASS/FAIL line per check; returns 0 only if every check passed.
+
+    A SKIP is not a check: it is printed and counted separately and never fails the run (only
+    --install-check can produce one — see install_check()).
+    """
+    checks, skips = [], []
 
     def ck(name, cond, detail=""):
         checks.append((name, bool(cond), detail))
         print("   %-4s %s%s" % ("PASS" if cond else "FAIL", name, ("  — %s" % detail) if detail and not cond else ""))
+
+    def skip(name, detail):
+        skips.append((name, detail))
+        print("   SKIP %s  — %s" % (name, detail))
 
     base_dir = tempfile.mkdtemp(prefix="pair_loop-selftest-")
     try:
@@ -908,13 +1236,176 @@ def selftest():
            sorted(p for _, p in ents) == ["docs/moved.md", "docs/stray.md"], str(ents))
         f.reap_worktree(404)
 
+        # ── #409: a FORGE deliverable commits its WHOLE PACKAGE, so the package lands installable ──
+        # The bug this proves gone: #401 merged forge2/artifact_tree_gen/add.py and nothing else, so
+        # the pyproject.toml the worker wrote was journaled a stray and reaped, and what landed on
+        # main cannot be `pip install -e .`'d. The scope gate is the deliverable's PATH.
+        print("-- #409: a forge package deliverable commits the whole package")
+        pkg, name = "checkouts/current/forge2/selftest_forge", "selftest_forge"
+        deliv = pkg + "/add.py"
+        ck("package_root_of() finds the package under a nested forge2/",
+           package_root_of(deliv) == pkg, str(package_root_of(deliv)))
+        ck("package_root_of() takes a SUBMODULE to the same package root",
+           package_root_of(pkg + "/sub/helper.py") == pkg, str(package_root_of(pkg + "/sub/helper.py")))
+        ck("package_root_of() ignores a tool path (single-file, unchanged)",
+           package_root_of("tools/pair_loop.py") is None, str(package_root_of("tools/pair_loop.py")))
+        ck("package_root_of() ignores a doc path (single-file, unchanged)",
+           package_root_of("docs/PLAYBOOK.md") is None, str(package_root_of("docs/PLAYBOOK.md")))
+        ck("package_root_of() refuses a file sitting DIRECTLY in forge2/ (no package dir)",
+           package_root_of("checkouts/current/forge2/loose.py") is None,
+           str(package_root_of("checkouts/current/forge2/loose.py")))
+        ck("is_build_artifact() catches an egg-info dir and what's under it",
+           is_build_artifact(pkg + "/selftest_forge.egg-info")
+           and is_build_artifact(pkg + "/selftest_forge.egg-info/PKG-INFO")
+           and is_build_artifact(pkg + "/__pycache__/add.cpython-311.pyc"))
+        ck("is_build_artifact() leaves real package source alone",
+           not any(is_build_artifact(p) for p in (deliv, pkg + "/pyproject.toml", pkg + "/config.json",
+                                                  pkg + "/sub/helper.py")))
+
+        w409 = f.open_worktree(409, base)
+        wrote = _st_forge_package(w409["path"], pkg, name)
+        # what the worker's own `pip install -e .` leaves behind, and what importing leaves behind
+        os.makedirs(os.path.join(w409["path"], pkg, name + ".egg-info"))
+        open(os.path.join(w409["path"], pkg, name + ".egg-info", "PKG-INFO"), "w").write("Name: x\n")
+        os.makedirs(os.path.join(w409["path"], pkg, "build", "lib"))
+        open(os.path.join(w409["path"], pkg, "build", "lib", "add.py"), "w").write("built\n")
+        # ...and a genuine stray, OUTSIDE the package: the scope must still exclude it
+        open(os.path.join(w409["path"], "docs", "notes.md"), "w").write("scratch\n")
+
+        c409 = f.commit_deliverable(409, deliv, "ticket #409: forge unit")
+        ck("a forge deliverable is a PACKAGE commit", c409["package"] == pkg, str(c409["package"]))
+        ck("the package commit committed", c409["committed"], str(c409))
+        in_commit = f.git("show", "--name-only", "--format=", "ticket/409").split()
+        ck("the MODULE landed", deliv in in_commit, str(in_commit))
+        ck("its pyproject.toml landed (THE #401 bug)", pkg + "/pyproject.toml" in in_commit, str(in_commit))
+        ck("its config landed", pkg + "/config.json" in in_commit, str(in_commit))
+        ck("its submodule landed", pkg + "/sub/helper.py" in in_commit, str(in_commit))
+        ck("the WHOLE package source landed, exactly", sorted(in_commit) == wrote,
+           "committed %s; wrote %s" % (sorted(in_commit), wrote))
+        ck("the committed fileset is surfaced (files, not an empty strays:[])",
+           sorted(c409["files"]) == wrote, str(c409["files"]))
+        ck("build artifacts did NOT ride along into the commit",
+           not any(is_build_artifact(p) for p in in_commit), str(in_commit))
+        ck("...and they are NAMED as skipped, not dropped silently",
+           sorted(c409["skipped"]) == sorted([pkg + "/build/lib/add.py", pkg + "/" + name + ".egg-info/PKG-INFO"]),
+           str(c409["skipped"]))
+        ck("a stray OUTSIDE the package is still a stray", c409["strays"] == ["docs/notes.md"],
+           str(c409["strays"]))
+        ck("the commit LOG names the fileset that landed",
+           pkg + "/pyproject.toml" in f.git("log", "-1", "--format=%B", "ticket/409")
+           and "Package commit (#409)" in f.git("log", "-1", "--format=%B", "ticket/409"),
+           f.git("log", "-1", "--format=%B", "ticket/409"))
+        ck("the journal line names the package and its files, not one module",
+           "PACKAGE %s/" % pkg in commit_note(1, deliv, c409) and pkg + "/pyproject.toml" in commit_note(1, deliv, c409),
+           commit_note(1, deliv, c409))
+        ck("the worker's prompt line matches what the harness commits (no contradiction)",
+           "commits the WHOLE of %s/" % pkg in worker_scope(deliv, pkg) and "touch nothing else" not in worker_scope(deliv, pkg),
+           worker_scope(deliv, pkg))
+        ck("a non-package deliverable's prompt line is UNCHANGED",
+           worker_scope("docs/x.md", None) == "write it to docs/x.md (create or overwrite that file; "
+                                              "touch nothing else).", worker_scope("docs/x.md", None))
+
+        # a second round re-commits only what changed, and STILL names it
+        open(os.path.join(w409["path"], pkg, "config.json"), "w").write('{"schema": 1, "offset": 1}\n')
+        c409b = f.commit_deliverable(409, deliv, "ticket #409: round 2")
+        ck("a later round commits the package file that changed", c409b["committed"]
+           and c409b["files"] == [pkg + "/config.json"], str(c409b["files"]))
+
+        # THE ACCEPTANCE: the package lands on the base, whole and installable
+        m409 = f.merge_to_base(409, base, "merge ticket/409")
+        ck("the package branch merged to base", m409.get("ok"), m409.get("reason", ""))
+        merged_pkg = os.path.join(repo, pkg)
+        ck("forge2/<repo>/ lands on base WITH its pyproject.toml (#409 acceptance)",
+           os.path.isfile(os.path.join(merged_pkg, "pyproject.toml")), str(os.path.isdir(merged_pkg)))
+        ck("...and with the module, config and submodule beside it",
+           all(os.path.isfile(os.path.join(merged_pkg, r)) for r in ("add.py", "config.json", "sub/helper.py")))
+        ck("...and with NO build artifacts on base",
+           not os.path.exists(os.path.join(merged_pkg, name + ".egg-info"))
+           and not os.path.exists(os.path.join(merged_pkg, "build")))
+        f.reap_worktree(409)
+
+        # THE PILOT, RE-RUN — #409's acceptance sentence, staged literally. The base starts holding
+        # what #401 actually landed (the module, alone, no pyproject.toml), a fresh unit rewrites it
+        # into a full package, and the fix has to carry the MISSING pyproject.toml onto the base this
+        # time. Under the pre-#409 single-file commit this branch would have landed add.py again and
+        # the pyproject.toml would have been journaled a stray and reaped a second time.
+        print("-- #409: re-running the pilot over a module-only package heals it")
+        pilot = "checkouts/current/forge2/pilot_pkg"
+        os.makedirs(os.path.join(repo, pilot))
+        open(os.path.join(repo, pilot, "add.py"), "w").write("def add(a, b):\n    return a + b\n")
+        _st_git(repo, "add", "-A")
+        _st_git(repo, "commit", "--quiet", "-m", "what #401 landed: the module, alone")
+        ck("base starts module-only, exactly as the pilot left it (NOT installable)",
+           os.path.isfile(os.path.join(repo, pilot, "add.py"))
+           and not os.path.exists(os.path.join(repo, pilot, "pyproject.toml")))
+        w412 = f.open_worktree(412, base)
+        _st_forge_package(w412["path"], pilot, "pilot_pkg")
+        c412 = f.commit_deliverable(412, pilot + "/add.py", "ticket #412: re-run the pilot")
+        ck("the re-run commits the MISSING pyproject.toml together with the rewritten module",
+           c412["package"] == pilot and pilot + "/pyproject.toml" in c412["files"]
+           and pilot + "/add.py" in c412["files"], str(c412["files"]))
+        m412 = f.merge_to_base(412, base, "merge ticket/412")
+        ck("the re-run merged to base", m412.get("ok"), m412.get("reason", ""))
+        ck("the module-only package is HEALED on base: pyproject.toml is now present",
+           os.path.isfile(os.path.join(repo, pilot, "pyproject.toml")))
+        f.reap_worktree(412)
+
+        # the OTHER direction: --package-commit off keeps the single-file commit for a forge path,
+        # and a tag/tool path is single-file whatever the gate says.
+        print("-- #409: the gate, both ways")
+        w410 = f.open_worktree(410, base)
+        _st_forge_package(w410["path"], "checkouts/current/forge2/other_pkg", "other_pkg")
+        c410 = f.commit_deliverable(410, "checkouts/current/forge2/other_pkg/add.py", "ticket #410", "off")
+        ck("--package-commit off forces the single-file commit for a forge path",
+           c410["package"] is None and c410["files"] == ["checkouts/current/forge2/other_pkg/add.py"],
+           str(c410["files"]))
+        ck("...and its package files are then reported as strays (the pre-#409 record)",
+           "checkouts/current/forge2/other_pkg/pyproject.toml" in c410["strays"], str(c410["strays"]))
+        f.reap_worktree(410)
+
+        w411 = f.open_worktree(411, base)
+        open(os.path.join(w411["path"], "tools", "tag_x.py"), "w").write("tag\n")
+        open(os.path.join(w411["path"], "tools", "sibling.py"), "w").write("not mine\n")
+        c411 = f.commit_deliverable(411, "tools/tag_x.py", "ticket #411")
+        ck("a TOOL deliverable is untouched by #409: single file, sibling not swept in",
+           c411["package"] is None and c411["files"] == ["tools/tag_x.py"]
+           and c411["strays"] == ["tools/sibling.py"], str(c411))
+        c411b = f.commit_deliverable(411, "tools/tag_x.py", "ticket #411 (forced)", "on")
+        ck("--package-commit on honors an explicit directory commit for a non-forge path",
+           c411b["package"] == "tools" and "tools/sibling.py" in c411b["files"], str(c411b))
+        f.reap_worktree(411)
+
+        # ── the acceptance criterion itself: `pip install -e .` from the MERGED tree (opt-in) ──
+        # LAST on purpose: it is the only step that touches the network, and pip writes an .egg-info
+        # into the base tree it installs from — which the checks above must not see.
+        if install_check_too:
+            print("-- #409 acceptance: pip install -e . from the merged base tree (--install-check)")
+            status, detail = install_check(base_dir, merged_pkg)
+            if status == "SKIP":
+                skip("`pip install -e .` succeeds from the merged tree", detail)
+            else:
+                ck("`pip install -e .` succeeds from the merged tree", status == "PASS", detail)
+                if status == "PASS":
+                    print("        %s" % detail)
+            # And the reason the artifacts were excluded: the install just wrote an .egg-info into
+            # the base tree. Because it was never committed, it is UNTRACKED — so the base tree has
+            # no tracked drift and policy 3's #213 guard still lets the next ticket merge.
+            ck("the install left the base tree free of TRACKED drift (#213 still mergeable)",
+               f.tracked_dirty() == [], str(f.tracked_dirty()))
+
         bad = [n for n, ok, _ in checks if not ok]
-        print("\n== selftest == %d/%d checks passed%s"
-              % (len(checks) - len(bad), len(checks), "" if not bad else "; FAILED: " + "; ".join(bad)))
+        print("\n== selftest == %d/%d checks passed%s%s"
+              % (len(checks) - len(bad), len(checks),
+                 "; %d skipped" % len(skips) if skips else "",
+                 "" if not bad else "; FAILED: " + "; ".join(bad)))
         return 1 if bad else 0
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
-        print("== selftest == throwaway repo removed (this repo, the db and the network were never touched)")
+        # The claim has to track what actually ran: --install-check pip-installs, which reaches the
+        # network, so the default's "the network was never touched" would be a lie on that path.
+        print("== selftest == throwaway repo removed (this repo and the db were never touched; %s)"
+              % ("the network was used by --install-check's pip install, and nothing else"
+                 if install_check_too else "the network was never touched"))
 
 
 def main():
@@ -936,9 +1427,21 @@ def main():
                     help="branch to fork ticket/<id> from and merge back into (default: the repo's current branch)")
     ap.add_argument("--keep-worktree", action="store_true",
                     help="do not reap the worktree after a successful merge (debugging; the merge still happens)")
+    ap.add_argument("--package-commit", choices=("auto", "on", "off"), default="auto", metavar="AUTO|ON|OFF",
+                    help="what one round COMMITS (#409). auto (default): the deliverable's path decides — a "
+                         "forge module (<...>/%s/<repo>/...) commits its WHOLE package directory so its "
+                         "pyproject.toml/config/entry points land with it; every other deliverable (tags, "
+                         "tools, docs) commits that one file alone. on: always commit the deliverable's "
+                         "package (its own directory, if the path names no forge package). off: always "
+                         "commit only the deliverable file." % PACKAGE_MARKER)
     ap.add_argument("--selftest", action="store_true",
                     help="prove the branch/worktree/commit/merge/reap flow in a THROWAWAY temp repo, then exit "
                          "(no db, no agents, no network; this repo is not touched)")
+    ap.add_argument("--install-check", action="store_true",
+                    help="with --selftest only: also run a real `pip install -e .` on the forge package the "
+                         "selftest merged, in a throwaway venv — #409's acceptance criterion. USES THE "
+                         "NETWORK (pip fetches the build backend), which is why --selftest excludes it by "
+                         "default; with no network it reports SKIP, not FAIL")
     ap.add_argument("--compile-playbook", action="store_true",
                     help="file a documentation ticket from ALL harvested lessons and run the pair on it")
     ap.add_argument("--playbook", default="docs/PLAYBOOK.md",
@@ -947,7 +1450,9 @@ def main():
 
     # ── selftest: needs no key, no server, no db ──────────────────────────────
     if a.selftest:
-        return selftest()
+        return selftest(install_check_too=a.install_check)
+    if a.install_check:
+        ap.error("--install-check only means anything with --selftest")
 
     if not API_KEY:
         raise Unexpected("no CONGRUENCY_API_KEY (secrets or env) — token routes need it")
@@ -1020,6 +1525,13 @@ def main():
     pb_line = ("\nBefore starting, read %s — the AUDITED playbook of lessons harvested from prior "
                "tickets. Apply what applies.\n" % a.playbook) if os.path.isfile(pb) else ""
 
+    # #409: ONE package root decides all three of — what the worker is told to build, what the
+    # adversary is told to judge, and what the commit stages. Resolved once, here, from the same
+    # forge + --package-commit gate commit_deliverable() will use, so the three cannot disagree.
+    pkg = forge.package_root(a.deliverable, a.package_commit)
+    print("== scope == %s" % ("PACKAGE %s/ — the whole package is committed each round (#409)" % pkg
+                              if pkg else "single file %s (unchanged)" % a.deliverable))
+
     findings, history = [], []
     for rnd in range(1, a.rounds + 1):
         worker = "%s-t%dr%d" % (w_role, tid, rnd)
@@ -1027,6 +1539,7 @@ def main():
         focus = FOCUS.get(kind, FOCUS["documentation"])
         ctx = dict(tid=tid, kind=kind, title=title, body=body, deliverable=a.deliverable, playbook=pb_line,
                    workspace=workspace, branch=wt["branch"],
+                   worker_scope=worker_scope(a.deliverable, pkg), auditor_scope=auditor_scope(a.deliverable, pkg),
                    worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"])
 
         # fresh pair, registered + authorized (fresh spawn = cleared memory; trails persist)
@@ -1050,18 +1563,14 @@ def main():
                                  "note": "round %d: produced %s — %s" % (rnd, wres.get("ref"), wres.get("note", "")),
                                  "steps_remaining": 2})
 
-        # i1: the deliverable is COMMITTED on the ticket's branch — always, every round (#213)
+        # i1: the work is COMMITTED on the ticket's branch — always, every round (#213). Its scope is
+        # the deliverable, or the deliverable's whole package for a forge unit (#409, policy 8).
         cm = step("commit: %s" % wt["branch"], forge.commit_deliverable, tid, a.deliverable,
                   "ticket #%d: %s\n\n%s\n\nRound %d on %s; worker %s; deliverable %s"
-                  % (tid, (title or "")[:64], wres.get("note", ""), rnd, wt["branch"], worker, a.deliverable))
+                  % (tid, (title or "")[:64], wres.get("note", ""), rnd, wt["branch"], worker, a.deliverable),
+                  a.package_commit)
         rest("ticket.progress", {"ticket_id": tid, "agent_id": fid,
-                                 "note": "round %d: %s on %s @ %s%s"
-                                         % (rnd, "committed %s" % a.deliverable if cm["committed"]
-                                            else "no change to commit for %s" % a.deliverable,
-                                            wt["branch"], cm["sha"][:10],
-                                            ("; UNCOMMITTED strays left in the worktree (the mandate forbids "
-                                             "them; they will not survive the reap): " + ", ".join(cm["strays"][:5]))
-                                            if cm["strays"] else "")})
+                                 "note": commit_note(rnd, a.deliverable, cm)})
 
         aprompt = AUDITOR_PROMPT % {**ctx, "agent": auditor, "role": a_role}
         vres = step("validate: %s" % auditor, spawn_claude, aprompt, focus["auditor_tools"], a.timeout, wt["path"])
@@ -1090,10 +1599,14 @@ def main():
                         False, "")
                 return 4
             history.append({"round": rnd, "findings": []})
+            # The manifest's permanent UID covers what LANDED, so the note names it: for a forge unit
+            # that is the package and its fileset, not the one module the ref points at (#409).
+            landed = ("package %s/ (%s)" % (cm["package"], ", ".join(cm["files"]))) if cm["package"] else wres.get("ref", a.deliverable)
             rest("work.record", {"ticket_id": tid, "kind": "doc" if kind == "documentation" else "code",
                                  "ref": wres.get("ref", a.deliverable),
-                                 "note": "%s [%s @ %s merged to %s @ %s]"
-                                         % (wres.get("note", ""), wt["branch"], cm["sha"][:10], base, mg["sha"][:10])})
+                                 "note": "%s [landed %s; %s @ %s merged to %s @ %s]"
+                                         % (wres.get("note", ""), landed, wt["branch"], cm["sha"][:10],
+                                            base, mg["sha"][:10])})
             rest("ticket.progress", {"ticket_id": tid, "agent_id": fid,
                                      "note": "MERGED %s -> %s (--no-ff): %d commit(s) landed in merge commit %s "
                                              "(base was %s); branch kept as the ticket's trace"
