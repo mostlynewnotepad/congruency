@@ -53,11 +53,33 @@ A dev-only universe would therefore leave every one of the 26 page units dependi
 has no unit ticket, which is exactly the under-enumeration #230 forbids ("enumerate EVERY unit").
 This tool mirrors the engine, and `--subset tag:` still lets a run drain only tags.
 
+THE TAG GATE IS THE #282 HARNESS, NOT A DIFF (#323 — the systemic bug this tool used to cause).
+Tag units used to state their gate as "byte-equivalent vs the PHP render". A blind auditor reads
+that as a WHOLE-PAGE byte diff of ?page=tags — and that diff is STRUCTURALLY NON-EMPTY for EVERY
+tag, including tags already merged byte-perfect (#323 measured ~6205B on CategoryView, TreeView and
+TicketList, all three correct). The reason has nothing to do with any port: the PHP URL returns a
+full CMS page, while the Go server frames the tag engine's render in its own chrome and says so in
+its source — congruency-go/server.go:820-823, "the CMS Controller::control() page chrome is still
+not reproduced here." So correct ports were rejected, pairs never self-settled, and #310/#311/#312
+had to be hand-harvested against the harness that was already authoritative.
+
+The authoritative gate already exists: congruency-go/tags/equivalence_test.go (#282) renders each
+tag through tags.RenderTag and compares it to the tag's own bytes SLICED out of the live PHP page.
+So a tag unit filed by this tool now names exactly that, and REFUSES the diff by name and with its
+evidence — a gate stated only as a positive gets re-derived by the next reader into the same wrong
+diff. tag_harness() verifies the file still defines the test before any tag ticket is filed, and
+reads the harness's override knobs OUT OF IT (#323's own text sketches the gate as
+`CONGRUENCY_SQLITE=<db> go test ...`, but the harness never reads CONGRUENCY_SQLITE — its db knob
+is CONGRUENCY_EQUIV_DB, equivalence_test.go:199-206 — so that prefix would silently do nothing).
+Tag-on-tag dependencies are derived too: see tag_emits().
+
 UNIT-SCOPED GATES. Each unit ticket's gate exercises THAT unit and nothing less:
   * a route unit diffs ?route=<its own name>;
   * a page unit diffs /?page=<its own DocumentID>;
-  * a tag unit diffs ?page=tags&tag=<its own name> AND every page whose template embeds it (the
-    embedding pages are derived per tag from Document_Templates, not guessed);
+  * a tag unit settles on the #282 harness above (`go test ./tags/ -run TestTagEquivalence`) with
+    its tag registered — never on a whole-page diff. The pages whose templates embed it are still
+    derived per tag from Document_Templates, but they are CONTEXT (which argument forms the live
+    site uses), not the gate: diffing a page is the same broken whole-page comparison;
   * each CRUD verb drives ITS OWN verb (list paginates/filters/orders, read fetches a real pk and
     a 404, create/update/delete run their own HTTP method against scratch db copies);
   * congruency_rest_route is gated on ?route= traffic (the engine's own success + error
@@ -128,14 +150,28 @@ Successor numbers are MONOTONIC: the next generation is one past the highest thi
 re-mints the number g1 and the journal stays readable. The chain is scoped by --subset, so a
 `--subset tag:` drain and a full drain never block each other.
 
+CORRECTING THE TAG UNITS ALREADY FILED (--correct-open-tags, #323). Fixing the template only helps
+units filed FROM NOW ON, and this tool is idempotent by design — it will never re-file a unit whose
+key is already ticketed — so the tag units already carrying the broken wording would stay broken
+forever. Their bodies cannot be rewritten either: ticket identity is immutable by SQL trigger
+(tg_tickets_immutable_identity, migrations/0029_ticket_authorization.sql:111-117 — "ticket identity
+(id, ts, title, body, component, kind) is permanent: append events"). The lawful move is the one
+the trigger names: --correct-open-tags APPENDS one governed ticket.progress event, carrying the
+corrected gate, to each still-open tag unit. It edits nothing, files nothing, re-opens nothing, and
+is idempotent — a ticket whose journal already holds the correction marker is skipped. Candidates
+come from the db (ALL statuses, minus DONE/CLOSED) UNION the live queue, because ticket.queue
+returns only OPEN/REQUESTED and an ACTIVE unit — a pair working the broken gate RIGHT NOW — is the
+one that most needs the correction.
+
 SAFE BY DEFAULT: run with no flags this tool only REPORTS — it writes to no db and creates no file
 (verified before/after in isolation: the state dir gains no `-wal`/`-shm`/anything and the db's hash
-is unchanged). It writes exactly two things, both only when you ask: --json writes the one path you
-name, and --file-tickets POSTs — solely through the governed rest.php routes (ticket.create ->
-ticket.kind -> edge.record) with X-Api-Key from ../.secrets/ats.env, the same source pair_loop.py
-reads. It appends to the registry's bug_reports sink only if it hits an unexpected exception (the
-Variant-A report note-for-claude mandates). Pure-python stdlib, registry-gated (a tool that cannot
-see registry.json throws).
+is unchanged). It writes exactly three things, each only when you ask: --json writes the one path you
+name; --file-tickets POSTs — solely through the governed rest.php routes (ticket.create ->
+ticket.kind -> edge.record); and --correct-open-tags POSTs ticket.progress events, equally governed.
+Both POST paths use X-Api-Key from ../.secrets/ats.env, the same source pair_loop.py reads. It
+appends to the registry's bug_reports sink only if it hits an unexpected exception (the Variant-A
+report note-for-claude mandates). Pure-python stdlib, registry-gated (a tool that cannot see
+registry.json throws).
 
 Every invocation below is written from the REPO ROOT — the directory that holds registry.json — and
 runs as written from there (`tools/go_port_decomposer.py` would NOT: the tool lives under
@@ -146,6 +182,7 @@ checkouts/current/congruency, so that shorter form only resolves from the CMS ap
     python3 checkouts/current/congruency/tools/go_port_decomposer.py --file-tickets  # file a batch
     python3 checkouts/current/congruency/tools/go_port_decomposer.py --subset route:agent. --file-tickets --batch 3
     python3 checkouts/current/congruency/tools/go_port_decomposer.py --json /tmp/units.json   # dump the enumeration
+    python3 checkouts/current/congruency/tools/go_port_decomposer.py --correct-open-tags      # #323: fix filed tag units
 
 Exit 0 on a clean run; exit 2 with a one-line message (never a traceback) on a bad invocation or an
 unusable environment.
@@ -156,6 +193,7 @@ import os
 import re
 import sqlite3
 import sys
+import textwrap
 import time
 import traceback
 import urllib.error
@@ -185,6 +223,27 @@ CONG_DB = os.path.join(STATE, "congruency.sqlite")
 REST_PHP = os.path.join(SOURCE, "boot", "rest.php")
 TAGS_DIR = os.path.join(SOURCE, "invocators", "tags")                # configure.php: TAGS_DIR
 SOURCE_FROM_ROOT = os.path.relpath(SOURCE, ROOT)
+
+# ── the Go port, and the AUTHORITATIVE tag gate (#282, #323) ─────────────────────────────────────
+# The tag harness is the ONLY thing that settles a tag unit. See "THE TAG GATE" in the module
+# docstring for why the obvious whole-page diff is not, and cannot be, that gate.
+GO_DIR = os.path.join(ROOT, "congruency-go")
+GO_FROM_ROOT = os.path.relpath(GO_DIR, ROOT)
+GO_TAGS_DIR = os.path.join(GO_DIR, "tags")
+TAG_HARNESS = os.path.join(GO_TAGS_DIR, "equivalence_test.go")       # #282
+TAG_HARNESS_FROM_ROOT = os.path.relpath(TAG_HARNESS, ROOT)
+TAG_TEST_NAME = "TestTagEquivalence"
+# The gate command a tag unit settles on, written from the REPO ROOT like every other invocation
+# this tool prints. No env prefix: the harness resolves the db/app-root/URL itself (see
+# tag_harness()), and every one of its knobs already defaults to the live server's own values.
+TAG_GATE_CMD = "cd %s && go test ./tags/ -run %s -count=1 -v" % (GO_FROM_ROOT, TAG_TEST_NAME)
+# The idempotency marker for --correct-open-tags. A ticket BODY is immutable by SQL trigger
+# (tg_tickets_immutable_identity, migrations/0029_ticket_authorization.sql:111-117 — "ticket
+# identity (id, ts, title, body, component, kind) is permanent: append events"), so an already-filed
+# unit is corrected by APPENDING a journal event, and this marker in the note is what makes a second
+# run skip it instead of appending the same correction twice.
+GATE_CORRECTION_MARK = "[go-port:gate-correction:v1]"
+CORRECTION_AGENT = "go_port_decomposer"
 
 # The PHP interpreter the harness ships, and the boot invocation serve.py uses (php -S with
 # boot/router.php as the router script, cwd = the app root). Both are quoted into the gates so a
@@ -221,6 +280,26 @@ GROUP_RANK = {"boot": 0, "helper": 1, "crud": 2, "engine": 3, "page": 4, "route"
 # This is the same pattern in python, with the tag NAME captured so a page's embedded tags are read
 # out of Document_Templates.Content the way the engine reads them.
 TAG_INVOCATION_RE = re.compile(r"<<<([a-zA-Z]+)(?:\([A-Za-z0-9]*\))*>>>")
+
+# A tag INVOCATION AS EMITTED BY ANOTHER TAG, matched on the name alone. The full TAG_INVOCATION_RE
+# above cannot be used for this: an emitted invocation is usually built at run time, so its argument
+# is a PHP expression in the source, not the literal [A-Za-z0-9]* the engine will see after
+# interpolation. BodyTag.php:20 is the case that proves it —
+#     return "<<<ContentTag(" . $this->body . ")>>>";
+# — which TAG_INVOCATION_RE does NOT match (`" . $this->body . "` is not [A-Za-z0-9]*), while the
+# engine matches the INTERPOLATED result at run time and substitutes ContentTag. So this matches
+# TAG_KEY_PREFIX + FUNCTION_NAME only, and the name class is the engine's own FUNCTION_NAME —
+# "[a-zA-Z]+" (boot/constants.default.json:33) — so a name this stops short of is a name the engine
+# also refuses to substitute. `<<<Config_Form_Invocator($product)>>>`
+# (invocators/tags/store/Catalog_Controller.php:19) is exactly that: both this pattern and the
+# engine's read the name as "Config" and stop at the underscore, so the engine leaves that
+# invocation LITERAL and it is correctly not reported as a dependency. See tag_emits().
+TAG_EMIT_RE = re.compile(r"<<<([a-zA-Z]+)")
+
+# A tag REGISTRATION in the Go port: `Register("<Name>", func(...) ...)`, the only supported way
+# into the registry (congruency-go/tags/engine.go:1342-1368 — "Register ... is the ONLY supported
+# way in"). Comment lines are skipped by the caller, so a docblock naming Register is not counted.
+GO_REGISTER_RE = re.compile(r"\bRegister\(\"([A-Za-z0-9_]+)\"\s*,")
 
 # ── the encoder legend. Every fact here is checked against boot/rest.php at run time by
 #    rest_encoding(); nothing below is a standing claim about which reply uses which. ─────────────
@@ -649,18 +728,30 @@ def rest(base, route, obj=None, method=None, key=None, timeout=15):
 
 
 # ── the PHP lexer: ONE masking pass ─────────────────────────────────────────────────────────────
-def php_mask(src):
-    """Return a SAME-LENGTH, SAME-LINE-NUMBERED copy of PHP source in which every comment and every
-    string-literal BODY is blanked to spaces (newlines preserved, quotes kept). Indices into the mask
-    are therefore valid indices into the original, so structure can be found on the mask while text is
-    read from the real source.
+def php_lex(src, blank_strings=True):
+    """Return a SAME-LENGTH, SAME-LINE-NUMBERED copy of PHP source with every comment blanked to
+    spaces (newlines preserved) and, when blank_strings, every string-literal BODY blanked too
+    (quotes kept). Indices into the result are therefore valid indices into the original, so
+    structure can be found on it while text is read from the real source.
 
     One pass, not stacked regexes — this is tools/tag_selfcheck.py's lex() lesson, and rest.php is
     exactly the file that proves it. A regex that strips `//` line comments BEFORE strings eats the
     closing quote of the real literal in file_get_contents('php://input'), and the stray quote then
     pairs with the next quote in the file and swallows whole functions. Scanning once means a `//`
     inside a string is seen as string content, and a quote inside a comment is seen as comment text.
-    Line comments: // and #. Block comments: /* */. String escapes: \\<any>."""
+    Line comments: // and #. Block comments: /* */. String escapes: \\<any>.
+
+    THE TWO CALLERS WANT OPPOSITE THINGS, WHICH IS WHY THIS TAKES A FLAG:
+      php_mask()      (blank_strings=True)  — structure only. Used to find rest.php's functions and
+                                              branch guards, where a brace or paren inside a literal
+                                              would mislead the balancer.
+      php_code_only() (blank_strings=False) — comments gone, string bodies KEPT. Used to find the
+                                              tag invocations a tag EMITS, which live inside string
+                                              literals (BodyTag.php:20 returns the literal
+                                              "<<<ContentTag(" . $this->body . ")>>>"). Blanking
+                                              literals would erase exactly what that scan looks for,
+                                              while keeping comments would report every usage
+                                              example in a docblock as a real dependency."""
     def blank(text):
         return "".join(ch if ch == "\n" else " " for ch in text)
 
@@ -694,18 +785,29 @@ def php_mask(src):
                     break
                 j += 1
             if j >= n:                                    # unterminated literal: blank to EOF
-                out.append(q + blank(src[i + 1:n]))
+                out.append(q + (blank(src[i + 1:n]) if blank_strings else src[i + 1:n]))
                 i = n
-            else:
-                out.append(q + blank(src[i + 1:j]) + q)   # quotes kept, body blanked
+            else:                                         # quotes always kept; body per the flag
+                body = blank(src[i + 1:j]) if blank_strings else src[i + 1:j]
+                out.append(q + body + q)
                 i = j + 1
         else:
             out.append(c)
             i += 1
     mask = "".join(out)
     if len(mask) != len(src):                             # the whole design rests on this
-        die("internal: php_mask changed the source length (%d -> %d)" % (len(src), len(mask)))
+        die("internal: php_lex changed the source length (%d -> %d)" % (len(src), len(mask)))
     return mask
+
+
+def php_mask(src):
+    """Comments AND string bodies blanked — the structural mask rest.php's parsing runs on."""
+    return php_lex(src, blank_strings=True)
+
+
+def php_code_only(src):
+    """Comments blanked, string bodies KEPT — the view tag_emits() reads emitted tags out of."""
+    return php_lex(src, blank_strings=False)
 
 
 def php_functions(mask):
@@ -1366,7 +1468,106 @@ def page_units(con, tags_by_page):
     return units
 
 
-def tag_units(pages_by_tag):
+def tag_harness():
+    """The #282 tag-equivalence harness — VERIFIED to exist and to still define the test this tool's
+    gate names, and its override knobs READ OUT OF IT rather than remembered.
+
+    This mirrors what php_units() does for the render chain and what fn_span() does for rest.php: a
+    unit ticket that names a gate command is a promise the command runs, so the file behind it is
+    checked at enumeration time and a stale map is a hard error, never a silent claim. If this tool
+    printed `go test -run TestTagEquivalence` after #282's test had been renamed, every tag unit it
+    filed would carry a gate that exits "no tests to run" — a gate that passes while proving
+    nothing, which is the exact class of defect #323 exists to remove.
+
+    The knobs are derived because the gate must not name one the harness does not read. #323's own
+    text sketches the gate as `CONGRUENCY_SQLITE=<state db> go test ...`, and CONGRUENCY_SQLITE is
+    NOT among the four the harness reads (it resolves the db through equivDBPath(), whose override
+    is CONGRUENCY_EQUIV_DB — congruency-go/tags/equivalence_test.go:199-206). Setting
+    CONGRUENCY_SQLITE would do nothing at all, and a pair that pointed it at a scratch db and saw a
+    PASS would be reading a result from the wrong database. So the names come from the source."""
+    if not os.path.isfile(TAG_HARNESS):
+        die("the tag-equivalence harness (#282) is not at %s — it is the ONLY gate that settles a "
+            "tag unit, so this tool will not file tag tickets naming a gate that is not there; "
+            "re-read congruency-go/tags/ before filing" % TAG_HARNESS_FROM_ROOT)
+    src = open(TAG_HARNESS, encoding="utf-8", errors="replace").read()
+    if not re.search(r"\bfunc\s+" + re.escape(TAG_TEST_NAME) + r"\s*\(", src):
+        die("%s no longer defines func %s( — this decomposer's map of the #282 tag gate is stale, "
+            "and every tag unit it filed would name a `go test -run %s` that matches no test and "
+            "exits 0 without measuring anything; re-read the harness before filing"
+            % (TAG_HARNESS_FROM_ROOT, TAG_TEST_NAME, TAG_TEST_NAME))
+    knobs = sorted(set(re.findall(r"os\.Getenv\(\"([A-Z_0-9]+)\"\)", src)))
+    if not knobs:
+        die("%s reads no os.Getenv override at all — this tool's map of the #282 harness is stale; "
+            "re-read it before filing tickets that describe its knobs" % TAG_HARNESS_FROM_ROOT)
+    return {"rel": TAG_HARNESS_FROM_ROOT, "test": TAG_TEST_NAME, "cmd": TAG_GATE_CMD, "knobs": knobs}
+
+
+def go_registered_tags(found):
+    """The tag names the Go port has REGISTERED today, scanned out of congruency-go/tags/*.go.
+
+    `Register(name, factory)` is the registry's only writer (engine.go:1342-1368), called from an
+    init() in each tag's own file, so the set of Register("<Name>", ...) call sites IS the set of
+    tags tags.IsPorted() answers true for — which is exactly what the #282 harness measures and what
+    it SKIPs. Reporting it lets each tag unit say whether its own dependencies are satisfied yet.
+
+    Static, and THREE-WAY conservative, because a static scan of call sites is not the registry:
+      * comment lines are skipped, so a docblock naming Register is not a registration;
+      * a line calling panics(...) is skipped — engine.go's own self-checks REGISTER-TO-PROVE-IT-
+        FAILS, e.g. `check("Register: a nil factory panics", panics(func() {
+        Register("NeverRegistered", nil) }), true)` (engine.go:4402). That registration is rejected
+        by design, and counting it would report a tag that does not exist as ported;
+      * the result is intersected with the scanned tag universe, so a name that is not a real tag
+        under TAGS_DIR can never be reported as one.
+    It is a REPORTING aid and nothing more. The GATE is `go test`, which asks the real registry at
+    run time; this only decides how a dependency is LABELLED in a ticket body."""
+    names = set()
+    if not os.path.isdir(GO_TAGS_DIR):
+        return names
+    for f in sorted(os.listdir(GO_TAGS_DIR)):
+        if not f.endswith(".go"):
+            continue
+        for line in open(os.path.join(GO_TAGS_DIR, f), encoding="utf-8", errors="replace"):
+            s = line.lstrip()
+            if s.startswith("//") or s.startswith("*") or "panics(" in line:
+                continue
+            names.update(GO_REGISTER_RE.findall(line))
+    return names & set(found)
+
+
+def tag_emits(found):
+    """{tag: [other tags whose invocation this tag's own output embeds]} — a tag's REAL tag-on-tag
+    prerequisites, derived from the PHP rather than assumed.
+
+    WHY THIS IS A DEPENDENCY AT ALL. Tag_Wrapper::execute_all_tags RE-SCANS what a tag returns and
+    substitutes any invocation it finds there (lib/TagLoader/Tag/Tag_Wrapper.php; the recursion is
+    the `add_child` + recurse at $depth+1 step). So a tag whose get_document() emits <<<Other>>>
+    does not render its own final bytes — Other's bytes land inside them. BodyTag is the canonical
+    case: its whole body is `return "<<<ContentTag(" . $this->body . ")>>>";` (BodyTag.php:19-21), so
+    BodyTag's bytes ARE ContentTag's, and BodyTag cannot be measured until ContentTag is registered.
+
+    HOW IT IS READ. php_code_only() blanks comments and keeps string bodies, because an emitted
+    invocation lives in a string literal while a DOCUMENTED one lives in a docblock — and the
+    difference decides whether the engine ever sees it. Style.php is the file that proves both
+    halves: its docblock says "Every page template embeds <<<Style>>> ... (like <<<TitleTag>>>)"
+    (Style.php:8-9), which the engine never sees and which is NOT a dependency, while its return
+    concatenates the literal "<<<TelemetryBeacon>>>" (Style.php:28), which the engine DOES
+    substitute and which IS one. Names are then kept only if they are real scanned tags, so the
+    engine's non-matches (`<<<Tag>>>`, `<<<Config...>>>` — see TAG_EMIT_RE) drop out.
+
+    LIMIT, STATED PLAINLY BECAUSE THE TICKETS REST ON IT: this is a static scan. A name assembled
+    entirely at run time (`"<<<" . $name . ">>>"`) has no literal for it to see and would be missed.
+    No tag under TAGS_DIR builds one that way in this checkout — every emitted invocation has a
+    literal `<<<Name` prefix — but the unit ticket tells the porter to read the source rather than
+    trust this list as complete."""
+    emits = {}
+    for name in sorted(found):
+        code = php_code_only(open(os.path.join(SOURCE, found[name]), encoding="utf-8",
+                                  errors="replace").read())
+        emits[name] = sorted(set(t for t in TAG_EMIT_RE.findall(code) if t in found and t != name))
+    return emits
+
+
+def scan_tags():
     """Every tag under TAGS_DIR, discovered the way the live engine discovers them: TagList::scan
     (invocators/tags/dev/TagList.php) walks TAGS_DIR recursively with a RecursiveIteratorIterator,
     keeps any *.php whose source contains `Tag_Interface`, and keys it by basename-minus-.php (so
@@ -1385,25 +1586,27 @@ def tag_units(pages_by_tag):
             found.setdefault(f[:-4], os.path.relpath(path, SOURCE))
     if not found:
         die("no *.php under %s contains Tag_Interface — cannot enumerate the tags" % TAGS_DIR)
+    return found
 
+
+def tag_units(pages_by_tag, found, emits, registered, harness):
+    """One unit per scanned tag, each gated on the #282 harness — see gate_block()."""
     units = []
     for name in sorted(found):
         rel = found[name]
         pages = pages_by_tag.get(name, [])
         if pages:
             inpage = ("PAGES WHOSE TEMPLATE EMBEDS <<<%s>>> (read out of Document_Templates with the\n"
-                      "engine's own pattern — these are the in-page substitution sites, and they are part\n"
-                      "of this unit's gate):\n  %s\n" % (name, ", ".join(str(p) for p in pages)))
-            inpage_gate = ("  for p in %s; do\n"
-                           "    diff <(curl -s \"%s/?page=$p\") <(curl -s \"%s/?page=$p\") || echo \"DIVERGES: $p\";\n"
-                           "  done\n" % (" ".join(str(p) for p in pages), PHP_BASE, GO_BASE))
+                      "engine's own pattern). These are CONTEXT, not a gate — they tell you which argument\n"
+                      "forms the live site actually uses, so you port the ones that matter:\n%s\n"
+                      % (name, textwrap.fill(", ".join(str(p) for p in pages), width=94,
+                                             initial_indent="  ", subsequent_indent="  ")))
         else:
             inpage = ("PAGES WHOSE TEMPLATE EMBEDS <<<%s>>>: none today — no Document_Templates row\n"
-                      "mentions it. The gallery render below is therefore this unit's whole gate.\n" % name)
-            inpage_gate = ""
+                      "mentions it.\n" % name)
         units.append(unit(
             "tags", "tag", name, rel,
-            "Port tag %s to Go, byte-equivalent vs the PHP render against the same DB" % name,
+            "Port tag %s to Go — settle on the #282 go-test harness, NOT a whole-page diff" % name,
             "THE PHP ORIGINAL — the contract:\n  %s\n\nIt is a `Tag_Interface` tag; the engine substitutes\n"
             "it wherever <<<%s>>> appears in a template, and the gallery renders it standalone at\n"
             "?page=tags&tag=%s (TagList::scan finds it under TAGS_DIR, so that URL resolves). Port THIS\n"
@@ -1411,15 +1614,138 @@ def tag_units(pages_by_tag):
             "gracefully against a missing dependency must degrade IDENTICALLY in Go; see\n"
             "tools/tag_selfcheck.py for what each tag depends on).\n\n%s"
             % (rel, name, name, inpage),
-            "EQUIVALENCE-DIFF — both servers on the SAME db, byte-identical HTML.\n"
-            "  1. the gallery render of THIS tag:\n"
-            "     diff <(curl -s '%s/?page=tags&tag=%s') \\\n"
-            "          <(curl -s '%s/?page=tags&tag=%s')\n"
-            "%s"
-            "Whitespace counts — diff raw bytes. If this tag takes arguments, drive each argument form the\n"
-            "templates above actually use, not just the bare invocation."
-            % (PHP_BASE, name, GO_BASE, name, ("  2. every page that embeds it:\n" + inpage_gate) if inpage_gate else "")))
+            gate_block(name, emits.get(name, []), registered, harness)))
     return units
+
+
+def registering_block(name, harness):
+    """How a tag enters the registry the harness measures. Without this the gate cannot even be
+    attempted: an unregistered tag is SKIPped by the sweep, and a skip is a PASS."""
+    return (
+        "REGISTERING %s (the gate cannot pass until you do this):\n"
+        "  Add an init() to your tag's own file in %s/tags/, exactly as every ported tag does\n"
+        "  (congruency-go/tags/contenttag.go:151-153 is a one-tag example, and engine.go:1374-1385\n"
+        "  registers the ten #226 landed together):\n"
+        "\n"
+        "      func init() {\n"
+        "          Register(\"%s\", func(e *Engine, a *TagArguments) Tag { return &%sTag{e: e, args: a} })\n"
+        "      }\n"
+        "\n"
+        "  Register is the registry's ONLY writer (engine.go:1342-1368) and it PANICS on a duplicate\n"
+        "  name, so register in exactly ONE place. Registering is what flips tags.IsPorted(\"%s\") to\n"
+        "  true, and THAT is what makes the harness measure this tag instead of skipping it — no edit\n"
+        "  to %s is needed, or wanted.\n"
+        % (name, GO_FROM_ROOT, name, name, name, harness["rel"]))
+
+
+def deps_block(name, deps, registered):
+    """The tag-on-tag prerequisites — see tag_emits() for how they are derived."""
+    if not deps:
+        return (
+            "TAGS THIS TAG DEPENDS ON: none. Its own output embeds no other tag's invocation (derived\n"
+            "  from its PHP source, comments excluded — see the decomposer's tag_emits()), so nothing\n"
+            "  else has to be registered before the gate can measure it.\n")
+    lines = ["TAGS THIS TAG DEPENDS ON — PORT AND REGISTER THESE FIRST:"]
+    for d in deps:
+        lines.append("  - %-24s %s" % (d, "already registered in the Go engine today"
+                                       if d in registered else
+                                       "NOT registered yet — the gate CANNOT pass until it is"))
+    lines.append(
+        "\n  This is not bookkeeping: Tag_Wrapper::execute_all_tags RE-SCANS whatever a tag returns and\n"
+        "  substitutes any invocation it finds there, so the tag(s) above render INSIDE this tag's\n"
+        "  bytes. BodyTag is the clearest case — its entire body is\n"
+        "  `return \"<<<ContentTag(\" . $this->body . \")>>>\";` (invocators/tags/document/BodyTag.php:19-21),\n"
+        "  so BodyTag's bytes ARE ContentTag's bytes and no correct BodyTag render exists until\n"
+        "  ContentTag is registered. If a dependency is missing, the Go engine emits its marked\n"
+        "  divergence notice where the tag should be, the harness reports a BYTE MISMATCH, and the\n"
+        "  mismatch is in the DEPENDENCY, not in your port.\n"
+        "  The list is derived from this tag's PHP source (string literals, comments excluded) and is\n"
+        "  a floor, not a ceiling — read the source before trusting it as complete.")
+    return "\n".join(lines) + "\n"
+
+
+def gate_block(name, deps, registered, harness):
+    """THE tag gate (#323). The whole-page diff is refused here, by name, with its evidence.
+
+    #323's finding, in one line: a tag unit that says only "byte-equivalent vs the PHP render" gets
+    read by a blind auditor as a whole-page byte diff of ?page=tags — which is STRUCTURALLY
+    non-empty for every tag, including byte-perfect merged ones, because the Go server's page chrome
+    is not the PHP's. So correct ports were rejected and #310/#311/#312 had to be hand-harvested
+    against the harness that was already authoritative. This block names the harness, shows the
+    PASS, and refuses the diff explicitly — a gate stated only as a positive gets re-derived by the
+    next reader into the same wrong diff."""
+    return (
+        "THE GATE — THE ONLY THING THAT SETTLES THIS TICKET. Run the #282 tag-equivalence harness\n"
+        "from the repo root (the directory holding registry.json):\n"
+        "\n"
+        "    %s\n"
+        "\n"
+        "SETTLE WHEN THAT COMMAND PASSES with %s registered. The harness answers exactly this\n"
+        "unit's question — it renders THIS tag through tags.RenderTag (the same entry server.go's\n"
+        "handleTagsPage calls) and compares it byte-for-byte against the live PHP's bytes for\n"
+        "?page=tags&tag=%s. Paste this tag's own lines as the evidence:\n"
+        "\n"
+        "    --- PASS: %s/%s\n"
+        "        equivalence_test.go:NNN: IDENTICAL: <N>B byte-for-byte\n"
+        "\n"
+        "  A SKIP IS NOT A PASS. A line reading `--- SKIP: %s/%s` with \"no Go port\n"
+        "  yet\" means the tag is NOT registered and NOTHING was measured — and the sweep still exits 0,\n"
+        "  green. Registering it (below) is what turns that skip into a measurement. Read this tag's own\n"
+        "  line; never the exit code alone.\n"
+        "\n"
+        "DO NOT WHOLE-PAGE-DIFF ?page=tags. THIS IS NOT THE GATE, AND A NON-EMPTY DIFF HERE IS NOT A\n"
+        "DEFECT IN YOUR PORT:\n"
+        "\n"
+        "    diff <(curl -s '%s/?page=tags&tag=%s') <(curl -s '%s/?page=tags&tag=%s')   # <-- WRONG GATE\n"
+        "\n"
+        "  That diff is STRUCTURALLY NON-EMPTY for EVERY tag — including tags already merged as\n"
+        "  byte-perfect: #323 measured ~6205B of difference on CategoryView, TreeView and TicketList,\n"
+        "  all three of them correct. The two sides are not the same kind of document: the PHP URL returns a\n"
+        "  full CMS page (Controller::control's chrome, then the gallery, then the tag's bytes, then\n"
+        "  the template tail), while the Go server wraps the tag engine's render in its OWN frame and\n"
+        "  says so in its source — congruency-go/server.go:820-823 emits the comment \"the\n"
+        "  doctype/title/h1 frame around it is this server's own: the CMS Controller::control() page\n"
+        "  chrome is still not reproduced here.\" The difference is that missing chrome. It is a known,\n"
+        "  separate, un-ported piece of the server; it is not this tag, it is not yours to fix here,\n"
+        "  and no correct port can ever make that diff empty. Settling on it is what stalled the tag\n"
+        "  fan-out and forced #310/#311/#312 to be hand-harvested (#323).\n"
+        "\n"
+        "  The harness exists precisely because the tag's bytes are a SLICE of that page: it cuts the\n"
+        "  slice with TagList.php's own anchors (:62 and :76) and a page tail it MEASURES at run time,\n"
+        "  fetches PHP twice around the Go render so a concurrent write shows up as VOLATILE instead of\n"
+        "  a false failure, and compares only the tag. That is the comparison this ticket is asking for.\n"
+        "  Read %s before arguing with its verdict.\n"
+        "\n"
+        "%s"
+        "\n"
+        "%s"
+        "\n"
+        "WHAT THE HARNESS DOES NOT MEASURE — port these anyway, do not bolt them onto the gate:\n"
+        "  * ARGUMENTS. The gallery constructs the selected tag standalone (`new $sel(null)`,\n"
+        "    TagList.php:67-68), so the sweep measures the ARGUMENT-LESS render only. If this tag takes\n"
+        "    arguments, port them faithfully against the PHP source and the argument forms the pages\n"
+        "    above use; a Go unit test of your own is the right place to pin them.\n"
+        "  * THE IN-PAGE SUBSTITUTION SITES. Diffing ?page=<id> on both servers is the same broken\n"
+        "    whole-page comparison as above and fails for the same chrome reason. Those pages settle on\n"
+        "    their own page units, once the chrome is ported.\n"
+        "\n"
+        "IF THE HARNESS ITSELF SKIPS EVERYTHING (\"no API key\", \"state db absent\", \"server\n"
+        "unreachable\", \"TAGS_DIR lists no tags\") it measured NOTHING and this ticket does not settle.\n"
+        "Its four guards are deliberate — it never false-fails in CI — so a green run that skipped is\n"
+        "not evidence. Fix the environment: boot the PHP original the way tools/serve.py does\n"
+        "  ( cd %s && %s -S 127.0.0.1:%s boot/router.php )\n"
+        "and re-run. The harness resolves the db, the app root and the URL itself; its overrides are\n"
+        "%s\n"
+        "and NOTHING ELSE — in particular CONGRUENCY_SQLITE is NOT one of them, so prefixing the gate\n"
+        "with it changes nothing and would quietly measure the default database.\n"
+        % (harness["cmd"], name, name,
+           harness["test"], name, harness["test"], name,
+           PHP_BASE, name, GO_BASE, name,
+           harness["rel"],
+           registering_block(name, harness),
+           deps_block(name, deps, registered),
+           SOURCE_FROM_ROOT, PHP_BIN, PHP_BASE.rsplit(":", 1)[-1],
+           ", ".join("$" + k for k in harness["knobs"])))
 
 
 def template_tag_map(con):
@@ -1440,11 +1766,16 @@ def enumerate_units(con, enc, deny, fx):
     tags_by_page, pages_by_tag = template_tag_map(con)
     # a real page id for the boot/engine gates: prefer one that embeds tags, so a render gate renders
     fx["page"] = next((d for d, t in tags_by_page.items() if t), next(iter(tags_by_page), ""))
+    found = scan_tags()
+    harness = tag_harness()                 # hard-fails if the #282 gate this tool names is stale
+    emits = tag_emits(found)
+    registered = go_registered_tags(found)
     units = (helper_units(enc, fx) + route_units(con, enc) + crud_units(enc, fx, deny)
              + php_units(fx, [d for d, t in tags_by_page.items() if t])
-             + page_units(con, tags_by_page) + tag_units(pages_by_tag))
+             + page_units(con, tags_by_page)
+             + tag_units(pages_by_tag, found, emits, registered, harness))
     units.sort(key=lambda u: u["sort"])
-    return units, tags_by_page
+    return units, tags_by_page, emits, registered, harness
 
 
 # ── the per-unit ticket body ─────────────────────────────────────────────────────────────────────
@@ -1452,6 +1783,36 @@ def unit_body(u, deps):
     dep_text = ("DEPENDS ON (build these first — each is its own unit ticket unless marked):\n%s"
                 % "\n".join("  - %s" % d for d in deps)) if deps else \
                "DEPENDS ON: nothing — this unit is a leaf of the port; it can start now."
+
+    # A tag unit is gated by the #282 harness, NOT by a diff, so it takes the harness wording for
+    # both the build loop and the settle line. The generic text below says "EVERY diff above is
+    # EMPTY", which on a tag unit would contradict its own gate block and send the reader straight
+    # back to the whole-page diff that #323 exists to stop — the artifact must not argue with itself.
+    if u["utype"] == "tag":
+        build = ("THE BUILD — small, and ITERATIVE:\n"
+                 "  1. Implement ONLY this tag in the Go port, and REGISTER it (see THE GATE below).\n"
+                 "  2. Run the harness command in THE GATE below.\n"
+                 "  3. If this tag's line is a BYTE MISMATCH, fix the Go side and go back to 2 — the\n"
+                 "     harness prints the first differing lines. The PHP is the spec: when they disagree,\n"
+                 "     the Go port is wrong; never 'improve' the behaviour here. If the PHP is genuinely\n"
+                 "     defective, file a separate bug ticket and port the defect faithfully.\n")
+        settle = ("SETTLING: this ticket settles when — and only when — the harness command in THE GATE\n"
+                  "above PASSES for this tag. Paste the command you ran and this tag's own PASS/IDENTICAL\n"
+                  "line as the evidence. Do NOT settle on a whole-page diff of ?page=tags, and do NOT\n"
+                  "refuse a correct port because that diff is non-empty: it is non-empty for every tag,\n"
+                  "always, for a reason THE GATE explains and no port can fix. A SKIP is not a PASS.\n")
+    else:
+        build = ("THE BUILD — small, and ITERATIVE:\n"
+                 "  1. Implement ONLY this unit in the Go port.\n"
+                 "  2. Run the gate below, PHP original vs Go port, over the SAME database.\n"
+                 "  3. If any diff is non-empty, fix the Go side and go back to 2. The PHP is the spec: when they\n"
+                 "     disagree, the Go port is wrong — never 'improve' the behaviour here. If the PHP is\n"
+                 "     genuinely defective, file a separate bug ticket and port the defect faithfully.\n")
+        settle = ("THE GATE (how this ticket settles): EVERY diff above is EMPTY. Not 'equivalent', not 'looks\n"
+                  "right' — empty. Paste the exact diff invocations you ran and their empty output as the\n"
+                  "evidence. A gate that does not exercise this unit is not this unit's gate: if you cannot make\n"
+                  "a diff here run against THIS unit, say so on the ticket rather than settling on a diff that\n"
+                  "would be empty even with the unit unimplemented.\n")
     return (
         "Port ONE unit of congruency to Go. ONE. This ticket is deliberately SMALL: porting a whole\n"
         "layer at once is what #230 corrected (~150 units exist; a layer-sized tournament fails at that\n"
@@ -1467,29 +1828,20 @@ def unit_body(u, deps):
         "\n"
         "%s\n"
         "\n"
-        "THE BUILD — small, and ITERATIVE:\n"
-        "  1. Implement ONLY this unit in the Go port.\n"
-        "  2. Run the gate below, PHP original vs Go port, over the SAME database.\n"
-        "  3. If any diff is non-empty, fix the Go side and go back to 2. The PHP is the spec: when they\n"
-        "     disagree, the Go port is wrong — never 'improve' the behaviour here. If the PHP is\n"
-        "     genuinely defective, file a separate bug ticket and port the defect faithfully.\n"
+        "%s"
         "\n"
         "%s\n"
-        "THE GATE (how this ticket settles): EVERY diff above is EMPTY. Not 'equivalent', not 'looks\n"
-        "right' — empty. Paste the exact diff invocations you ran and their empty output as the\n"
-        "evidence. A gate that does not exercise this unit is not this unit's gate: if you cannot make\n"
-        "a diff here run against THIS unit, say so on the ticket rather than settling on a diff that\n"
-        "would be empty even with the unit unimplemented.\n"
+        "%s"
         "\n"
         "Kind is `build` (a pair: coder + adversarial tester). This unit gets a tournament only if\n"
         "someone judges it genuinely worth one — that is the exception on #230, not the default.\n"
         "\n"
         "Filed mechanically by %s under ticket #%d."
         % (u["key"], u["bucket"], u["layer_ticket"], u["layer_text"], u["source"],
-           u["contract"], dep_text, u["probe"], SELF_FROM_ROOT, DECOMPOSER_TICKET))
+           u["contract"], dep_text, build, u["probe"], settle, SELF_FROM_ROOT, DECOMPOSER_TICKET))
 
 
-def deps_for(u, units, tags_by_page):
+def deps_for(u, units, tags_by_page, emits=None):
     """A unit's REAL prerequisites, by key — traced through the code, not assumed from the bucket.
 
     The trap this avoids: ?page= never touches congruency_rest_dispatch. boot/router.php calls the
@@ -1551,6 +1903,11 @@ def deps_for(u, units, tags_by_page):
     elif u["utype"] == "tag":
         out += ["go-port:tags:engine:engine_tag_wrapper", "go-port:tags:engine:engine_tag_parser",
                 "go-port:tags:engine:engine_tagarguments", "go-port:tags:engine:engine_tag_interface"]
+        # The tags THIS tag's own output embeds. execute_all_tags re-scans a tag's return value and
+        # substitutes what it finds there, so those tags render INSIDE this one's bytes and the #282
+        # harness cannot measure this tag until they are registered — BodyTag/ContentTag is the case
+        # that proves it (#323). Derived from the PHP source; see tag_emits().
+        out += ["go-port:tags:tag:%s" % t for t in (emits or {}).get(u["name"], [])]
     # keep only prerequisites that are real, enumerated units; anything else would be a dependency a
     # pair cannot act on (the exact defect of telling 26 pages to build the rest dispatch first).
     seen, kept = set(), []
@@ -1572,14 +1929,27 @@ def keys_from_db(con):
     return found
 
 
-def queue_titles(base, key):
-    """Titles of every OPEN/REQUESTED ticket, from the LIVE ticket.queue route. None if unreadable."""
+def queue_rows(base, key):
+    """Every OPEN/REQUESTED ticket row, from the LIVE ticket.queue route. None if unreadable.
+    (ticket.queue's SQL selects id, kind, status, component, title, body.)"""
     try:
-        rows = rest(base, "ticket.queue", method="GET", key=key).get("rows", [])
+        return rest(base, "ticket.queue", method="GET", key=key).get("rows", [])
     except Exception as e:                                # noqa: BLE001
         step("ticket.queue unreadable at %s (%s)" % (base, e))
         return None
-    return [(r.get("title") or "") for r in rows]
+
+
+def queue_titles(rows):
+    """Titles out of queue_rows(); None passes through so callers keep telling 'unreadable' apart
+    from 'readable and empty' — the distinction --file-tickets refuses to file without."""
+    return None if rows is None else [(r.get("title") or "") for r in rows]
+
+
+def queue_titles_by_id(rows):
+    """{id: title} out of queue_rows(), for the correction pass. Empty when the queue is unreadable:
+    the db read it is unioned with still supplies candidates, and every write is guarded by its own
+    journal check anyway."""
+    return dict((int(r["id"]), r.get("title") or "") for r in (rows or []) if r.get("id") is not None)
 
 
 def keys_from_queue(titles):
@@ -1694,6 +2064,116 @@ def successor_body(remaining, batch, subset, gen):
            SELF_FROM_ROOT, DECOMPOSER_TICKET))
 
 
+# ── correcting the tag units that were ALREADY filed with the broken gate (#323) ─────────────────
+def correction_note(name, deps, registered, harness):
+    """The gate correction appended to an already-open tag unit's journal. It carries
+    GATE_CORRECTION_MARK so a second run recognises its own work and appends nothing."""
+    return (
+        "GATE CORRECTION (ticket #323) %s\n"
+        "\n"
+        "This tag unit's BODY states its gate as \"byte-equivalent vs the PHP render\". Read literally\n"
+        "that has been taken to mean a WHOLE-PAGE byte diff of ?page=tags — and that diff is\n"
+        "STRUCTURALLY NON-EMPTY for EVERY tag, including tags already merged byte-perfect, because the\n"
+        "Go server's page chrome is not the PHP's (congruency-go/server.go:820-823 says so in its own\n"
+        "comment: \"the CMS Controller::control() page chrome is still not reproduced here\"). Correct\n"
+        "ports were rejected on it, and #310/#311/#312 had to be hand-harvested. The body cannot be\n"
+        "rewritten — a ticket's identity is permanent by SQL trigger (tg_tickets_immutable_identity,\n"
+        "migrations/0029_ticket_authorization.sql:111-117: \"append events\") — so this event is the\n"
+        "correction, and it OVERRIDES the body's gate wording.\n"
+        "\n"
+        "THE GATE FOR THIS UNIT IS THE #282 HARNESS, AND NOTHING ELSE. From the repo root:\n"
+        "\n"
+        "    %s\n"
+        "\n"
+        "SETTLE when that PASSES with %s registered (`--- PASS: %s/%s`, logging\n"
+        "\"IDENTICAL: <N>B byte-for-byte\"). It renders THIS tag through tags.RenderTag and compares it\n"
+        "against the tag's own bytes SLICED out of the live PHP page, which is the comparison this unit\n"
+        "actually wants. A `--- SKIP` (\"no Go port yet\") measured NOTHING and is NOT a pass — the sweep\n"
+        "still exits 0. Register the tag with an init() calling Register(\"%s\", ...) in its own file\n"
+        "under congruency-go/tags/ (engine.go:1342-1368; contenttag.go:151-153 is a worked example).\n"
+        "\n"
+        "%s"
+        "\n"
+        "Full detail — the four harness guards, its override knobs, and what it does not measure —\n"
+        "is in %s and in any tag unit filed after #323.\n"
+        % (GATE_CORRECTION_MARK, harness["cmd"], name, harness["test"], name, name,
+           deps_block(name, deps, registered), harness["rel"]))
+
+
+def open_tag_tickets(con, titles_by_id):
+    """Tag units that are still WORKABLE — every ticket whose title carries a `go-port:tags:tag:<T>`
+    key and whose status is not a terminal one.
+
+    Read from the db (ALL statuses) UNION the live queue, for the same reason the idempotency read
+    is: `ticket.queue` returns only OPEN/REQUESTED (its SQL is
+    `WHERE upper(status) IN ('OPEN','REQUESTED')`), so it cannot see an ACTIVE unit — and ACTIVE is
+    precisely a unit a pair is working RIGHT NOW on the broken gate, the most important one to
+    correct. The db read can miss an uncheckpointed row that the queue then supplies."""
+    out = {}
+    for tid, title, status in con.execute("SELECT id, title, status FROM tickets"):
+        if (status or "").upper() in ("DONE", "CLOSED"):
+            continue
+        for k in KEY_RE.findall(title or ""):
+            if k.startswith("go-port:tags:tag:"):
+                out[int(tid)] = (k.split(":")[-1], title, (status or "").upper())
+    for tid, title in (titles_by_id or {}).items():
+        for k in KEY_RE.findall(title or ""):
+            if k.startswith("go-port:tags:tag:") and int(tid) not in out:
+                out[int(tid)] = (k.split(":")[-1], title, "OPEN/REQUESTED")
+    return out
+
+
+def already_corrected(base, key, tid):
+    """True if this ticket's journal already carries the correction. Unknown (None) if the journal
+    cannot be read — the caller then SKIPS rather than risk a duplicate note."""
+    try:
+        rows = rest(base, "ticket.journal", {"ticket_id": tid}, method="GET", key=key).get("rows", [])
+    except Exception as e:                                # noqa: BLE001
+        step("ticket.journal unreadable for #%s (%s)" % (tid, e))
+        return None
+    return any(GATE_CORRECTION_MARK in (r.get("note") or "") for r in rows)
+
+
+def correct_open_tags(base, key, con, titles_by_id, emits, registered, harness, subset):
+    """Append the gate correction to every still-open tag unit that does not already carry it.
+
+    APPEND-ONLY BY CONSTRUCTION. It writes exactly one `ticket.progress` event per ticket, through
+    the governed route, and nothing else: no body is edited (the trigger forbids it), no ticket is
+    re-filed (that would duplicate a unit key the decomposer is built never to duplicate), no status
+    is touched. Re-running it is a no-op — every ticket whose journal already holds
+    GATE_CORRECTION_MARK is skipped."""
+    todo = open_tag_tickets(con, titles_by_id)
+    if subset:
+        todo = dict((t, v) for t, v in todo.items() if subset in "go-port:tags:tag:%s" % v[0])
+    if not todo:
+        step("no still-open tag unit to correct")
+        return 0
+    step("%d still-open tag unit(s) are candidates for the gate correction" % len(todo))
+    done = 0
+    for tid in sorted(todo):
+        name, _title, status = todo[tid]
+        seen = already_corrected(base, key, tid)
+        if seen is None:
+            print("== skip == #%-4s %-22s journal unreadable — not corrected" % (tid, name))
+            continue
+        if seen:
+            print("== skip == #%-4s %-22s already carries %s" % (tid, name, GATE_CORRECTION_MARK))
+            continue
+        try:
+            rest(base, "ticket.progress", {
+                "ticket_id": tid, "agent_id": CORRECTION_AGENT, "steps_remaining": 0,
+                "note": correction_note(name, emits.get(name, []), registered, harness)}, key=key)
+        except Exception as e:                            # noqa: BLE001
+            step("FAILED to correct #%s (%s): %s" % (tid, name, e))
+            bug_report("correct_open_tags", e,
+                       "python3 %s --correct-open-tags" % SELF_FROM_ROOT, e)
+            continue
+        done += 1
+        print("== corrected == #%-4s %-22s [%s] gate -> the #282 harness" % (tid, name, status))
+    step("%d tag unit(s) corrected; %d left alone" % (done, len(todo) - done))
+    return done
+
+
 # ── filing ───────────────────────────────────────────────────────────────────────────────────────
 def file_ticket(base, key, title, body, kind="build"):
     """ticket.create -> ticket.kind, through the governed routes. Returns the new ticket id."""
@@ -1738,7 +2218,7 @@ def file_batch(base, key, todo, unticketed, batch, parent, spawn, subset, gen, e
         step("--no-spawn — successor withheld (%d unit(s) still un-ticketed)" % remaining_after)
         return filed
 
-    titles = queue_titles(base, key)
+    titles = queue_titles(queue_rows(base, key))
     if titles is None:
         # Unreadable queue AFTER filing. Spawn anyway: a duplicate successor is visible and harmless
         # (the next run files nothing new and stops), whereas a missing successor silently ends the
@@ -1796,7 +2276,10 @@ def report(units, done, todo, subset, batch):
 def main():
     ap = argparse.ArgumentParser(
         description="Enumerate every congruency-go port unit and file one small, equivalence-gated "
-                    "build ticket per unit (#230). Reports and writes NOTHING unless --file-tickets.")
+                    "build ticket per unit (#230). A tag unit is gated on the #282 harness "
+                    "(go test ./tags/ -run TestTagEquivalence), never on a whole-page diff (#323). "
+                    "Reports and writes NOTHING unless --file-tickets, --correct-open-tags or "
+                    "--json is given.")
     ap.add_argument("--file-tickets", action="store_true",
                     help="actually file one build ticket per un-ticketed unit, through rest.php's "
                          "governed ticket.create/ticket.kind routes (default: report only, no writes)")
@@ -1819,6 +2302,13 @@ def main():
     ap.add_argument("--parent", type=int, default=DECOMPOSER_TICKET, metavar="ID",
                     help="ticket the spawned-successor edge hangs from (default %d)" % DECOMPOSER_TICKET)
     ap.add_argument("--no-spawn", action="store_true", help="file the batch but spawn no successor")
+    ap.add_argument("--correct-open-tags", action="store_true",
+                    help="#323: APPEND the corrected gate (the #282 go-test harness) to the journal "
+                         "of every still-open tag unit that was filed with the old whole-page-diff "
+                         "wording. A ticket's body is immutable by SQL trigger, so this appends one "
+                         "governed ticket.progress event per ticket and edits nothing; it is "
+                         "idempotent (a ticket already carrying the correction is skipped) and it "
+                         "files no tickets. Combines with --subset; independent of --file-tickets")
     ap.add_argument("--base", default=PHP_BASE, metavar="URL",
                     help="the congruency server carrying the governed routes (default %s)" % PHP_BASE)
     ap.add_argument("--db", default=CONG_DB, metavar="PATH", help="state db (default %s)" % CONG_DB)
@@ -1838,13 +2328,17 @@ def main():
     step("gate fixtures from the live db: table=%s pk=%s id=%s col=%s route=%s"
          % (fx["table"], fx["pk"], fx["id"], fx["col"], fx["route"]))
 
-    units, tags_by_page = enumerate_units(con, enc, deny, fx)
+    units, tags_by_page, emits, registered, harness = enumerate_units(con, enc, deny, fx)
     for u in units:
-        u["deps"] = deps_for(u, units, tags_by_page)
+        u["deps"] = deps_for(u, units, tags_by_page, emits)
         u["body"] = unit_body(u, u["deps"])
     step("enumerated %d unit(s): %s" % (len(units), ", ".join(
         "%d %s" % (len([u for u in units if u["utype"] == t]), t)
         for t in ("boot", "helper", "crud", "engine", "page", "route", "tag"))))
+    step("tag gate = %s (%s), test %s; %d tag(s) registered in the Go engine today; %d tag(s) emit "
+         "another tag and cannot be measured before it is registered"
+         % (harness["cmd"], harness["rel"], harness["test"], len(registered),
+            len([t for t in emits if emits[t]])))
 
     if a.subset:
         units = [u for u in units if a.subset in u["key"]]
@@ -1857,7 +2351,9 @@ def main():
     key = api_key()
     done = keys_from_db(con)
     step("%d unit key(s) already ticketed per the state db (all statuses)" % len(done))
-    titles = queue_titles(a.base, key)
+    rows = queue_rows(a.base, key)
+    titles = queue_titles(rows)
+    titles_by_id = queue_titles_by_id(rows)
     open_hi = max_open_generation(titles or [], a.subset)
     gen = this_generation(a.gen, open_hi)
     ever_hi = max_generation_ever(con, titles, a.subset)
@@ -1884,9 +2380,21 @@ def main():
                                           "title", "deps", "body")} for u in units], fh, indent=2)
         print("== json == %s" % a.json)
 
+    # The #323 correction pass, before the dry-run exit so it runs with or without --file-tickets.
+    # It is opt-in and append-only: see correct_open_tags().
+    if a.correct_open_tags:
+        if not key:
+            die("no CONGRUENCY_API_KEY (../.secrets/ats.env or the environment) — cannot correct")
+        print()
+        correct_open_tags(a.base, key, con, titles_by_id, emits, registered, harness, a.subset)
+
     if not a.file_tickets:
-        print("\n== dry == reported only; nothing was written. Add --file-tickets to file the %d unit "
-              "ticket(s) above." % len(todo))
+        if a.correct_open_tags:
+            print("\n== done == correction pass only; no unit ticket was filed (add --file-tickets "
+                  "for that). The %d un-ticketed unit(s) above are untouched." % len(todo))
+        else:
+            print("\n== dry == reported only; nothing was written. Add --file-tickets to file the %d unit "
+                  "ticket(s) above." % len(todo))
         return 0
     if not key:
         die("no CONGRUENCY_API_KEY (../.secrets/ats.env or the environment) — cannot file")
