@@ -127,33 +127,64 @@ are this module's structure rather than its configuration: the fact that `__all_
 imports, the fact that a source module is imported once per config order, and the exception each
 failure raises. Changing those would change behavior, which is what this ticket exists to prevent.
 
-DELIBERATE, DOCUMENTED DIVERGENCES (three; everything else is intended to be indistinguishable)
-----------------------------------------------------------------------------------------------
-Each is forced by the ticket's own requirements, and each is proven by `selftest` against the
-original's bytes rather than asserted.
+DELIBERATE, DOCUMENTED DIVERGENCES (four; everything else is intended to be indistinguishable)
+---------------------------------------------------------------------------------------------
+Each is forced by the ticket's own requirements, and each is MEASURED by `selftest` against the
+original's bytes rather than asserted. Section [10] of the selftest runs the list below as its
+specification: every caller operation named here as preserved is run against BOTH modules and
+compared, and every difference named here as remaining is shown to be exactly that and no more.
 
   1. WHEN THE BINDING HAPPENS. The original bound at IMPORT time: `import dz_debug` either bound
-     all three names or raised. This rewrite binds on FIRST TOUCH of the surface (PEP 562
-     `__getattr__`), so importing this module resolves no config and imports no submodule.
-     That is what makes the module importable, installable and provable at all — see THE MISSING
-     SIBLINGS below — and it is why `selftest` can run in a checkout where `.logger` and `.log` do
-     not exist yet. The binding it then performs is the original's, whole and in order: touching
-     ANY one of the three names imports BOTH source modules and binds ALL three, exactly as the
-     original's two import statements did, so no caller can observe a half-bound module. The only
-     observable difference is confined to the window between `import dz_debug` and the first touch
-     of the surface: in that window `vars(dz_debug)` lacks the three names and `dz_debug.__all__`
-     is not yet set. After the first touch the two namespaces are identical, which is what
-     `selftest` checks. `bind()` makes the binding explicit for a caller who wants the original's
-     import-time semantics: `import dz_debug; dz_debug.bind()` is the original's `import dz_debug`,
-     including its failure modes.
-  2. THE MODULE DOCSTRING. The original had none, so `dz_debug.__doc__` was `None` and is now this
+     all three names or raised. This rewrite binds on FIRST TOUCH of the surface, so importing this
+     module resolves no config and imports no submodule. That is what makes the module importable,
+     installable and provable at all — see THE MISSING SIBLINGS below — and it is why `selftest`
+     can run in a checkout where `.logger` and `.log` do not exist yet. The binding it then performs
+     is the original's, whole and in order: touching ANY one of the three names imports BOTH source
+     modules and binds ALL three, exactly as the original's two import statements did, so no caller
+     can observe a half-bound module. `bind()` makes it explicit for a caller who wants the
+     original's import-time semantics: `import dz_debug; dz_debug.bind()` is the original's
+     `import dz_debug`, including its failure modes.
+
+     What this costs, stated exactly. The difference lives in the WINDOW between `import dz_debug`
+     and the first touch of the surface, and it is confined to reading the module's `__dict__`
+     DIRECTLY: in that window `vars(dz_debug)`, `dz_debug.__dict__` and `dir(dz_debug)` do not list
+     `debug_decorator`, `save`, `Logger` or `__all__`, where the original's would. `vars()` reads
+     the dict without going through the module at all, so no module can hook it; this is the
+     irreducible price of not binding at import, and it is inspection-only — it reports the
+     namespace, it cannot change it. From the first touch onwards `vars(dz_debug)` carries the
+     ORIGINAL's whole surface, under the original's names and bound to the same objects (the
+     machinery of divergence 4 sits alongside it, as it does at every other moment).
+
+     What it does NOT cost, because it would otherwise be a trap rather than a difference: every
+     operation a caller performs THROUGH the module behaves as the original's, in the window as
+     much as after it. In particular a caller's WRITE in the window is not lost and does not
+     poison anything — `dz_debug.save = stub` then touching the surface leaves `save` as the stub,
+     because the original's bind happened before that write and the write won, so the bind here
+     declines to overwrite what a caller already put there (`_caller_owns`). A `del dz_debug.save`
+     in the window succeeds and stays deleted, rather than raising or quietly coming back
+     (`_LazyModule.__delattr__`, `_materialized`). Reads, `hasattr`, `from dz_debug import *`,
+     `importlib.reload` and dunder probes are likewise indistinguishable. None of that is claimed
+     here on inspection of the code: selftest section [10] performs each of these operations on the
+     ORIGINAL and on this module and checks the results are equal.
+  2. THE MODULE'S TYPE. `type(dz_debug)` is `_LazyModule`, a `types.ModuleType` SUBCLASS this
+     module installs on itself, rather than `types.ModuleType` exactly. It is what gives the module
+     the `__delattr__` hook that divergence 1 needs to keep `del` behaving as the original's; PEP
+     562's module-level `__getattr__` covers reads only. `isinstance(dz_debug, ModuleType)` — the
+     way this is actually asked — stays True, and every other module behavior is inherited
+     untouched; only the exact-type test `type(dz_debug) is ModuleType` sees it.
+  3. THE MODULE DOCSTRING. The original had none, so `dz_debug.__doc__` was `None` and is now this
      text. Nothing in the surface reads `__doc__`; it is recorded here because it is a real, if
      inert, difference between the two modules.
-  3. THIS MODULE'S OWN TOP-LEVEL NAMES. See THE CALLABLE SURFACE above: they do not reach
+  4. THIS MODULE'S OWN TOP-LEVEL NAMES. See THE CALLABLE SURFACE above: they do not reach
      `__all__`, so `from dz_debug import *` is unchanged. Their one real consequence is that an
      export name that collides with one of them (a config saying `{"name": "bind", ...}`) would
      silently overwrite this module's own machinery, so `bind()` refuses it as a `ConfigError`
-     naming the collision. The original, having no other names, could not collide.
+     naming the collision. That check is made against `_OWN_NAMES` — a snapshot of this module's
+     own names taken once, at import, BEFORE anything can bind — and never against the live
+     `globals()`, which by then also holds bound exports and whatever a caller has assigned.
+     Testing the live dict would turn an ordinary `dz_debug.save = stub` into a reported collision
+     with "this module's own save" and raise a ConfigError against a config that is correct. The
+     original, having no other names, could not collide at all.
 
 THE MISSING SIBLINGS (read this before concluding something is broken)
 ---------------------------------------------------------------------
@@ -222,20 +253,25 @@ above this one, the one holding `pyproject.toml`):
     .venv/bin/forge2-dz-debug selftest
     .venv/bin/python -c "import dz_debug; print(dz_debug.surface())"
 
-That was RUN against this package, not assumed: setuptools builds the editable wheel, and the
-console script and `import dz_debug` then work from any working directory. The venv is not
-decoration — a bare `pip install -e .` on a system Python managed by a package manager is refused
-with "externally-managed-environment" (PEP 668), which is that Python's rule and nothing to do with
-this package.
+The venv is not decoration — a bare `pip install -e .` on a system Python managed by a package
+manager is refused with "externally-managed-environment" (PEP 668), which is that Python's rule and
+nothing to do with this package.
+
+WHAT IS PROVEN ABOUT THAT, AND WHAT IS NOT. `selftest` does NOT run pip: it is deliberately
+hermetic, so it needs no network and no writable environment and can be run anywhere, by anyone, to
+check this file's claims. Section [8] proves everything the install depends on and stops exactly
+where honesty requires — it reads `pyproject.toml` back and checks that it declares a build
+backend, the forge2 distribution name, and the import package `dz_debug`; that the declared package
+is on disk where setuptools will look for it; that the `forge2-dz-debug` console script resolves to
+a callable in this module; and it runs `import dz_debug` in a SUBPROCESS from an unrelated working
+directory with only the package root on the path, which is the end state an editable install
+produces. What it does not do — invoke pip and let setuptools build the editable wheel — is stated
+in its own output rather than glossed over, and the three commands above are how to do it.
 
 `pyproject.toml` declares the import package as `dz_debug`, so an installed copy is imported by the
 name the forge unit was always addressed by — `from dz_debug import debug_decorator, save, Logger`
 keeps working, which is acceptance item (b). It also declares the `forge2-dz-debug` console script
-pointing at `main()` below. `selftest` checks all of that WITHOUT running pip: it reads
-`pyproject.toml` back, resolves the console-script target, and proves `import dz_debug` works from
-an unrelated working directory with only the package root on the path — the end state an editable
-install produces. It stays hermetic on purpose, so it needs no network and no writable environment
-and can be run anywhere, by anyone, to check this file's claims.
+pointing at `main()` below.
 
 SIDE EFFECTS
 ------------
@@ -260,6 +296,7 @@ import json
 import os
 import sys
 import traceback
+import types
 from datetime import datetime
 
 #: The ORIGINAL unit's bytes, quoted verbatim from ticket #361's embedded source block. This is the
@@ -519,10 +556,10 @@ def _exports():
             raise ConfigError("%s: %r is not a usable Python name" % (where, name))
         if name.startswith("__"):
             raise ConfigError(
-                "%s: %r cannot be exported. This module binds its surface lazily through a PEP 562 "
-                "module __getattr__, which Python consults only for names the module does not "
-                "already define — and every dunder it would need is already defined. A dunder "
-                "export could never be reached, so it is refused rather than silently ignored."
+                "%s: %r cannot be exported. This module binds its surface lazily, through a "
+                "__getattr__ that Python consults only for names the module does not already "
+                "define — and every dunder it would need is already defined. A dunder export could "
+                "never be reached, so it is refused rather than silently ignored."
                 % (where, name))
         if name in seen:
             raise ConfigError("%s: %r is exported twice; each name may be exported once"
@@ -538,17 +575,66 @@ def _exports():
 
 # ─────────────────────────────── binding the surface ───────────────────────────────
 
-_BOUND = {}     # the export names currently bound into this module, and their values
+#: What THIS MODULE bound, name -> value, including the `__all__` it derived. It is the record of
+#: what is this module's to overwrite; anything else on the module belongs to a caller (see
+#: `_caller_owns`). Two invariants make it trustworthy:
+#:
+#:   * it is read out of `globals()` rather than assigned fresh, so `importlib.reload` — which
+#:     re-executes this body in the module's EXISTING `__dict__`, without clearing it — does not
+#:     desync the record from the names actually bound. A plain `_BOUND = {}` here would reset the
+#:     record while the names it describes stayed in the module dict, and every one of them would
+#:     then look caller-owned;
+#:   * `_unbind()` is the only thing that removes from it, and it removes from the module dict in
+#:     the same breath.
+_BOUND = globals().get("_BOUND", {})
+
+
+def _materialized():
+    """Has the ORIGINAL's import-time bind already been performed, for the config now in force?
+
+    This is what stops the lazy binding from being observable AFTER the fact. The original bound
+    once, at import, and from then on a name it had not bound was simply absent: `del dz_debug.save`
+    then `dz_debug.save` raised AttributeError. Once the bind here has been materialized this module
+    is in that same state, so it must stop binding on demand — a second bind would RESURRECT a name
+    the caller deleted and turn that AttributeError into a working attribute.
+
+    `configure()`/`reset_config()` unbind, which clears this: the next touch then binds the config
+    that is newly in force. Read through `globals()` so that, like `_BOUND`, it survives a reload.
+    """
+    return globals().get("_MATERIALIZED", False)
+
+
+#: Set by `bind()`, cleared by `_unbind()`. See `_materialized`.
+_MATERIALIZED = globals().get("_MATERIALIZED", False)
 
 
 def _unbind():
     """Remove whatever `bind()` bound, so the next touch of the surface re-binds from the config
     now in force. The submodule attributes the import system set (`dz_debug.logger`) are left
-    alone: the original never removed them either, and `sys.modules` keeps them consistent."""
+    alone: the original never removed them either, and `sys.modules` keeps them consistent.
+
+    Only names in `_BOUND` are removed — never a caller's own — and `__all__` rides along in
+    `_BOUND` as an ordinary key, so it is dropped here exactly when the names it lists are.
+    """
     for name in list(_BOUND):
         globals().pop(name, None)
     _BOUND.clear()
-    globals().pop("__all__", None)
+    globals()["_MATERIALIZED"] = False
+
+
+def _caller_owns(name):
+    """Is `name` on this module because a CALLER put it there, rather than this module?
+
+    This is what makes the lazy binding invisible to a caller that writes into the window between
+    `import dz_debug` and the first touch of the surface. In the ORIGINAL the bind happened at
+    import, so a caller's `dz_debug.save = stub` always landed AFTER it and won. Here the bind is
+    materialized later, so it must not undo that write: a name the caller already put on the module
+    is left exactly as the caller left it.
+
+    A name is the caller's when it is on the module but is neither something this module bound
+    (`_BOUND`) nor one of this module's own top-level names (`_OWN_NAMES`).
+    """
+    return name in globals() and name not in _BOUND and name not in _OWN_NAMES
 
 
 def _package():
@@ -599,79 +685,142 @@ def _from_import(module, attr, spec):
         ) from None
 
 
+def _is_passthrough_dunder(name):
+    """Is `name` a dunder this module must answer for WITHOUT resolving any config?
+
+    `__all__` is excluded because it IS part of the surface — in the original there was no `__all__`
+    to read unless both imports had succeeded, and that is preserved. Every other dunder is Python's
+    own business: a config gate that fired on `dz_debug.__wrapped__` would break every library that
+    probes for optional dunders.
+    """
+    return name.startswith("__") and name.endswith("__") and name != "__all__"
+
+
 def bind():
     """Do the ORIGINAL's import-time work now, and return the resulting `__all__`.
 
     `import dz_debug; dz_debug.bind()` is the original's `import dz_debug`: it imports each export's
     source module in config order, lifts each attribute out, binds the names onto this module and
     sets `__all__` — with the original's failure modes intact (see `_import_source` and
-    `_from_import`). It is called automatically by `__getattr__` on the first touch of the surface,
-    so a caller only needs it to force the original's import-time timing (divergence 1).
+    `_from_import`). It is called automatically on the first touch of the surface, so a caller only
+    needs it to force the original's import-time timing (divergence 1).
 
-    Idempotent: re-binding drops what a previous config bound and re-reads the config in force. A
+    The ORDER here is behavior, not housekeeping:
+
+      1. the config is validated first, so a malformed config object throws before anything is
+         imported or bound;
+      2. then EVERY export's source module is imported and EVERY attribute lifted, before a single
+         name is bound. The original's two `from ... import ...` statements either all succeeded or
+         raised, so a caller could never see a half-bound module; doing all the work up front keeps
+         that true, and keeps a missing module or a missing name raising at the same point;
+      3. only then are the names written onto the module — skipping any the CALLER owns
+         (`_caller_owns`), because in the original the caller's write happened after the
+         import-time bind and won.
+
+    Idempotent: re-binding re-reads the config in force and re-imports through `sys.modules`. A
     source module named twice is imported once, because `sys.modules` caches it — exactly as the
     original's single `from .logger import debug_decorator, save` did.
 
     Raises:
         ConfigError: if no config object can be resolved or `exports` is malformed, or if an export
-            name would overwrite one of this module's own (see divergence 3).
+            name would overwrite one of this module's own (see divergence 4).
         ImportError: whatever the original's import statements would have raised, untouched —
             including `ModuleNotFoundError` for a source module that is not there.
     """
     exports = _exports()
-    _unbind()
-    values = {}
-    for name, module, attr in exports:
-        if name in globals():
+
+    # Divergence 4, and ONLY divergence 4: an export may not be named after one of this module's own
+    # top-level names, because binding it would overwrite this module's machinery. The comparison is
+    # against `_OWN_NAMES` — a snapshot of what this module itself defines, taken once at import —
+    # and never against the live `globals()`, which also holds whatever previous binds and CALLERS
+    # have put there. Testing the live dict would report a caller's own `dz_debug.save = stub`, or a
+    # name left behind by an earlier bind, as a collision with this module's machinery: a false
+    # ConfigError against a correct config, blaming the config for the caller's ordinary write.
+    for name, _module, _attr in exports:
+        if name in _OWN_NAMES:
             raise ConfigError(
-                "config object for %s exports %r, but this module already defines that name. "
-                "Binding it would overwrite this module's own %r and break it. The original had "
-                "no other top-level names and so could not collide; rename the export, or export "
-                "it from a module that does not shadow this one."
-                % (UNIT, name, name))
+                "config object for %s exports %r, but this module defines a top-level %r of its "
+                "own. Binding it would overwrite this module's own %r and break it. The original "
+                "had no other top-level names and so could not collide; rename the export, or "
+                "export it from a module that does not shadow this one."
+                % (UNIT, name, name, name))
+
+    lifted = []
+    for name, module, attr in exports:
         spec = "%s:%s" % (module, attr)
-        values[name] = _from_import(_import_source(module), attr, spec)
+        lifted.append((name, _from_import(_import_source(module), attr, spec)))
+
+    values = {name: value for name, value in lifted if not _caller_owns(name)}
+    if not _caller_owns("__all__"):
+        values["__all__"] = [name for name, _module, _attr in exports]
     globals().update(values)
     _BOUND.update(values)
-    globals()["__all__"] = [name for name, _module, _attr in exports]
-    return globals()["__all__"]
+    globals()["_MATERIALIZED"] = True
+    return list(globals()["__all__"])
 
 
-def __getattr__(name):
-    """Bind the surface on first touch and serve the requested name (PEP 562).
+class _LazyModule(types.ModuleType):
+    """The type `dz_debug` takes on, so a touch of the surface materializes the ORIGINAL's bind.
 
-    Python calls this only for a name this module does not already define, so once `bind()` has run
-    the three names and `__all__` are served straight out of the module dict and this function is
-    not consulted again. `__all__` binds too rather than being answered from the config alone: in
-    the original there was no `__all__` to read unless both imports had succeeded, and that is
-    preserved. `surface()` reports what the config declares WITHOUT importing anything, for a
-    caller that wants to look without touching.
-
-    Dunders other than `__all__` are refused with the plain AttributeError Python expects, without
-    resolving any config: a config gate that fired on `dz_debug.__wrapped__` would break every
-    library that probes for optional dunders.
+    The original bound at import; this module cannot (see THE MISSING SIBLINGS in the module
+    docstring), so it binds on first touch instead. A plain PEP 562 module `__getattr__` would cover
+    reads and nothing else, which leaves `del dz_debug.save` in the unbound window raising
+    AttributeError where the original — having bound the name at import — deletes it. Hooking
+    `__delattr__` needs a real type, so this module installs one on itself at the bottom of this
+    file. `types.ModuleType` is the base, so `isinstance(dz_debug, ModuleType)` is unaffected.
     """
-    if name.startswith("__") and name.endswith("__") and name != "__all__":
-        raise AttributeError("module %r has no attribute %r" % (__name__, name))
-    bind()
-    try:
-        return globals()[name]
-    except KeyError:
-        raise AttributeError("module %r has no attribute %r" % (__name__, name)) from None
+
+    def __getattr__(self, name):
+        """Serve a name the module dict does not hold, binding the surface first.
+
+        Python calls this only when normal lookup fails, so once the surface is bound the three
+        names and `__all__` are served straight out of the module dict and this never runs for them.
+        """
+        if _is_passthrough_dunder(name) or _materialized():
+            # Already materialized means the module is in the state the original was in after its
+            # import: a name that is not here is simply not here. Binding again would resurrect a
+            # name the caller deleted.
+            raise AttributeError("module %r has no attribute %r" % (self.__name__, name))
+        bind()
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError("module %r has no attribute %r"
+                                 % (self.__name__, name)) from None
+
+    def __delattr__(self, name):
+        """Delete an attribute, binding the surface first if the name is not there yet.
+
+        `import dz_debug; del dz_debug.save` succeeds in the original because `save` was bound at
+        import. Materializing the bind before the delete makes it succeed here too, with the same
+        end state: the name gone, the rest of the surface bound, and a later read of it raising
+        AttributeError rather than quietly binding it again.
+        """
+        if name not in self.__dict__ and not _materialized() and not _is_passthrough_dunder(name):
+            bind()
+        super().__delattr__(name)
+        # Keep the record honest: what the caller deleted is no longer bound, and no longer this
+        # module's to overwrite.
+        _BOUND.pop(name, None)
 
 
 def surface():
     """Report the surface the config declares, without importing anything.
 
-    Returns a list of `{name, source, bound}` dicts in `__all__` order, where `bound` says whether
-    that name is bound into this module right now. This reads the config and nothing else — it is
-    the way to inspect the declared surface in a checkout where the source modules are not present,
-    which is what `dz_debug/__init__.py surface` prints.
+    Returns a list of `{name, source, bound}` dicts in `__all__` order. `bound` says whether that
+    name is bound into this module RIGHT NOW, and it is answered by looking in the module dict —
+    the one place that cannot disagree with what a caller sees. Answering it from this module's own
+    bookkeeping instead would let the two drift apart and make `bound` lie: report False for a name
+    that `'save' in vars(dz_debug)` says is there.
+
+    This reads the config and nothing else — it is the way to inspect the declared surface in a
+    checkout where the source modules are not present, which is what `dz_debug/__init__.py surface`
+    prints.
 
     Raises:
         ConfigError: if no config object can be resolved or `exports` is malformed.
     """
-    return [{"name": name, "source": "%s:%s" % (module, attr), "bound": name in _BOUND}
+    return [{"name": name, "source": "%s:%s" % (module, attr), "bound": name in globals()}
             for name, module, attr in _exports()]
 
 
@@ -735,6 +884,17 @@ def _attempt(thunk):
         return thunk()
     except BaseException as exc:  # noqa: BLE001 — a test net must survive anything
         return _Raised(exc)
+
+
+def _raised(thunk):
+    """The NAME of the exception `thunk` raises, or "no exception" — as a comparable value.
+
+    A check that only asked whether both modules raised SOMETHING would pass when one raised
+    AttributeError and the other ConfigError, which is the whole question. Naming the type makes
+    the two answers comparable across the two packages, where the exception objects cannot be.
+    """
+    got = _attempt(thunk)
+    return got.type.__name__ if isinstance(got, _Raised) else "no exception: %r" % (got,)
 
 
 def _write(path, text):
@@ -807,7 +967,7 @@ def _describe(module):
     # The SURFACE's names as they are actually bound into the module dict — `__all__`'s names plus
     # the two submodule attributes the imports leave behind. NOT every public name in `vars()`: the
     # rewrite also defines its own top-level machinery (`bind`, `main`, the config helpers), which
-    # the original had none of. That is divergence 3, and it is checked on its own terms below —
+    # the original had none of. That is divergence 4, and it is checked on its own terms below —
     # what matters is that none of it reaches `__all__`, not that the two dicts are the same size.
     surface_names = set(module.__all__) | {"logger", "log"}
     out = {"__all__": list(module.__all__),
@@ -851,7 +1011,12 @@ def selftest(stream=None):
 
     saved_env = {CONFIG_ENV: os.environ.get(CONFIG_ENV)}
     saved_active, saved_resolved = _ACTIVE, _RESOLVED
+    # `_BOUND` and `_MATERIALIZED` describe the SAME state and are saved and restored together.
+    # Putting the names back while leaving `_MATERIALIZED` false would leave this module bound but
+    # believing it was not, and the next read of a name it does not have would try to bind again
+    # instead of raising AttributeError — the very desync `_materialized` exists to prevent.
     saved_bound = dict(_BOUND)
+    saved_materialized = _materialized()
     here = os.path.dirname(os.path.abspath(__file__))
     package_root = os.path.dirname(here)
 
@@ -916,7 +1081,7 @@ def selftest(stream=None):
             extra = sorted(set(n for n in vars(rewrite) if not n.startswith("_"))
                            - set(n for n in vars(original) if not n.startswith("_")))
             check(extra and not (set(extra) & set(rewrite.__all__)),
-                  "divergence 3: the rewrite's %d extra top-level names (%s) are its own "
+                  "divergence 4: the rewrite's %d extra top-level names (%s) are its own "
                   "machinery, and NOT ONE of them reaches __all__, so no caller sees them"
                   % (len(extra), ", ".join(extra)))
 
@@ -927,7 +1092,7 @@ def selftest(stream=None):
                   "`from dz_debug import *` binds exactly the names the ORIGINAL's did — %r — and "
                   "each to that package's own attribute" % (sorted(star_want),))
             check("bind" not in star_got and "main" not in star_got and "json" not in star_got,
-                  "...and none of the rewrite's own top-level names leak into it (divergence 3)")
+                  "...and none of the rewrite's own top-level names leak into it (divergence 4)")
             check(callable(rewrite.debug_decorator) and rewrite.debug_decorator(len) is len
                   and rewrite.debug_decorator(len) is original.debug_decorator(len),
                   "the re-exported debug_decorator WORKS, and identically to the ORIGINAL's: it "
@@ -1154,10 +1319,137 @@ def selftest(stream=None):
                   "force")
             eager.reset_config()
 
-            # ── 10. the command line, as actual processes ───────────────────────────
+            # ── 10. the lazy window — divergence 1's cost, measured against the ─────
+            #     ORIGINAL rather than described.
+            #
+            #     Divergence 1 is the whole of this rewrite's behavioral risk, so the
+            #     docstring's account of it is the thing most worth disbelieving. Every
+            #     operation below is run on the ORIGINAL and on the rewrite and the results
+            #     compared, so the account is checked and not taken on trust. The WRITE cases
+            #     matter most: a write into the window that the bind later undid, or that
+            #     poisoned the bind, would be a silent trap for `monkeypatch.setattr` and
+            #     every other ordinary caller — observable long after the window closed.
+            print("[10] the window between `import dz_debug` and the first touch, probed "
+                  "against the ORIGINAL", file=out)
+
+            def in_window(root, package, operation):
+                """Run `operation` on a freshly imported copy, before anything touches it."""
+                return _attempt(lambda: operation(_import_fresh(root, package)))
+
+            def both(operation):
+                """The ORIGINAL's result and the rewrite's, for the same operation."""
+                return (in_window(orig_root, "_dz_original", operation),
+                        in_window(landed, "_dz_rewrite_landed", operation))
+
+            def probe(label, operation):
+                want, got = both(operation)
+                same = not isinstance(want, _Raised) and got == want
+                check(same, "%s — the ORIGINAL: %s%s"
+                      % (label, json.dumps(want) if same else repr(want),
+                         "" if same else "   BUT THE REWRITE: %r" % (got,)))
+
+            def write_then_touch(module):
+                stub = "a caller's stub"
+                module.save = stub                       # the write, in the window
+                other = module.Logger("n").name          # the touch that binds
+                return {"the touch works": other,
+                        "the write survives it": module.save is stub,
+                        "__all__ is the original's": list(module.__all__),
+                        "star-import binds the stub": _star_import(module.__name__)["save"] is stub}
+
+            probe("a caller's `dz_debug.save = stub` in the window, then a touch", write_then_touch)
+
+            def delete_then_read(module):
+                del module.save                          # the delete, in the window
+                return {"gone from the module dict": "save" in vars(module),
+                        "the rest still binds": module.Logger("n").name,
+                        "reading it now raises": _raised(lambda: module.save),
+                        "__all__ still lists it": list(module.__all__)}
+
+            probe("a caller's `del dz_debug.save` in the window, then a read", delete_then_read)
+
+            def caller_all_wins(module):
+                module.__all__ = ["save"]
+                module.Logger                            # the touch
+                return {"the caller's __all__ survives": list(module.__all__)}
+
+            probe("a caller's `dz_debug.__all__ = [...]` in the window survives the bind",
+                  caller_all_wins)
+
+            def probes(module):
+                return {"hasattr(save)": hasattr(module, "save"),
+                        "hasattr(nope)": hasattr(module, "nope"),
+                        "hasattr(__wrapped__)": hasattr(module, "__wrapped__"),
+                        "isinstance ModuleType": isinstance(module, types.ModuleType),
+                        "reading a name that is not there": _raised(lambda: module.nope)}
+
+            probe("hasattr, a dunder probe, isinstance and a missing name", probes)
+
+            # `importlib.reload` re-runs the module's FINDER, so unlike every other probe here
+            # the package's root has to still be on sys.path while it happens — `_import_fresh`
+            # takes it back off. These two run with the root kept in place.
+            def touch_reload_then_use(root, package):
+                def operation(module):
+                    module.save                          # bind BEFORE the reload
+                    sys.path.insert(0, root)
+                    try:
+                        reloaded = importlib.reload(module)
+                    finally:
+                        sys.path.remove(root)
+                    return {"the surface still works": reloaded.save(1, k=2),
+                            "__all__": list(reloaded.__all__),
+                            # A reload re-executes the module body, which is where round-1's
+                            # `_BOUND = {}` desynced the record from a module dict the reload
+                            # does NOT clear — and every already-bound name then looked like a
+                            # collision with this module's own machinery.
+                            "an explicit bind() after it": _raised(reloaded.bind)
+                                                           if hasattr(reloaded, "bind") else "n/a"}
+                return in_window(root, package, operation)
+
+            r_reload = touch_reload_then_use(landed, "_dz_rewrite_landed")
+            o_reload = touch_reload_then_use(orig_root, "_dz_original")
+            check(not isinstance(r_reload, _Raised) and not isinstance(o_reload, _Raised)
+                  and r_reload["the surface still works"] == o_reload["the surface still works"]
+                  and r_reload["__all__"] == o_reload["__all__"]
+                  and r_reload["an explicit bind() after it"].startswith("no exception"),
+                  "importlib.reload after a bind leaves the ORIGINAL's surface, and an explicit "
+                  "bind() after it succeeds rather than reporting a false collision: %r"
+                  % (r_reload,))
+
+            def reload_then_surface(module):
+                module.save
+                sys.path.insert(0, landed)
+                try:
+                    reloaded = importlib.reload(module)
+                finally:
+                    sys.path.remove(landed)
+                return {"surface() says bound": [e["bound"] for e in reloaded.surface()],
+                        "and the module dict says": [n in vars(reloaded)
+                                                     for n in ("debug_decorator", "save", "Logger")]}
+            after = in_window(landed, "_dz_rewrite_landed", reload_then_surface)
+            check(not isinstance(after, _Raised)
+                  and after["surface() says bound"] == after["and the module dict says"]
+                  == [True, True, True],
+                  "...and surface()'s `bound` still agrees with the module dict after a reload, "
+                  "rather than contradicting it: %s" % json.dumps(after))
+
+            # The cost, stated exactly and shown to be exactly that: `vars()` reads the module
+            # dict without going through the module, so nothing can hook it. This is the ONE
+            # thing divergence 1 costs, and it converges the moment the surface is touched.
+            windowed = _import_fresh(landed, "_dz_rewrite_landed")
+            in_window_names = sorted(n for n in vars(windowed) if n in ("save", "__all__"))
+            windowed.save
+            check(in_window_names == []
+                  and sorted(n for n in vars(windowed) if n in ("save", "__all__"))
+                  == ["__all__", "save"],
+                  "divergence 1's whole cost: vars() does not show the surface in the window "
+                  "(%r), and shows all of it after the first touch — nothing else differs"
+                  % (in_window_names,))
+
+            # ── 11. the command line, as actual processes ───────────────────────────
             #     Run from an unrelated cwd, so each one also proves the claim that the
             #     working directory does not change what config is found.
-            print("[10] the command line — every command run as a process, from cwd=%s" % tmp,
+            print("[11] the command line — every command run as a process, from cwd=%s" % tmp,
                   file=out)
             gate_env = dict(os.environ, DZ_DEBUG_CONFIG=missing)
             for argv, env, want_code, want_text in (
@@ -1201,10 +1493,11 @@ def selftest(stream=None):
         _unbind()
         globals()["_ACTIVE"] = saved_active
         globals()["_RESOLVED"] = saved_resolved
+        # `__all__` rides along in `_BOUND` as an ordinary key, so restoring the record restores
+        # the module dict with it — there is nothing to put back by hand.
         _BOUND.update(saved_bound)
         globals().update(saved_bound)
-        if saved_bound:
-            globals()["__all__"] = list(saved_bound)
+        globals()["_MATERIALIZED"] = saved_materialized
 
     print("\n%s — %d checks, %d failure(s)"
           % ("SELFTEST PASSED" if not failures else "SELFTEST FAILED", checks[0], len(failures)),
@@ -1348,6 +1641,35 @@ def _resolves(spec):
         return True, ""
     except Exception as exc:  # noqa: BLE001 — reporting, not binding
         return False, "%s: %s" % (type(exc).__name__, exc)
+
+
+# ──────────────── what this module is, fixed once, before anything can bind ────────────────
+#
+# Everything above is now defined, so `globals()` at this point holds exactly THIS MODULE'S OWN
+# top-level names and nothing else. That set is what `bind()` refuses to let a config overwrite
+# (divergence 4), and what `_caller_owns` subtracts to recognise a caller's write. It must be a
+# SNAPSHOT rather than a live read of `globals()`, because from the first bind onwards the module
+# dict also holds bound exports and whatever callers have assigned.
+#
+# Like `_BOUND` it is read back out of `globals()` first, so it survives `importlib.reload`.
+# Recomputing it on a reload would take the snapshot in a dict that ALREADY holds the previously
+# bound exports and any caller's writes, and would silently swear they are this module's own —
+# which is exactly the confusion this snapshot exists to prevent. `__all__` is deliberately NOT in
+# it: `__all__` is part of the surface this module binds, not machinery a config may not touch.
+_OWN_NAMES = globals().get("_OWN_NAMES") or frozenset(
+    set(globals()) - {"__all__"} | {"_OWN_NAMES"})
+
+# Give this module the type whose `__getattr__`/`__delattr__` materialize the bind. Assigning
+# `__class__` on a module is supported for exactly this purpose, and `_LazyModule` derives from
+# `types.ModuleType`, so `dz_debug` remains a module by every test but `type(m) is ModuleType`.
+# Reload re-runs this line against the same module object, which is idempotent.
+#
+# Not when this file is being run as a plain script: `__name__` is then `"__main__"` and
+# `sys.modules["__main__"]` is the script itself, which has no surface to bind and must keep
+# raising plain AttributeError for a name it does not have. The `__main__` block below re-imports
+# the package under its real name, and THAT copy gets the type.
+if __name__ != "__main__":
+    sys.modules[__name__].__class__ = _LazyModule
 
 
 if __name__ == "__main__":
