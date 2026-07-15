@@ -1,0 +1,13 @@
+{
+  "_comment": "Configuration registry for the forge2 artifact_tree_gen package. Every registry-gated tool in this package walks UP the tree from its OWN file to find this file, and throws if it cannot see it (see the congruency repo's note-for-claude: 'if a tool cannot see the registry it will throw an exeption'). It sits beside the modules it configures, so they resolve their config from a clean checkout with no setup. Each unit reads only its own section; a unit whose section is absent throws, which is the gate working rather than a defect. This registry was filed by ticket #405, which covers the fib unit only, so fib is the only section here.",
+  "schema": 1,
+  "bug_reports": "logs/bug_reports.jsonl",
+  "forge2": {
+    "artifact_tree_gen": {
+      "fib": {
+        "_comment": "Config object for forge2:artifact_tree_gen/fib (module key forge-rw:f3df615229b4c9f7, ticket #405). 'trace' is the telemetry decorator the ORIGINAL unit hardcoded as `from code_pipeline import trace`; naming it here instead is #200's control-config requirement. null runs fib undecorated; a \"module:attr\" string (for example \"code_pipeline:trace\") applies that hook. A trace hook is telemetry and returns the wrapped result unchanged, so it does not alter what fib returns. It is null here because code_pipeline is not importable in this checkout.",
+        "trace": null
+      }
+    }
+  }
+}
