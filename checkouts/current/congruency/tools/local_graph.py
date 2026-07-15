@@ -28,7 +28,7 @@ THE GRAPH (nodes as built in build_graph(); -> plain edge, => conditional edge):
                 => pass ................. approval_gate      /
                                              |  (INTERRUPT: pauses for a wallet signature)
                                              => rejected .... held ... /
-                                             => approved .... merge
+                                             => approved .... merge   (merges ONLY the signed sha)
                                                                => refused . merge_refused -> harvest_fail
                                                                => ok ...... settle -> reap -> harvest_pass -> END
 
@@ -63,8 +63,11 @@ CHECKPOINT VS LEDGER — they COMPLEMENT, they do not duplicate (the rule this m
   The rule this module enforces, stated exactly: NO node lets the checkpoint DECIDE a settled fact.
   Every authority is re-derived from the durable stores at the moment it is needed — `decide`
   re-reads `ahead` from git (`Forge.ahead_of`) on every single pass rather than trusting the cursor;
-  `merge` believes only `Forge.merge_to_base`'s verified post-state (HEAD moved AND a real merge
-  commit exists), never a checkpointed flag or git's exit code; and `process_status DONE` still goes
+  `merge` re-reads the branch tip from the ref and refuses unless it is still the sha the wallet
+  signed (the cursor's word that it was is worth nothing), and believes the merge only on
+  `Forge.merge_to_base`'s verified post-state (HEAD moved AND a real merge commit exists) plus git's
+  own record of what that commit merged, never a checkpointed flag or git's exit code; and
+  `process_status DONE` still goes
   through the governed route, still gated by `tg_tickets_pair_completion`
   (0029_ticket_authorization.sql:133-141), which refuses DONE unless two DISTINCT agents hold two
   DISTINCT roles. Facts the checkpoint does carry forward (the merge sha `settle` puts in its
@@ -114,8 +117,10 @@ THE DRY EDGE — `decide` routes pass / fail / dry:
          nothing is recorded, the branch and worktree persist, the ticket stays open. This is
          pair_loop's empty-branch refusal (module docstring policy 3, pair_loop.py:48-54) promoted to
          an explicit edge so it is decided BEFORE the merge is attempted rather than discovered
-         inside it. `Forge.merge_to_base` remains the authority on every other refusal (conflict, a
-         drifted base tree) and is never second-guessed.
+         inside it. `Forge.merge_to_base` remains the authority on every refusal it already owns (a
+         conflict, a drifted base tree, an empty branch): those are never second-guessed or retried.
+         `merge` adds refusals of its own ON TOP of it — the signed-sha binding — because that is a
+         question about the APPROVAL, which the forge knows nothing about.
 
 THE APPROVAL GATE — the interrupt node, placed between a passing verdict and the irreversible merge:
   `approval_gate` calls `interrupt(payload)`, which PAUSES the graph and persists the checkpoint; the
@@ -132,6 +137,26 @@ THE APPROVAL GATE — the interrupt node, placed between a passing verdict and t
   signature over a DIFFERENT payload, or `approve: false` all route to `held`: nothing is merged, the
   branch and worktree persist, the ticket stays open. Because a node re-executes from its start on
   resume, `approval_gate` performs NO side effect before its `interrupt()` call.
+
+  THE SIGNATURE BINDS THE COMMIT, NOT THE BRANCH NAME (the second half of the gate, enforced in
+  `n_merge` — a valid signature alone is NOT sufficient to merge):
+  A branch name is a MOVING pointer. The payload names `sha` — the tip of ticket/<id> that the
+  auditor actually judged — and the pause the gate exists to create is deliberately long: the process
+  may exit entirely, and the branch and its worktree persist on disk the whole time. So between the
+  signature and the merge, anyone with disk access can commit onto ticket/<id> and move its tip.
+  Merging the branch NAME would then land whatever the tip is NOW: commits no auditor ever saw and no
+  wallet ever signed, under a signature that verifies perfectly. That would make the gate
+  ceremonial — it would defeat both its own stated purpose and the pair system's core governance
+  property, that nothing lands without passing the adversary's validate step.
+  Therefore `n_merge` RE-READS the tip of refs/heads/ticket/<id> from git and refuses unless it is
+  still EXACTLY the signed `sha`, and unless `ahead` is still exactly the signed count. A mismatch
+  routes to `merge_refused` like any other refusal (exit 4): nothing merges, nothing is recorded,
+  the branch and worktree persist untouched, the ticket stays open. The moved commits are not
+  erased — they are simply not landed on the approver's signature. Re-run the ticket and the new tip
+  goes through run_auditor and a NEW signature, which is the only way anything reaches the base.
+  After a merge, `n_merge` also re-checks the merge commit's second parent against the signed `sha`
+  and refuses to settle if it differs, so even a merge that raced the pre-check cannot claim a UID or
+  a DONE (see `n_merge` for the full argument and the residual window).
 
 Usage (every form except --selftest/--engine needs CONGRUENCY_API_KEY, from the env or
 .secrets/ats.env, and a reachable congruency server):
@@ -157,8 +182,9 @@ Exit codes (they mirror pair_loop's, with two added for the gate it does not hav
        (--selftest: at least one check FAILED)
     2  unexpected — a Variant-A bug report was filed to the registry's bug_reports sink
     3  halted — an active stop ticket aims at this ticket or an ancestor; nothing was done
-    4  refused — passed review but nothing landed: a merge conflict, a drifted base tree (#213), or a
-       DRY round with no commits the base lacks. Branch + worktree persist; the ticket stays open.
+    4  refused — passed review but nothing landed: a merge conflict, a drifted base tree (#213), a
+       DRY round with no commits the base lacks, or a branch that MOVED after its approval was signed
+       (the signed sha is no longer the tip). Branch + worktree persist; the ticket stays open.
     5  paused at the approval gate — awaiting a wallet-signed approval. NOT a failure: the checkpoint
        holds the run; --approve or --reject continues it.
     6  held — the approval was rejected or its signature did not verify. Nothing merged.
@@ -450,6 +476,12 @@ def wallet_canonical(payload):
     Sorted keys + no whitespace, so the approver and the verifier agree byte-for-byte regardless of
     dict ordering. Sign what you see: the signature covers the WHOLE approval payload (ticket,
     branch, base, verdict, ahead, sha), so a signature is not transferable to a different merge.
+
+    Signing the payload is only half of that guarantee, and on its own it is a WEAK half: it binds
+    the signature to a payload, not the payload to reality. `sha` is a claim about the branch made at
+    gate time, and the branch can move during the pause. `n_merge` supplies the other half by
+    refusing to merge unless the branch STILL is what this payload says it is. Neither half is
+    optional; see "THE SIGNATURE BINDS THE COMMIT, NOT THE BRANCH NAME" in the module docstring.
     """
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -662,14 +694,113 @@ def r_approval(state):
     return "approved" if state.get("approved") else "rejected"
 
 
+def branch_tip(forge, tid):
+    """The CURRENT tip of refs/heads/ticket/<id>, read from the ref itself. "" if the branch is gone.
+
+    The ref, never a worktree HEAD and never the checkpoint: the ref is what `git merge ticket/<id>`
+    will resolve, so it is the only thing worth comparing a signature against. `--verify --quiet`
+    makes a missing branch an empty answer rather than a raised fault, because the caller treats it
+    as a refusal (a branch that vanished is not one this signature can land).
+    """
+    ok, out = forge.git_ok("rev-parse", "--verify", "--quiet", "refs/heads/%s" % forge.branch_of(tid))
+    return out.strip() if ok else ""
+
+
+def merged_parent(forge, merge_sha):
+    """The SECOND parent of a merge commit — i.e. the commit that was merged IN. "" if there is none.
+
+    `git rev-list --parents -n 1 <sha>` prints "<commit> <parent1> <parent2> ...", so a --no-ff merge
+    of ticket/<id> into the base yields parent2 = the branch tip that landed. This is git's own record
+    of what was merged, read back AFTER the fact — the check that closes the loop on `merge_to_base`.
+    """
+    ok, out = forge.git_ok("rev-list", "--parents", "-n", "1", merge_sha)
+    parts = out.split() if ok else []
+    return parts[2] if len(parts) >= 3 else ""
+
+
 def n_merge(state, deps):
-    """SETTLE step 1: merge ticket/<id> into the base. `merge_to_base` is the sole authority on ok."""
+    """SETTLE step 1: merge ticket/<id> into the base — but ONLY if it is still the commit signed.
+
+    THE BINDING CHECK — a valid signature is necessary here, NOT sufficient. `approval_gate` proves
+    the approver signed THIS payload; this node proves the payload is still TRUE of the repository.
+    Without it the gate is ceremonial: `merge_to_base` merges the branch NAME, so it lands the tip as
+    of merge time, and the pause the gate creates is long by design (the process may exit entirely
+    while the branch and worktree sit on disk). Anyone who commits onto ticket/<id> during that pause
+    would have their commit landed — never judged by run_auditor, never covered by the signature —
+    by an approval that verifies perfectly. So the tip is re-read from the ref and must still be
+    EXACTLY the signed sha, and `ahead` must still be exactly the signed count.
+
+    Both are re-derived from git at the instant they are needed, never trusted from the checkpoint —
+    the same rule every other authority in this module obeys (see "CHECKPOINT VS LEDGER"). The signed
+    values ride in `state` only because that is where the payload the approver signed was built from;
+    git is what they are checked AGAINST.
+
+    A mismatch is an OUTCOME, not a fault: it routes to `merge_refused` exactly as a conflict or a
+    drifted base tree does. Nothing merges, nothing is recorded, and the moved commits are NOT
+    erased — the branch and its worktree persist untouched with every commit still on them. They
+    simply do not land on this signature; re-running the ticket puts the new tip through run_auditor
+    and a fresh approval, which is the only path to the base.
+
+    The residual window, stated plainly rather than papered over: `merge_to_base` takes the forge
+    lock itself, so this pre-check cannot be inside that lock without self-deadlocking on it (its
+    `lock()` re-opens the lockfile, and flock on a second descriptor of the same file blocks even
+    within one process). A microsecond remains between the check and the merge. Two things cover it:
+    the model is one process per ticket (parallel tickets are parallel processes on their own
+    branches), so no second writer is expected to be moving THIS branch; and after the merge the
+    second parent of the merge commit — git's own record of what landed — is checked against the
+    signed sha, so a merge that raced the pre-check is refused before `settle` can mint a UID or
+    claim DONE. It is refused loudly, since at that point the base has moved and only the record can
+    put it right.
+    """
+    signed_sha, signed_ahead = (state.get("sha") or "").strip(), int(state.get("ahead", 0))
+    tip = branch_tip(deps.forge, state["tid"])
+    if not signed_sha:
+        return {"reason": "the approval names no sha, so there is nothing for the merge to bind to — "
+                          "refusing to merge %s on an unbound approval" % state["branch"]}
+    if not tip:
+        return {"reason": "branch %s no longer exists, so the approved commit %s cannot be landed"
+                          % (state["branch"], signed_sha[:10])}
+    if tip != signed_sha:
+        return {"reason": "branch %s MOVED after its approval was signed: the wallet signed sha %s, "
+                          "but the tip is now %s. Those commits were never judged by the adversary "
+                          "and are not covered by the signature, so they will NOT be landed on it. "
+                          "Nothing is erased — branch and worktree keep every commit and the ticket "
+                          "stays open; re-run the ticket to put the new tip through validate and a "
+                          "fresh approval." % (state["branch"], signed_sha[:10], tip[:10])}
+    now_ahead = deps.forge.ahead_of(state["tid"], state["base"])
+    if now_ahead == 0 and signed_ahead != 0:
+        # The tip is still the signed sha, yet the base already contains it: `base` moved to absorb
+        # this branch (`Forge.ahead_of`: "a prior run already merged it"). The reachable way in is a
+        # crash between a successful `merge_to_base` and its checkpoint, so the resumed run re-enters
+        # this node with the work already landed. Merging again is not the answer and neither is
+        # claiming a settle this run did not perform: say what is true and let a human close it out.
+        return {"reason": "%s is already contained in %s — the approved commit %s has ALREADY landed "
+                          "(a run merged it and did not live to record it). Nothing is merged twice "
+                          "and nothing is claimed here: no UID, no DONE. The branch and its worktree "
+                          "persist and the ticket stays open; confirm the merge on %s and settle the "
+                          "ticket by hand." % (state["branch"], state["base"], signed_sha[:10],
+                                               state["base"])}
+    if now_ahead != signed_ahead:
+        return {"reason": "the approval for %s covers %d commit(s) ahead of %s, but %s now has %d — "
+                          "what would land is not what was signed; refusing. Branch and worktree "
+                          "persist; the ticket stays open."
+                          % (state["branch"], signed_ahead, state["base"], state["branch"], now_ahead)}
+
     mg = deps.forge.merge_to_base(state["tid"], state["base"],
                                   "merge %s: ticket #%d — %s\n\n%s"
                                   % (state["branch"], state["tid"], (state["title"] or "")[:64],
                                      state.get("note", "")))
     if not mg.get("ok"):
         return {"reason": mg.get("reason", "merge refused")}
+    landed = merged_parent(deps.forge, mg["sha"])
+    if landed != signed_sha:
+        return {"reason": "MERGE ANOMALY on %s: the merge commit %s landed %s, but the wallet signed "
+                          "%s — the branch moved between the binding check and the merge. Refusing to "
+                          "settle: no UID is minted and no DONE is claimed for a merge that was not "
+                          "approved. The base has moved and this note is the record of it; inspect %s "
+                          "before anything else is landed."
+                          % (state["branch"], mg["sha"][:10], (landed or "(no second parent)")[:10],
+                             signed_sha[:10], mg["sha"][:10])}
     return {"merge_sha": mg["sha"], "ahead": mg.get("ahead", 0), "reason": ""}
 
 
@@ -1322,6 +1453,97 @@ def selftest():
            "tools/two26.py" not in f.git("ls-tree", "-r", "--name-only", base))
         ck("the rejected ticket's branch persists (nothing thrown away)", f.branch_exists("ticket/226")
            and f.ahead_of(226, base) > 0)
+
+        # ══ the gate binds the COMMIT, not the branch name ══
+        # The precise attack the binding exists to stop, reproduced end-to-end. A branch name is a
+        # moving pointer and the gate's pause is long by design, so: drive #227 to the gate, then —
+        # while it is PAUSED, which is exactly the window a real approver's think-time opens, with the
+        # branch and worktree sitting on disk — commit an unreviewed file onto ticket/227 and move its
+        # tip. Then approve with a VALID signature over the payload the gate really showed. A gate
+        # that merged the branch NAME would land the backdoor under that good signature; this one
+        # must refuse, because the signature covers a sha and the sha is no longer the tip.
+        print("-- the gate binds the SIGNED SHA: a branch moved during the pause must NOT merge")
+        tid8 = 227
+        p227 = plan_for(tid8, deliverable="tools/two27.py")
+        r = child(tid8, "fresh", p227)
+        ck("the setup drives #227 to the gate and pauses", r.returncode == 5,
+           "exit %s; %s" % (r.returncode, (r.stdout or "")[-300:]))
+        snap = snapshot(tid8)
+        pend = snap["interrupt"] if snap else None
+        signed_sha = (pend or {}).get("sha")
+        ck("the payload names the exact tip the adversary judged (a sha, not just a branch name)",
+           bool(signed_sha) and signed_sha == f.git("rev-parse", "refs/heads/ticket/227").strip(),
+           "payload sha %s vs tip %s" % (signed_sha, f.git("rev-parse", "refs/heads/ticket/227").strip()))
+
+        wt227 = f.worktree_of(tid8)
+        with open(os.path.join(wt227, "BACKDOOR.py"), "w") as fh:
+            fh.write("# never judged by run_auditor, never covered by the wallet's signature\n")
+        f.git("add", "--", "BACKDOOR.py", cwd=wt227)
+        f.git("commit", "--quiet", "-m", "unreviewed commit landed during the approval pause", cwd=wt227)
+        moved_tip = f.git("rev-parse", "refs/heads/ticket/227").strip()
+        ck("the branch tip really MOVED while the gate sat paused", moved_tip != signed_sha,
+           "%s -> %s" % ((signed_sha or "")[:10], moved_tip[:10]))
+
+        r = child(tid8, "approve", p227)
+        ck("a VALID signature over the shown payload REFUSES a branch that moved (exit 4)",
+           r.returncode == 4, "exit %s; %s" % (r.returncode, (r.stdout or "")[-400:]))
+        ck("the unreviewed BACKDOOR did NOT reach the base",
+           "BACKDOOR.py" not in f.git("ls-tree", "-r", "--name-only", base))
+        ck("nothing merged at all — not even the approved deliverable rode in with it",
+           "tools/two27.py" not in f.git("ls-tree", "-r", "--name-only", base))
+        ck("the base has no merge commit for the moved branch",
+           not [l for l in f.git("log", "--oneline", base).splitlines() if "merge ticket/227" in l])
+        ck("no UID was minted for the refused merge", "work.record" not in routes(tid8))
+        ck("no DONE was claimed for the refused merge",
+           not any(e["route"] == "process_status" and e["obj"].get("status") == "DONE" for e in ledger_of(tid8)))
+        ck("the ledger records a REFUSAL and never a merge",
+           any(e["route"] == "ticket.progress" and "MERGE REFUSED" in str(e["obj"].get("note", ""))
+               for e in ledger_of(tid8))
+           and not any("MERGED" in str(e["obj"].get("note", "")) for e in ledger_of(tid8)
+                       if e["route"] == "ticket.progress"))
+        ck("the refusal names both the signed sha and the tip it found (it explains itself)",
+           any(e["route"] == "ticket.progress" and signed_sha[:10] in str(e["obj"].get("note", ""))
+               and moved_tip[:10] in str(e["obj"].get("note", "")) for e in ledger_of(tid8)))
+        ck("NOTHING was erased: the branch keeps both commits and the worktree persists",
+           f.git("rev-parse", "refs/heads/ticket/227").strip() == moved_tip
+           and f.ahead_of(tid8, base) == 2 and os.path.exists(wt227),
+           "tip %s, %d ahead, worktree %s" % (f.git("rev-parse", "refs/heads/ticket/227").strip()[:10],
+                                              f.ahead_of(tid8, base), os.path.exists(wt227)))
+        ck("the refused ticket stays open (the gate held, it did not fail the run)",
+           f.branch_exists("ticket/227"))
+        # and the control: the SAME approve flow settles when the branch did NOT move (#222 above),
+        # so the refusal is the binding firing, not the gate being broken for everyone.
+        ck("CONTROL: an unmoved branch still merges under the same flow (#222 settled)",
+           os.path.isfile(os.path.join(repo, "tools/thing.py")))
+
+        # The other way the binding can find the world changed: the branch did NOT move, but the base
+        # already contains it — the state a crash between a successful merge and its checkpoint
+        # leaves behind. (--kill-at fires at a node's START, so the selftest cannot produce that
+        # crash; the already-merged base it leaves is reproduced here directly.) The rule is the same:
+        # never merge twice, never claim a settle this run did not perform.
+        print("-- the binding also catches an ALREADY-landed branch (crash between merge and checkpoint)")
+        tid9 = 228
+        p228 = plan_for(tid9, deliverable="tools/two28.py")
+        r = child(tid9, "fresh", p228)
+        ck("#228 reaches the gate and pauses", r.returncode == 5,
+           "exit %s; %s" % (r.returncode, (r.stdout or "")[-300:]))
+        f.git("merge", "--no-ff", "-m", "merge ticket/228 (stands in for the crashed run's merge)",
+              "ticket/228")                    # the merge the crashed run made before it died
+        merges_before = len([l for l in f.git("log", "--oneline", base).splitlines()
+                             if "merge ticket/228" in l])
+        r = child(tid9, "approve", p228)
+        ck("an approval whose branch is ALREADY landed is refused, not merged again (exit 4)",
+           r.returncode == 4, "exit %s; %s" % (r.returncode, (r.stdout or "")[-400:]))
+        ck("...and it did NOT merge a second time",
+           len([l for l in f.git("log", "--oneline", base).splitlines()
+                if "merge ticket/228" in l]) == merges_before == 1)
+        ck("...and claimed no UID and no DONE for a merge it did not perform",
+           "work.record" not in routes(tid9)
+           and not any(e["route"] == "process_status" and e["obj"].get("status") == "DONE"
+                       for e in ledger_of(tid9)))
+        ck("...and the refusal SAYS the work already landed (it does not blame the signature)",
+           any(e["route"] == "ticket.progress" and "ALREADY landed" in str(e["obj"].get("note", ""))
+               for e in ledger_of(tid9)))
 
         # ══ the checkpoint is a cursor, not a ledger ══
         print("-- checkpoint discipline: a cursor, not a second ledger")
