@@ -139,17 +139,25 @@ THE SETTLED BRANCH-PER-TICKET DEFAULTS (RFC #220's open spec questions, answered
                       NEVER the ticket's kind: build/test/documentation is the WORK's kind, not the
                       ARTIFACT's. VM images register as 'forge-vm' in this same column.
       EVERY file in the commit's SCOPE is stamped, never just the --deliverable: a forge package
-      commits several (policy 8), and a registry naming one of them lies about the rest.
+      commits several (policy 8), and a registry naming one of them lies about the rest. That holds
+      even when two of them are byte-identical (a package's empty `__init__.py` files share one blob
+      sha) — they are two artifacts with two paths, so they get two rows; see IDEMPOTENT below.
       Three rules the stamp obeys, each driven in --selftest against the REAL 0014 route:
         NEVER FATAL. A failed artifact.record must not fail the commit or the round. The stamp is
           instrumentation, and instrumentation that can break the pipeline is worse than none (the
           discipline TreeView's telemetry already follows). Forge.stamp_artifacts() raises NOTHING,
           ever: every failure is caught, NAMED on the returned record, and journaled by commit_note.
-        IDEMPOTENT. The key is (ticket_id, forge_sha) — re-committing the same bytes mints no second
-          row, so a round-2 commit of an unchanged file is not a new artifact. 0014's artifact.record
-          is a bare INSERT with no unique index behind it, so the dedupe is a READ of the ticket's
-          rows through the governed `artifact.list` route before any write — not a db constraint, and
-          not a hand-written db touch.
+        IDEMPOTENT. The key is (ticket_id, forge_sha, NAME) — re-committing the same bytes to the same
+          PATH mints no second row, so a round-2 commit of an unchanged file is not a new artifact.
+          The name belongs in the key: the dedupe rule exists to stop a ROUND from minting a file
+          twice, and WITHOUT the name it also silences a file that merely shares another's bytes. Two
+          DISTINCT paths that happen to be byte-identical — a package's empty `__init__.py` files, the
+          everyday case for the packages policy 8 commits — are two artifacts, and each gets its row.
+          A registry that names one of them lies about the other, and the unnamed one is exactly what
+          a human greps for and cannot find. 0014's artifact.record is a bare INSERT with no unique
+          index behind it, so the dedupe is a READ of the ticket's rows through the governed
+          `artifact.list` route before any write — not a db constraint, and not a hand-written db
+          touch.
         NO SQL PEN. artifact.record + artifact.list, and nothing else. The harness never writes SQL.
 
 THE DIRECTORY-SERVICE GATE (#457) — MEASURED, AND NOT MET BY THIS FILE ALONE. READ THIS BEFORE
@@ -728,19 +736,26 @@ class Forge:
         surprise from any other line is still not the round's problem).
 
         WHY THE IDEMPOTENCY READ COMES FIRST (policy 10's IDEMPOTENT). The key is
-        (ticket_id, forge_sha) and NOTHING IN THE DB ENFORCES IT: 0014's artifact.record is a bare
-        INSERT and ticket_artifacts carries no unique index. So "record once" can only be honored by
-        reading the ticket's existing rows through `artifact.list` and not re-inserting what is there.
-        If that READ fails, this refuses to stamp AT ALL (stamped=False, the reason in `errors`)
-        rather than insert blind: a duplicate row is permanent — it lands in an append-only registry
-        and misreports one artifact as two — while a missing stamp is a gap the next commit closes.
-        In practice the read and the write are the same surface, so a failed read means the write was
-        never going to land either.
+        (ticket_id, forge_sha, name) and NOTHING IN THE DB ENFORCES IT: 0014's artifact.record is a
+        bare INSERT and ticket_artifacts carries no unique index. So "record once" can only be honored
+        by reading the ticket's existing rows through `artifact.list` and not re-inserting what is
+        there. If that READ fails, this refuses to stamp AT ALL (stamped=False, the reason in
+        `errors`) rather than insert blind: a duplicate row is permanent — it lands in an append-only
+        registry and misreports one artifact as two — while a missing stamp is a gap the next commit
+        closes. In practice the read and the write are the same surface, so a failed read means the
+        write was never going to land either.
 
-        Two files with IDENTICAL BYTES share one blob sha, so the key mints ONE row for them and the
-        second is reported in `skipped`. That follows from (ticket_id, forge_sha) being the key and is
-        deliberate: the row addresses CONTENT, and there is exactly one content here (a package's
-        empty `sub/__init__.py` files are the everyday case).
+        WHY `name` IS IN THE KEY, AND WHY LEAVING IT OUT WAS A BUG. Two files with IDENTICAL BYTES
+        share one blob sha — a package's empty `__init__.py` files are the everyday case for the
+        packages policy 8 commits, and git stores both as e69de29bb2d1d6434b8b29ae775ad8c2e48c5391. A
+        key of (ticket_id, forge_sha) alone cannot tell those two apart from ONE file stamped twice,
+        so it drops the second as "already stamped" and its PATH never reaches the registry at all.
+        That is the disease #457 exists to cure, reintroduced one layer down: `name` is the
+        repo-relative path a human greps, so a file with no row is a file no one can find, however
+        faithfully some OTHER file's row records its bytes. The dedupe rule is about ROUNDS —
+        "re-committing the same bytes" — and (ticket_id, forge_sha, name) satisfies that exactly: a
+        re-commit of the same path mints nothing, while every distinct path that landed gets its row.
+        Per policy 10: EVERY file in the commit's SCOPE is stamped.
         """
         out = {"recorded": [], "skipped": [], "errors": [], "stamped": False}
         if self.api is None or not cm.get("committed"):
@@ -748,7 +763,7 @@ class Forge:
         try:
             try:
                 rws = self.api(ARTIFACT_LIST_ROUTE, {"ticket_id": int(tid)}, "GET").get("rows", [])
-                seen = {(r.get("forge_sha") or "").lower() for r in rws}
+                seen = {((r.get("forge_sha") or "").lower(), r.get("name")) for r in rws}
             except Exception as e:  # noqa: BLE001 — cannot prove idempotency, so do not write
                 out["errors"].append("%s (the idempotency read) failed, so NOTHING was stamped rather "
                                      "than risk a duplicate row: %s" % (ARTIFACT_LIST_ROUTE, e))
@@ -760,9 +775,10 @@ class Forge:
                     out["skipped"].append("%s: no blob in %s (a deletion is not an artifact)"
                                           % (path, version))
                     continue
-                if sha.lower() in seen:
-                    out["skipped"].append("%s: already stamped for #%s at forge_sha %s (same bytes, "
-                                          "not a new artifact)" % (path, tid, sha[:10]))
+                if (sha.lower(), path) in seen:
+                    out["skipped"].append("%s: already stamped for #%s at forge_sha %s (this PATH "
+                                          "already landed these exact bytes — not a new artifact)"
+                                          % (path, tid, sha[:10]))
                     continue
                 row = {"ticket_id": int(tid), "name": path, "version": version,
                        "forge_sha": sha, "kind": ARTIFACT_KIND}
@@ -772,7 +788,7 @@ class Forge:
                     out["errors"].append("%s for %s (forge_sha %s) failed: %s"
                                          % (ARTIFACT_RECORD_ROUTE, path, sha[:10], e))
                     continue
-                seen.add(sha.lower())        # a duplicate WITHIN this commit is still a duplicate
+                seen.add((sha.lower(), path))     # this PATH's bytes are now on the record
                 out["recorded"].append(row)
             out["stamped"] = True
         except Exception as e:  # noqa: BLE001 — the outer net: the stamp NEVER costs the round
@@ -1365,6 +1381,21 @@ def _st_forge_package(wt, pkg, name):
     Every part beyond add.py is one the ticket names — pyproject.toml, config, entry points,
     submodules — and every one of them is what #401 lost: a package whose pyproject.toml is not
     committed is not a package, and a check that only proved add.py lands would prove nothing new.
+
+    TWO EMPTY `__init__.py` FILES, ON PURPOSE (#457). A real package carries one per package
+    directory and they are EMPTY, so git stores both as the SAME blob
+    (e69de29bb2d1d6434b8b29ae775ad8c2e48c5391) — two distinct paths, one content address. That is the
+    everyday shape, and it is the one shape that can break the mint hook's dedupe: a key that ignores
+    `name` reads the second file as the first one stamped twice and drops its row, so the file lands
+    in git and is absent from the registry. This fixture wrote exactly ONE empty file before #457's
+    round 2, which is precisely why the EVERY-FILE-IN-SCOPE check below could not see that defect. A
+    fixture with no collision in it cannot prove a collision is handled.
+
+    The root `__init__.py` is deliberately NOT declared in FORGE_PYPROJECT, and needs no declaration:
+    naming py-modules AND packages explicitly turns setuptools' auto-discovery OFF, so the file is
+    simply not installed and cannot disturb the build (--install-check proves the package still
+    installs with it present). It is a file the worker LEFT — which is what this fixture reproduces —
+    and therefore a file the package commit must stamp.
     """
     d = os.path.join(wt, pkg)
     os.makedirs(os.path.join(d, "sub"), exist_ok=True)
@@ -1373,6 +1404,7 @@ def _st_forge_package(wt, pkg, name):
                   "def main():\n    print(add(2, 3))\n",
         "pyproject.toml": FORGE_PYPROJECT % {"name": name},
         "config.json": '{"schema": 1, "offset": 0}\n',
+        "__init__.py": "",
         "sub/__init__.py": "",
         "sub/helper.py": "def bump(v, by):\n    return v + by\n",
     }
@@ -2388,7 +2420,7 @@ def selftest(install_check_too=False):
                ARTIFACT_RECORD_ROUTE not in gl.routes(), str(gl.routes()))
             fl.reap_worktree(464)
 
-            # IDEMPOTENT (key: ticket_id, forge_sha) — the same commit, stamped twice.
+            # IDEMPOTENT (key: ticket_id, forge_sha, name) — the same commit, stamped twice.
             again = fm.stamp_artifacts(457, cm457)
             ck("IDEMPOTENT — re-stamping the same commit mints NO second row",
                again["recorded"] == [] and len(ga.artifacts(457)) == 1 and bool(again["skipped"]),
@@ -2427,6 +2459,26 @@ def selftest(install_check_too=False):
                                             cwd=w460["path"]).strip() for r in r460), str(r460))
             ck("...and the build artifacts that were never committed are never stamped either",
                not any(is_build_artifact(r["name"]) for r in r460), str([r["name"] for r in r460]))
+            # THE COLLISION (#457 round 2). The package's two `__init__.py` files are both EMPTY, so
+            # git gives them ONE blob sha. A dedupe keyed on (ticket_id, forge_sha) alone reads the
+            # second as the first stamped twice and drops it: the file lands in git and its PATH is
+            # nowhere in the registry — the exact disease #457 exists to cure. The shared sha is
+            # proven here from GIT's own answer (not asserted), so this check cannot pass by the
+            # fixture quietly losing its collision.
+            empties = [p for p in wrote460 if p.endswith("__init__.py")]
+            eshas = {fp.git("rev-parse", "%s:%s" % (c460["sha"], p), cwd=w460["path"]).strip()
+                     for p in empties}
+            ck("...INCLUDING two DISTINCT paths that git stores as ONE blob (both `__init__.py` are "
+               "empty): the key is (ticket_id, forge_sha, name), so a shared content address costs "
+               "neither file its row",
+               len(empties) == 2 and len(eshas) == 1
+               and sorted(r["name"] for r in r460 if r["name"] in empties) == sorted(empties),
+               "empties=%s shared_sha=%s rows=%s" % (empties, eshas, [r["name"] for r in r460]))
+            ck("...and the name in the key NARROWS the dedupe without disabling it: re-stamping that "
+               "same package commit mints NO second row for ANY of its files",
+               fp.stamp_artifacts(460, c460)["recorded"] == []
+               and sorted(r["name"] for r in gp.artifacts(460)) == wrote460,
+               str([r["name"] for r in gp.artifacts(460)]))
             # a DELETION is in the commit's fileset but is not an artifact: there are no bytes.
             os.remove(os.path.join(w460["path"], pkg460, "config.json"))
             c460b = fp.commit_deliverable(460, pkg460 + "/add.py", "ticket #460: retire the config")
