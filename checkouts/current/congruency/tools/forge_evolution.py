@@ -152,6 +152,25 @@ decision; an AT-RISK family is a merge.
     the whole point: it is the jail family, its topology is LINEAR, and reading the risk off the
     label would have called the one family this ticket exists for a safe naming decision.
 
+"EVERY FILE AT ITS TIP" INCLUDES THE ONES THIS TOOL CANNOT READ. The gate's rule is an IF AND ONLY
+IF, so the only way to earn SAFE TO OMIT is to resolve every file — and a file whose blob the object
+store will not produce has NOT been resolved. It is possible for `git ls-tree` to LIST a file whose
+blob is missing or corrupt (`cat-file` then fails on that sha while the tip still enumerates), and
+such a file is recorded as UNREADABLE: it keeps its place in the tip's file count, its content
+identity is None, and it goes on the merge-home worklist marked `unreadable` with the reason. It can
+never be counted as contained, because nobody can show it came home. This matters because the
+failure is silent by nature — the file is still listed, so a scan that dropped what it could not
+read would hand the gate a SHORTER tip in which every remaining file happens to resolve, and the
+fork's real work would vanish from the worklist, the orphan set and the totals at once. UNKNOWN IS
+NEVER PROOF, at any scale: an unreadable BLOB is one worklist entry; an unreadable TIP (ls-tree
+itself fails, or the blob batch never answers) is reported NOT SAFE with the reason and an empty
+worklist, since a git that never ran is an environment failure, not a list of un-merged work.
+`totals.unreadable_blobs` and the `unreadable_blobs` list report every such gap; on the live forge
+both are 0 — no forge repo is missing an object today, so this rule changes none of the figures
+above. --selftest proves it the only way that means anything: it builds a fork holding a file that
+never came home, deletes exactly that blob's loose object, and asserts the verdict, the file count
+and the worklist are IDENTICAL to the intact run.
+
 AT-RISK IS NOT "CANNOT RETIRE", AND THE TWO MUST NOT BE CONFUSED. `risk` is what the DAG can prove
 about a whole family; the gate is what CONTENT proves about one fork. They disagree on purpose: a
 family can be AT-RISK (its canonical does not contain some member's tip) while that member is still
@@ -211,6 +230,14 @@ ARCHIVES_DIR = "archives"       # config/forge/archives/ — where omni.git live
 SAFE, NOT_SAFE = "SAFE TO OMIT (proven)", "NOT SAFE TO OMIT"
 RISK_NONE, RISK_AT = "NONE", "AT-RISK"
 GIT_TIMEOUT = 120
+
+# The `kind` of a scanned file's identity: how its module-sha was derived, or that it has none.
+# UNREADABLE means ls-tree LISTS the file but its blob will not come out of the object store (a
+# missing/corrupt object). Such a file has NO content identity, so it can never be PROVEN to have
+# come home: §3's gate counts it as unresolved work, never as contained. It is a distinct value —
+# not None, not a silent drop — precisely so no code path can mistake "we could not read it" for
+# "it is not there".
+UNREADABLE = "unreadable"
 
 
 class ForgeError(RuntimeError):
@@ -371,11 +398,26 @@ def tip_files(gitdir, tip):
 
 
 def batch_blobs(gitdir, shas):
-    """{blob_sha: bytes} read in ONE `git cat-file --batch` process.
+    """{blob_sha: bytes} read in ONE `git cat-file --batch` process, or None if the BATCH failed.
 
     A tip holds hundreds of blobs and the forge holds 261 tips; one subprocess per blob would make
     a live run take minutes instead of seconds. A sha git reports as `missing` is simply absent
-    from the result, so a caller sees it as unreadable rather than as empty content.
+    from the returned map, so `scan_tip` sees that ONE blob as unreadable rather than as empty
+    content.
+
+    THE RETURN IS THREE-VALUED ON PURPOSE. `{}`/a partial map means "git ANSWERED; these are the
+    blobs it had" — anything absent is a real per-blob gap in the object store. None means "git did
+    not answer at all" (it timed out, or exited non-zero): nothing was learned about ANY blob, and
+    the two must not be confused.
+
+    What this protects is the WORKLIST'S MEANING, not the safety of the verdict. Either way the
+    verdict is safe — `scan_tip` records an unread blob as UNREADABLE and the gate counts it as
+    unresolved, so a failed batch can only ever produce NOT SAFE, never a false "contained". But
+    #452 §3 makes the unresolved list THE MERGE-HOME WORKLIST — the thing an operator works through
+    — and a batch that timed out is an environment failure, not 39 files of un-merged work. So None
+    becomes a whole-tip UNKNOWN ("this member's tip would not enumerate"), which the gate reports as
+    NOT SAFE with an EMPTY worklist and the reason stated, rather than inventing a worklist out of
+    a git that never ran.
     """
     shas = [s for s in dict.fromkeys(shas)]
     if not shas:
@@ -391,7 +433,11 @@ def batch_blobs(gitdir, shas):
     except FileNotFoundError:
         raise ForgeError("git is not on PATH — this tool reads the forge's bare repos with git")
     except subprocess.TimeoutExpired:
-        return {}
+        p.kill()
+        p.communicate()
+        return None                         # the batch never answered — learn nothing, claim nothing
+    if p.returncode != 0:
+        return None                         # a fatal git error mid-stream: the map would be a lie
     res, i = {}, 0
     while i < len(out):
         nl = out.find(b"\n", i)
@@ -409,12 +455,25 @@ def batch_blobs(gitdir, shas):
 
 
 def scan_tip(gitdir, tip, cache):
-    """{path: {"blob": sha, "id": module_sha, "kind": "ast"|"raw"}} for every file at `tip`.
+    """{path: {"blob": sha, "id": module_sha|None, "kind": "ast"|"raw"|UNREADABLE}}, or None.
+
+    EVERY path `ls-tree` lists at `tip` appears in the result — that is the invariant the gate rests
+    on, since §3 asks whether "every file at its tip" resolves and a file that is not in the result
+    is a file nobody can ask about. A blob the object store will not produce is therefore recorded
+    with id=None and kind=UNREADABLE rather than dropped: it is a file at the tip whose content is
+    UNKNOWN, and unknown must surface as work, never as proof. (Dropping it silently made a fork
+    holding un-merged files report "SAFE TO OMIT (proven)" — the gate saw a shorter tip and every
+    file it could still see happened to resolve.)
+
+    None means the TIP ITSELF would not enumerate (ls-tree failed, or the blob batch never answered)
+    — nothing is known about any file, which `evolve` records as unreadable and the gate reports as
+    NOT SAFE.
 
     `cache` maps (blob_sha, is_python) -> (module_sha, kind) across the whole run: the forge is
     mostly ingestion duplicates, so the same blob is met over and over and normalizing it once
     matters. The key carries is_python because identity depends on the PATH's extension, not only
-    on the bytes — the same blob at a.py and at a.txt is a different module-sha by definition.
+    on the bytes — the same blob at a.py and at a.txt is a different module-sha by definition. Only
+    successfully READ blobs are cached, so one repo's missing object can never poison another's.
     """
     files = tip_files(gitdir, tip)
     if files is None:
@@ -422,6 +481,8 @@ def scan_tip(gitdir, tip, cache):
     want = [sha for sha, path in files
             if (sha, os.path.splitext(path)[1].lower() in PY_EXT) not in cache]
     blobs = batch_blobs(gitdir, want) if want else {}
+    if blobs is None:
+        return None                         # the batch never answered: the whole tip is UNKNOWN
     out = {}
     for sha, path in files:
         is_py = os.path.splitext(path)[1].lower() in PY_EXT
@@ -429,7 +490,11 @@ def scan_tip(gitdir, tip, cache):
         if key not in cache:
             raw = blobs.get(sha)
             if raw is None:
-                continue                    # unreadable blob: reported by the caller as a gap
+                # ls-tree lists it but cat-file will not produce it: keep the FILE, drop only the
+                # claim to know its content. id=None matches no home blob, so the gate lists it as
+                # unresolved work and the fork cannot be proven safe to omit.
+                out[path] = {"blob": sha, "id": None, "kind": UNREADABLE}
+                continue
             cache[key] = module_sha(raw, path)
         mid, kind = cache[key]
         out[path] = {"blob": sha, "id": mid, "kind": kind}
@@ -612,6 +677,13 @@ def gate(lin, remotes, scans, extra_homes=None):
     Every blob resolves -> "SAFE TO OMIT (proven)": proven, never assumed. Any blob unresolved ->
     the exact file list, which IS THE MERGE-HOME WORKLIST. The fork MUST NOT be dropped while that
     list is non-empty; it shrinks to empty exactly when the fork is safe to drop.
+
+    "EVERY FILE" INCLUDES THE UNREADABLE ONES. Because the rule is an IF AND ONLY IF, the SAFE
+    verdict is earned only by resolving every file — so a file whose blob the store will not produce
+    (id=None, kind=UNREADABLE; `ls-tree` still lists it) is unresolved BY DEFINITION and joins the
+    worklist with its reason. Unknown content is never proof, at either scale: an unreadable BLOB is
+    one worklist entry, while an unreadable TIP (sc is None) is NOT SAFE with the reason and an
+    empty worklist — a git that never answered is an environment failure, not a list of work.
     """
     canon = lin.get("canonical") or lin.get("candidate")
     homes = homes_for(lin, extra_homes)
@@ -622,6 +694,16 @@ def gate(lin, remotes, scans, extra_homes=None):
             home_missing.append(h)
             continue
         for path, rec in sc.items():
+            # An UNREADABLE file at the HOME has id=None and indexes NOTHING: a blob nobody could
+            # read is not evidence that anything came home. This is the SECOND of two independent
+            # guards and is redundant TODAY — the fork loop below tests `id is None` before it ever
+            # consults home_ids, so a None key here could not be matched even if it existed. It is
+            # kept because the two guards fail differently: this one keeps home_ids meaning exactly
+            # "content identities PROVEN present at a home", so any future reader of it (a second
+            # lookup, a reordered branch) inherits the invariant instead of a None that silently
+            # matches. Neither guard is load-bearing alone; do not remove both.
+            if rec["id"] is None:
+                continue
             home_ids.setdefault(rec["id"], []).append("%s:%s" % (h, path))
 
     forks = []
@@ -643,24 +725,47 @@ def gate(lin, remotes, scans, extra_homes=None):
                                   % ", ".join(home_missing)})
             forks.append(rec)
             continue
-        unresolved = []
+        unresolved, unreadable_here = [], 0
         for path in sorted(sc):
             f = sc[path]
-            if f["id"] not in home_ids:
+            if f["id"] is None:
+                # UNKNOWN CONTENT IS NEVER PROOF. This file is at the tip; whether it came home
+                # cannot be decided, so it counts as work and blocks the SAFE verdict.
+                unreadable_here += 1
+                unresolved.append({"path": path, "blob": f["blob"], "module_sha": None,
+                                   "identity": UNREADABLE,
+                                   "why": "blob %s is listed at this tip but the object store will "
+                                          "not produce it, so its content identity is UNKNOWN and "
+                                          "it cannot be proven to have come home" % f["blob"][:10]})
+            elif f["id"] not in home_ids:
                 unresolved.append({"path": path, "blob": f["blob"], "module_sha": f["id"],
                                    "identity": f["kind"]})
         rec.update({
             "files_at_tip": len(sc),
             "resolved": len(sc) - len(unresolved),
             "unresolved": unresolved,
+            "unreadable_at_tip": unreadable_here,
             "verdict": SAFE if not unresolved else NOT_SAFE,
         })
         if unresolved:
             rec["worklist_note"] = (
                 "THIS LIST IS THE MERGE-HOME WORKLIST: %d file(s) at %s's tip resolve to no blob "
-                "in %s. %s MUST NOT be dropped while this list is non-empty; it shrinks to empty "
+                "in %s%s. %s MUST NOT be dropped while this list is non-empty; it shrinks to empty "
                 "exactly when %s is safe to omit."
-                % (len(unresolved), m["repo"], " or ".join(homes), m["repo"], m["repo"]))
+                % (len(unresolved), m["repo"], " or ".join(homes),
+                   "" if not unreadable_here else
+                   " (%d of them because the blob itself is UNREADABLE — unknown content is listed "
+                   "as work, never assumed contained)" % unreadable_here,
+                   m["repo"], m["repo"]))
+        elif not sc:
+            # An empty result now means ONE thing only — a tip whose tree genuinely holds no files.
+            # It cannot mean "the read failed": a failed batch returns None (whole-tip UNKNOWN,
+            # handled above as NOT SAFE) and an unreadable blob keeps its entry. Saying "every one
+            # of the 0 files resolves — PROVEN contained" would still be vacuous phrasing that reads
+            # like a proof over real files, so the empty tree says what it actually is.
+            rec["worklist_note"] = (
+                "%s's tip holds NO files at all — an EMPTY tree, not an unread one — so there is "
+                "nothing to bring home and nothing to lose by omitting it." % m["repo"])
         else:
             rec["worklist_note"] = (
                 "every one of the %d file(s) at %s's tip resolves by content identity to a blob in "
@@ -735,15 +840,23 @@ def orphans(doc_lineages, scans):
                 if os.path.splitext(path)[1].lower() not in SOURCE_EXT:
                     continue
                 universe.add(rec["blob"])
-                universe_ids.add(rec["id"])
+                if rec["id"] is not None:
+                    universe_ids.add(rec["id"])
                 if m["repo"] == canon:
                     canon_blobs.add(rec["blob"])
-                    canon_ids.add(rec["id"])
+                    # an UNREADABLE canonical file (id=None) covers no CONTENT: its blob sha is
+                    # still real and still present at a canonical tip, but None must never enter
+                    # canon_ids or every unreadable fork file would read as "content came home".
+                    if rec["id"] is not None:
+                        canon_ids.add(rec["id"])
                 else:
                     holders[rec["blob"]].append({"lineage": lin["name"], "lineage_id": lin["id"],
                                                  "repo": m["repo"], "path": path,
                                                  "module_sha": rec["id"], "identity": rec["kind"]})
-                    non_ids[rec["id"]].add(rec["blob"])
+                    # an UNREADABLE blob HAS no module id, so it cannot be counted as one; it still
+                    # appears as a blob-sha orphan above, which is the report §4 asks for.
+                    if rec["id"] is not None:
+                        non_ids[rec["id"]].add(rec["blob"])
     rows = []
     for blob in sorted(holders):
         if blob in canon_blobs:
@@ -759,7 +872,10 @@ def orphans(doc_lineages, scans):
             "held_by": [{"repo": h["repo"], "path": h["path"]} for h in held],
             # a blob-sha orphan whose CONTENT is at a canonical tip came home with only
             # whitespace/comment drift: it is not lost, and the gate treats it as contained.
-            "content_came_home": held[0]["module_sha"] in canon_ids,
+            # An UNREADABLE blob (module_sha None) is never one of those: unknown content has not
+            # been shown to have come home, so it stays a live orphan.
+            "content_came_home": (held[0]["module_sha"] is not None
+                                  and held[0]["module_sha"] in canon_ids),
         })
     rows.sort(key=lambda r: (r["lineage"], r["path"], r["blob"]))
     return {
@@ -824,15 +940,54 @@ def load_family(path):
 
 
 def check_family(doc):
-    """Fail with ONE line if this is not a Part-1 document — never a KeyError deep in the run."""
+    """Fail with ONE line if this is not a usable Part-1 document — never a KeyError deep in the run.
+
+    THE CONTRACT THIS ENFORCES is "every key the run goes on to REQUIRE is present and the right
+    shape", not "some keys look familiar". A --family-json can be hand-edited, truncated, or written
+    by a different version of forge_family_tree.py, and a document that gets past this guard only to
+    die on `lineage['roots']` inside `timeline()` breaks the docstring's promise of exit 2 with one
+    line and no traceback. So the list below is kept in step with what the code dereferences
+    UNGUARDED: `roots` (timeline), `members[*].repo` and `members[*].tip` (timeline, gate, orphans).
+    Keys the code reads through .get() — canonical/candidate/topology/classification/commits — are
+    optional and deliberately NOT required here.
+    """
     if not isinstance(doc, dict) or "lineages" not in doc or "remotes" not in doc:
         raise ForgeError("this is not a forge_family_tree.py document: it has no 'lineages' and "
                          "'remotes' keys. Produce one with `forge_family_tree.py --json -`")
+    if not isinstance(doc["lineages"], list):
+        raise ForgeError("this document's 'lineages' is %s, not a list — is it from a different "
+                         "version of forge_family_tree.py?" % type(doc["lineages"]).__name__)
+    if not isinstance(doc["remotes"], str):
+        raise ForgeError("this document's 'remotes' is %s, not a path string — is it from a "
+                         "different version of forge_family_tree.py?"
+                         % type(doc["remotes"]).__name__)
     for lin in doc["lineages"]:
-        for key in ("id", "members", "name"):
+        if not isinstance(lin, dict):
+            raise ForgeError("a lineage in this document is %s, not an object — is it from a "
+                             "different version of forge_family_tree.py?" % type(lin).__name__)
+        # 'roots' and 'members[*].tip' are required because timeline()/gate()/orphans() index them
+        # directly; leaving them out of this check is what turns version skew into a KeyError.
+        for key in ("id", "members", "name", "roots"):
             if key not in lin:
-                raise ForgeError("a lineage in this document has no %r key — is it from a "
-                                 "different version of forge_family_tree.py?" % key)
+                raise ForgeError("lineage %r in this document has no %r key — is it from a "
+                                 "different version of forge_family_tree.py?"
+                                 % (lin.get("name", lin.get("id", "<unnamed>")), key))
+        for key in ("members", "roots"):
+            if not isinstance(lin[key], list):
+                raise ForgeError("lineage %r has a %r that is %s, not a list — is it from a "
+                                 "different version of forge_family_tree.py?"
+                                 % (lin.get("name", lin.get("id")), key,
+                                    type(lin[key]).__name__))
+        for m in lin["members"]:
+            if not isinstance(m, dict):
+                raise ForgeError("a member of lineage %r is %s, not an object — is it from a "
+                                 "different version of forge_family_tree.py?"
+                                 % (lin.get("name", lin.get("id")), type(m).__name__))
+            for key in ("repo", "tip"):
+                if key not in m:
+                    raise ForgeError("a member of lineage %r has no %r key — is it from a "
+                                     "different version of forge_family_tree.py?"
+                                     % (lin.get("name", lin.get("id")), key))
     return doc
 
 
@@ -855,7 +1010,8 @@ def evolve(family, only=None, extra_homes=None):
     if not os.path.isdir(remotes):
         raise ForgeError("the forge is not at %s (named by the Part-1 document) — pass --remotes"
                          % remotes)
-    lineages, cache, scans, unreadable = family["lineages"], {}, {}, []
+    lineages, cache, scans = family["lineages"], {}, {}
+    unreadable, unreadable_blobs = [], []
     for lin in lineages:
         for m in lin["members"]:
             gd = os.path.join(remotes, m["repo"])
@@ -868,6 +1024,18 @@ def evolve(family, only=None, extra_homes=None):
                                    "reason": "tip %s would not enumerate" % m["tip"][:10]})
                 continue
             scans[(lin["id"], m["repo"])] = sc
+            # PER-BLOB gaps are recorded too, not only whole-tip ones: a file ls-tree lists whose
+            # blob will not come out of the store is unknown content at a tip, and unknown content
+            # must be visible. It is already counted as work by the gate and kept in the orphan
+            # report; this list is the third place it shows, so no run can hide it.
+            for path in sorted(sc):
+                if sc[path]["id"] is None:
+                    unreadable_blobs.append({
+                        "repo": m["repo"], "lineage_id": lin["id"], "path": path,
+                        "blob": sc[path]["blob"],
+                        "reason": "listed at tip %s but the object store will not produce this "
+                                  "blob, so its content identity is UNKNOWN — it is counted as "
+                                  "unresolved work, never as contained" % m["tip"][:10]})
 
     orph = orphans(lineages, scans)              # over the WHOLE forge, before any --lineage filter
 
@@ -917,6 +1085,7 @@ def evolve(family, only=None, extra_homes=None):
             "lineages": len(rows),
             "members_scanned": len(scans),
             "unreadable": len(unreadable),
+            "unreadable_blobs": len(unreadable_blobs),
             "forks_examined": len(forks),
             "forks_safe_to_omit": len(safe),
             "forks_not_safe": len(unsafe),
@@ -928,6 +1097,7 @@ def evolve(family, only=None, extra_homes=None):
             "universe_module_ids": orph["universe_module_ids"],
         },
         "unreadable": unreadable,
+        "unreadable_blobs": unreadable_blobs,
         "orphan_report": orph,
         "lineages": rows,
     }
@@ -1018,6 +1188,10 @@ def render_gate(row, verbose=False, cap=12):
             continue
         L.append("        %d of %d file(s) at its tip resolve by content identity"
                  % (f.get("resolved", 0), f.get("files_at_tip", 0)))
+        if f.get("unreadable_at_tip"):
+            L.append("        %s at its tip UNREADABLE (listed by ls-tree, but the object store "
+                     "will not produce the blob): content UNKNOWN, so counted as work below, "
+                     "never as contained" % _plural(f["unreadable_at_tip"], "file"))
         if f["unresolved"]:
             L.append("        MERGE-HOME WORKLIST — %s NOT yet home:"
                      % _plural(len(f["unresolved"]), "file"))
@@ -1668,6 +1842,167 @@ def selftest():
         ck("--home: the extra home is named in the proof",
            f3 and "second_home.git" in f3["homes"], f3 and str(f3.get("homes")))
 
+        # ---- UNREADABLE BLOB: unknown content is WORK, never "proven contained" -----------------
+        # A fork holding an un-merged file must not become SAFE TO OMIT merely because that file's
+        # blob went unreadable. `ls-tree` still LISTS the file (only the blob is gone), so a scan
+        # that drops what it cannot read hands the gate a shorter tip in which every remaining file
+        # happens to resolve — and the fork's real work disappears from the worklist, the orphan
+        # report and the totals at once. The proof here is the whole pipeline, twice, over its own
+        # throwaway forge: the ONLY difference between the two runs is one deleted object file.
+        remotes_c = os.path.join(base, "remotes-corrupt")
+        os.makedirs(remotes_c)
+
+        def publish_c(w, name):
+            bare = os.path.join(remotes_c, name)
+            _sh(base, "init", "--bare", "--quiet", "--initial-branch=main", bare)
+            _sh(w, "push", "--quiet", bare, "main:main")
+            return bare
+
+        wch = work("corrupt")
+        commit(wch, "a.py", HOME_PY, "X: root", when="2026-04-01T00:00:00 +0000")
+        publish_c(wch, "corrupt_home.git")
+        wcf = os.path.join(base, "w-corrupt-fork")
+        _sh(base, "clone", "--quiet", os.path.join(remotes_c, "corrupt_home.git"), wcf)
+        commit(wcf, "unique.py", "def unique():\n    return 'never came home'\n",
+               "X/fork: a file that never came home", when="2026-04-02T00:00:00 +0000")
+        publish_c(wcf, "corrupt_fork.git")
+        # the home runs on so it wins on commit count and Part 1 nominates it canonical on topology
+        commit(wch, "b.py", "def b():\n    return 2\n", "X/home: runs on",
+               when="2026-04-03T00:00:00 +0000")
+        commit(wch, "c.py", "def c():\n    return 3\n", "X/home: runs on again",
+               when="2026-04-04T00:00:00 +0000")
+        _sh(wch, "push", "--quiet", os.path.join(remotes_c, "corrupt_home.git"), "main:main")
+        _sh(base, "--git-dir", os.path.join(remotes_c, "corrupt_home.git"), "fetch", "--quiet",
+            os.path.join(remotes_c, "corrupt_fork.git"), "+refs/heads/*:refs/remotes/fork/*")
+
+        def corrupt_run():
+            d = evolve(check_family(run_part1(tool, remotes=remotes_c)))
+            r = next((x for x in d["lineages"] if x["name"] == "corrupt_home"), None)
+            fk = next((x for x in r["gate"]["forks"] if x["repo"] == "corrupt_fork.git"),
+                      None) if r else None
+            return d, fk
+
+        docH, fH = corrupt_run()                       # run 1: the forge is intact
+        ck("UNREADABLE: (baseline) the fork holding an un-merged file is NOT SAFE, worklist "
+           "['unique.py'], 2 files at tip",
+           fH and fH["verdict"] == NOT_SAFE and fH["files_at_tip"] == 2
+           and [u["path"] for u in fH["unresolved"]] == ["unique.py"],
+           fH and "%s files_at_tip=%s worklist=%s"
+                  % (fH["verdict"], fH["files_at_tip"], [u["path"] for u in fH["unresolved"]]))
+        ck("UNREADABLE: (baseline) unique.py is an orphan and no blob is unreadable yet",
+           docH["orphan_report"]["orphan_blobs"] == 1
+           and docH["totals"]["unreadable_blobs"] == 0,
+           "orphans=%s unreadable_blobs=%s" % (docH["orphan_report"]["orphan_blobs"],
+                                               docH["totals"]["unreadable_blobs"]))
+
+        # now delete ONLY the loose object backing unique.py, exactly as the round-1 repro did
+        ctip = _sh(base, "--git-dir", os.path.join(remotes_c, "corrupt_fork.git"),
+                   "rev-parse", "refs/heads/main")
+        cblob = _sh(base, "--git-dir", os.path.join(remotes_c, "corrupt_fork.git"),
+                    "rev-parse", "%s:unique.py" % ctip)
+        obj = os.path.join(remotes_c, "corrupt_fork.git", "objects", cblob[:2], cblob[2:])
+        ck("UNREADABLE: the fork's blob is a loose object this check can remove",
+           os.path.exists(obj), obj)
+        if os.path.exists(obj):
+            os.remove(obj)
+        still = _sh(base, "--git-dir", os.path.join(remotes_c, "corrupt_fork.git"),
+                    "ls-tree", "-r", ctip)
+        rc_cat = subprocess.run(["git", "--git-dir", os.path.join(remotes_c, "corrupt_fork.git"),
+                                 "cat-file", "-p", cblob],
+                                capture_output=True, text=True).returncode
+        ck("UNREADABLE: the trap is real — ls-tree STILL lists unique.py while cat-file fails",
+           "unique.py" in still and rc_cat != 0, "ls-tree=%r cat-file rc=%s" % (still, rc_cat))
+
+        docC, fC = corrupt_run()                       # run 2: same command, one object gone
+        ck("UNREADABLE: the fork is STILL NOT SAFE TO OMIT — a missing object is not a proof",
+           fC and fC["verdict"] == NOT_SAFE, fC and fC["verdict"])
+        ck("UNREADABLE: the file is STILL counted at the tip (files_at_tip stays 2, not 1)",
+           fC and fC["files_at_tip"] == 2, fC and str(fC.get("files_at_tip")))
+        ck("UNREADABLE: unique.py is STILL the worklist — the work did not vanish with the blob",
+           fC and [u["path"] for u in fC["unresolved"]] == ["unique.py"],
+           fC and str([u["path"] for u in fC["unresolved"]]))
+        ck("UNREADABLE: the worklist entry is marked unreadable and says why, rather than "
+           "claiming an identity it does not have",
+           fC and fC["unresolved"][0]["identity"] == UNREADABLE
+           and fC["unresolved"][0]["module_sha"] is None
+           and "UNKNOWN" in fC["unresolved"][0]["why"],
+           fC and str(fC["unresolved"][0]))
+        ck("UNREADABLE: the gate counts it (unreadable_at_tip=1) and nothing resolved falsely",
+           fC and fC["unreadable_at_tip"] == 1 and fC["resolved"] == 1,
+           fC and "unreadable_at_tip=%s resolved=%s" % (fC.get("unreadable_at_tip"),
+                                                        fC.get("resolved")))
+        ck("UNREADABLE: it is STILL an orphan — the orphan report does not lose it either",
+           docC["orphan_report"]["orphan_blobs"] == 1
+           and docC["orphan_report"]["orphans"][0]["blob"] == cblob
+           and docC["orphan_report"]["orphans"][0]["content_came_home"] is False,
+           str(docC["orphan_report"]["orphan_blobs"]))
+        ck("UNREADABLE: totals report the gap (unreadable_blobs=1) — visible in the third output",
+           docC["totals"]["unreadable_blobs"] == 1
+           and docC["unreadable_blobs"][0]["path"] == "unique.py",
+           str(docC["totals"]["unreadable_blobs"]))
+        ck("UNREADABLE: the verdict is unchanged by the corruption — every field a reader acts on "
+           "matches the intact run",
+           fH and fC and (fH["verdict"], fH["files_at_tip"],
+                          [u["path"] for u in fH["unresolved"]])
+                      == (fC["verdict"], fC["files_at_tip"],
+                          [u["path"] for u in fC["unresolved"]]))
+        # the fork's own verdict LINE, not the whole page: the gate's summary line always spells
+        # out "N SAFE TO OMIT (proven) / M NOT safe", so searching the page for that phrase would
+        # match the tally and prove nothing about this fork.
+        gtxt = render(docC, want=("gate",))
+        fline = next((l for l in gtxt.splitlines()
+                      if l.strip().startswith("corrupt_fork.git")), "")
+        ck("UNREADABLE: the rendered gate calls the fork NOT SAFE and lists the file as work",
+           NOT_SAFE in fline and SAFE not in fline and "unique.py" in gtxt
+           and "MERGE-HOME WORKLIST" in gtxt, repr(fline))
+        ck("UNREADABLE: the rendered gate says the blob is unreadable rather than staying silent",
+           "UNREADABLE" in gtxt and "(unreadable)" in gtxt,
+           "no unreadable marker in the rendered gate")
+        # An unreadable blob at the HOME is the same trap wearing the other hat: two files nobody
+        # can read are not "the same file". Corrupt the home's b.py as well and the fork's
+        # unreadable unique.py must NOT resolve against it — were the unknown identity indexed as a
+        # home blob, every unreadable fork file would match it and prove itself contained.
+        hblob = _sh(base, "--git-dir", os.path.join(remotes_c, "corrupt_home.git"),
+                    "rev-parse", "refs/heads/main:b.py")
+        hobj = os.path.join(remotes_c, "corrupt_home.git", "objects", hblob[:2], hblob[2:])
+        if os.path.exists(hobj):
+            os.remove(hobj)
+        docB, fB = corrupt_run()
+        ck("UNREADABLE: an unreadable blob at the HOME resolves nothing — the fork is still NOT "
+           "SAFE and unique.py is still its worklist",
+           fB and fB["verdict"] == NOT_SAFE
+           and [u["path"] for u in fB["unresolved"]] == ["unique.py"],
+           fB and "%s worklist=%s" % (fB["verdict"], [u["path"] for u in fB["unresolved"]]))
+        ck("UNREADABLE: both gaps are reported (the fork's and the home's)",
+           docB["totals"]["unreadable_blobs"] == 2
+           and sorted(u["path"] for u in docB["unreadable_blobs"]) == ["b.py", "unique.py"],
+           str([(u["repo"], u["path"]) for u in docB["unreadable_blobs"]]))
+
+        # a whole-tip read failure was already NOT SAFE; prove the two paths agree rather than
+        # assuming the per-blob fix did not regress it.
+        ck("UNREADABLE: a whole-tip failure is still NOT SAFE too ('unknown is never safe')",
+           gate({"id": "x", "name": "x", "canonical": "h.git",
+                 "members": [{"repo": "h.git", "tip": "0" * 40},
+                             {"repo": "f.git", "tip": "1" * 40}]},
+                remotes_c, {("x", "h.git"): {}})["forks"][0]["verdict"] == NOT_SAFE)
+        # A 0-file tip may ONLY come from a genuinely empty tree now, so it must not borrow the
+        # language of a proof over real files — that sentence was a symptom of the round-1 defect.
+        empty = gate({"id": "e", "name": "e", "canonical": "h.git",
+                      "members": [{"repo": "h.git", "tip": "0" * 40},
+                                  {"repo": "f.git", "tip": "1" * 40}]},
+                     remotes_c, {("e", "h.git"): {}, ("e", "f.git"): {}})["forks"][0]
+        ck("EMPTY TIP: a genuinely empty tree is SAFE but says it is EMPTY, never 'every one of "
+           "the 0 file(s) resolves ... PROVEN contained'",
+           empty["verdict"] == SAFE and "NO files at all" in empty["worklist_note"]
+           and "0 file(s)" not in empty["worklist_note"],
+           empty["worklist_note"])
+        ck("UNREADABLE: batch_blobs is three-valued — 'nothing asked for' is {} but a FAILED batch "
+           "is None, so a git that never ran cannot be read as a store with no blobs",
+           batch_blobs(os.path.join(remotes_c, "corrupt_fork.git"), []) == {}
+           and batch_blobs(os.path.join(base, "not-a-git-repo-at-all"), [cblob]) is None)
+        ck("UNREADABLE: an unreadable TIP is a whole-tip UNKNOWN (None), never a short file list",
+           scan_tip(os.path.join(remotes_c, "corrupt_fork.git"), "0" * 40, {}) is None)
+
         # ---- refusals and errors explain themselves --------------------------------------------
         try:
             check_family({"nope": 1})
@@ -1675,6 +2010,69 @@ def selftest():
         except ForgeError as e:
             ck("ERRORS: a non-Part-1 document is refused with one clear line",
                "not a forge_family_tree.py document" in str(e), str(e))
+
+        # ---- VERSION SKEW: every key the run REQUIRES is guarded, with one line and no traceback -
+        # check_family is the tool's promise that a hand-edited, truncated or version-skewed
+        # --family-json exits 2 with one line. A key it does not check but the run dereferences
+        # anyway (roots in timeline(), tip in gate()/timeline()) breaks that promise with a raw
+        # KeyError, so each required key is checked by REMOVING it from a document Part 1 really
+        # produced and running the SAME entry point the CLI runs.
+        good = json.loads(json.dumps(family))          # a real Part-1 document, deep-copied
+        skews = [
+            ("a lineage with no 'roots'", lambda d: d["lineages"][0].pop("roots"), "roots"),
+            ("a lineage with no 'members'", lambda d: d["lineages"][0].pop("members"), "members"),
+            ("a lineage with no 'id'", lambda d: d["lineages"][0].pop("id"), "id"),
+            ("a lineage with no 'name'", lambda d: d["lineages"][0].pop("name"), "name"),
+            ("a member with no 'tip'", lambda d: d["lineages"][0]["members"][0].pop("tip"), "tip"),
+            ("a member with no 'repo'", lambda d: d["lineages"][0]["members"][0].pop("repo"),
+             "repo"),
+        ]
+        for label, break_it, key in skews:
+            d = json.loads(json.dumps(good))
+            break_it(d)
+            try:
+                check_family(d)
+                ck("SKEW: %s is refused" % label, False, "it was accepted")
+            except ForgeError as e:
+                ck("SKEW: %s is refused with ONE line naming %r" % (label, key),
+                   key in str(e) and "\n" not in str(e), str(e))
+            except KeyError as e:
+                ck("SKEW: %s is refused" % label, False, "raw KeyError %s — the guard missed it" % e)
+        for label, break_it in [("'lineages' that is not a list",
+                                 lambda d: d.update({"lineages": {"a": 1}})),
+                                ("'remotes' that is not a path",
+                                 lambda d: d.update({"remotes": 7})),
+                                ("a lineage that is not an object",
+                                 lambda d: d.update({"lineages": ["nope"]})),
+                                ("a member that is not an object",
+                                 lambda d: d["lineages"][0].update({"members": ["nope"]}))]:
+            d = json.loads(json.dumps(good))
+            break_it(d)
+            try:
+                check_family(d)
+                ck("SKEW: %s is refused" % label, False, "it was accepted")
+            except ForgeError as e:
+                ck("SKEW: %s is refused with one line" % label, "\n" not in str(e), str(e))
+            except (KeyError, TypeError, AttributeError) as e:
+                ck("SKEW: %s is refused" % label, False,
+                   "raw %s: %s — the guard missed it" % (type(e).__name__, e))
+        ck("SKEW: the UNBROKEN document still passes the guard (it refuses skew, not everything)",
+           check_family(json.loads(json.dumps(good))) is not None)
+        ck("SKEW: optional keys Part 1 may omit are NOT required (they are read via .get)",
+           bool(check_family(dict(good, lineages=[
+               dict(l, **{k: None for k in ()}) for l in good["lineages"]]))))
+        d = json.loads(json.dumps(good))
+        for l in d["lineages"]:
+            for k in ("canonical", "candidate", "topology", "classification", "member_count"):
+                l.pop(k, None)
+            for m in l["members"]:
+                m.pop("commits", None)
+        try:
+            ck("SKEW: a document missing only OPTIONAL keys runs end to end (no over-strict guard)",
+               bool(evolve(check_family(d))))
+        except (ForgeError, KeyError) as e:
+            ck("SKEW: a document missing only OPTIONAL keys runs end to end (no over-strict guard)",
+               False, "%s: %s" % (type(e).__name__, e))
         try:
             parse_homes(["garbage"])
             ck("ERRORS: a malformed --home is refused with one clear line", False)
