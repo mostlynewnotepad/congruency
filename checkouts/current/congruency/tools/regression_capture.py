@@ -89,8 +89,10 @@ TOGGLE — DEFAULT OFF, and OFF is a byte-for-byte no-op:
                                change. An explicit `on`/`off` outranks the registry.
 
 USAGE — this module is a LIBRARY with a self-proving CLI. It is called by pair_loop through a thin
-hook (`--print-hook` prints the exact patch; the hook is two one-line calls, deliberately NOT a
-pair_loop rewrite — the #279 regression came from exactly that):
+hook: two one-line calls (guard() before the commit, capture() after a fail verdict) plus an import,
+a flag, and ONE changed line at the verdict journal — five small sites, deliberately NOT a pair_loop
+rewrite, because the #279 regression came from exactly that. `--print-hook` prints the exact patch
+and --selftest checks every line it quotes against the live pair_loop:
 
     python3 regression_capture.py --selftest        # prove the method; no network, no db, no repo writes
     python3 regression_capture.py --verify-scope    # re-prove the scoping claims above against pair_loop
@@ -1124,9 +1126,11 @@ def _note(out, extra=""):
 
 # ── the pair_loop hook, stated exactly (this module does not edit pair_loop.py) ──────────────────
 HOOK_PATCH = '''\
-THE pair_loop.py HOOK — four inserted lines and one changed line, in three places. #440 asks for a
-MINIMAL pair_loop change on purpose: the #279 regression came from a large pair_loop rewrite, so this
-module carries all of the logic and pair_loop only calls it.
+THE pair_loop.py HOOK — five small sites: an import, a flag, TWO one-line calls (the guard and the
+capture), and ONE changed line at the verdict journal. #440 asks for a MINIMAL pair_loop change on
+purpose: the #279 regression came from a large pair_loop rewrite, so this module carries all of the
+logic and pair_loop only calls it. Sites 4 and 5 are BOTH required and neither is optional — they are
+two different join sites over the same findings, and the one in 4 fires first (see 4).
 
 THIS PATCH IS NOT APPLIED BY THIS MODULE, and could not be: ticket #440's worker mandate is "write it
 to checkouts/current/congruency/tools/regression_capture.py (create or overwrite that file; touch
@@ -1156,7 +1160,35 @@ its own ticket. `--verify-scope` reports whether it is installed in the live pai
 
    + regression_capture.guard(wt["path"], tid, a.regression_capture)
 
-4) after the fail verdict — the single hook. It replaces the existing `findings = ...` line:
+4) the VERDICT JOURNAL, immediately after `vres = step("validate: ...` — one changed line. This site
+   is not optional and it is not the hook: it FIRES FIRST. pair_loop journals every verdict before it
+   branches on pass/fail, and that note joins the findings —
+
+       "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
+                      ("; findings: " + "; ".join(vres.get("findings", []))) if vres.get("findings") else "")
+
+   — so the per-finding repro spelling (a dict in `findings`) raises `TypeError: sequence item 0:
+   expected str instance, dict found` HERE, ~50 lines before the hook in (5) could ever flatten it.
+   In pair_loop a TypeError is not a round outcome: it is an unexpected crash, a Variant-A bug report
+   and exit 2. Patching only (5) would ship a schema whose third spelling kills the harness:
+
+   + rc_on = regression_capture.capture_enabled(a.regression_capture)
+     rest("ticket.progress", {"ticket_id": tid, "agent_id": auditor,
+                              "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
+   -                                 ("; findings: " + "; ".join(vres.get("findings", [])))
+   +                                 ("; findings: " + "; ".join(
+   +                                     regression_capture.worker_findings(vres, rc_on) if rc_on
+   +                                     else vres.get("findings", [])))
+                                      if vres.get("findings") else ""),
+                              "steps_remaining": 1 if vres.get("verdict") == "pass" else 3})
+
+   The `if rc_on else vres.get("findings", [])` arm is deliberate and load-bearing for the toggle.
+   With capture OFF this line evaluates the ORIGINAL expression, character for character — so OFF
+   keeps today's behavior exactly, INCLUDING today's TypeError on a dict finding. That is the correct
+   reading of "OFF is byte-for-byte unchanged": OFF must not fix things either. The structured-repro
+   schema is opt-in, so nothing files a dict finding while capture is off.
+
+5) after the fail verdict — the capture hook. It replaces the existing `findings = ...` line:
 
    - findings = vres.get("findings", ["(none given)"])
    + rc = regression_capture.capture(wt["path"], tid, a.deliverable, pkg, body, vres, rnd,
@@ -1170,13 +1202,18 @@ its own ticket. `--verify-scope` reports whether it is installed in the live pai
    worker_findings() replaces the raw `.get("findings")` for two reasons, and with capture OFF it
    returns a list of plain strings UNCHANGED, byte for byte (--selftest checks that identity):
      * the per-finding repro spelling puts a dict in `findings`, which pair_loop's
-       `"; ".join(vres.get("findings", []))` would raise on;
+       `"; ".join(vres.get("findings", []))` would raise on — at BOTH join sites, which is why (4)
+       exists as well as this one;
      * it is the single place the worker-facing text is scrubbed, and because harvest() composes
        lessons from these same findings and --compile-playbook compiles the playbook from those
        lessons, scrubbing here keeps the mechanism out of docs/PLAYBOOK.md too.
 
 NOTHING ELSE CHANGES. No verdict is touched, no ordering is touched — in particular ticket.assign
 still runs before process_status ACTIVE in pair(), which is the #279 regression and must stay.
+
+Every anchor line quoted above is checked against the LIVE pair_loop.py by --selftest (see "the hook
+patch applies to the pair_loop that is actually here"), because a patch citing a line that has since
+moved is a patch that cannot be applied as written — this repo's own playbook, Theme 1.
 '''
 
 
@@ -1285,7 +1322,7 @@ def verify_scope():
             if not ok:
                 print("        %s" % detail)
         print("\nSee WORKER-IMMUTABILITY in this module's docstring: the package case is why guard() "
-              "exists.\nRun --print-hook for the two call sites.")
+              "exists.\nRun --print-hook for all five of the hook's sites.")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1488,6 +1525,35 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
                           "clamp", "clamp", [10, 0, 5], {}) == ["return", 5])
         ck("nothing is executed inside the repo: the candidate is copied to a temp dir",
            not os.path.exists(os.path.join(ROOT, "_rc_runner.py")))
+
+        # The child's environment is STRIPPED (_clean_env()), and that is load-bearing rather than
+        # hygiene. The candidate dir holds exactly ONE module, so an original that imports a sibling
+        # fails closed to `import_error` and capture() rejects the repro before minting anything —
+        # but only while the child's sys.path is the throwaway dir and the stdlib. A stray PYTHONPATH
+        # re-opens the one door this module exists to keep shut: some OTHER tree's module answering
+        # for the original's, which is `expected` defined by code that is not the oracle.
+        # Proven by poisoning, not by reading the dict: the first check alone passes happily while
+        # the second is broken (mutation-tested — `env = dict(os.environ)` survives it).
+        ck("_clean_env() strips PYTHONPATH/PYTHONSTARTUP and forbids .pyc in the child",
+           "PYTHONPATH" not in _clean_env() and "PYTHONSTARTUP" not in _clean_env()
+           and _clean_env().get("PYTHONDONTWRITEBYTECODE") == "1", str(sorted(_clean_env())[:6]))
+        poison = os.path.join(tmp, "poison")
+        os.makedirs(poison, exist_ok=True)
+        with open(os.path.join(poison, "rc_helper.py"), "w") as fh:
+            fh.write("def scale(v, lo, hi):\n    return 999      # NOT the original's code\n")
+        importing = "from rc_helper import scale\n\n\ndef clamp(v, lo, hi):\n    return scale(v, lo, hi)\n"
+        was = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = poison
+        try:
+            poisoned = run_entrypoint(importing, "clamp", "clamp", [10, 0, 5], {})
+        finally:
+            if was is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = was
+        ck("a stray PYTHONPATH cannot answer for the oracle: a foreign sibling is unimportable, so the "
+           "capture fails closed (import_error) instead of minting 999 as the ORIGINAL's answer",
+           poisoned[0] == "import_error", str(poisoned))
 
         # ── the happy path: capture on the synthetic unit ──
         print("-- 3/4. mint + the validation invariant (red-on-buggy, green-on-original, mutation)")
@@ -1934,6 +2000,64 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
         ck("the documented hook patch itself is stated, not applied (pair_loop.py is not this "
            "deliverable and an edit to it would be reaped as a stray)",
            "does not edit pair_loop" in HOOK_PATCH or "NOT APPLIED BY THIS MODULE" in HOOK_PATCH)
+
+        # ── 5e. the hook patch applies to the pair_loop that is actually here ──
+        # A patch is a promise that the reader will find what it quotes at the site it names. This
+        # module cannot apply it (the mandate is one file), so the patch is a DOCUMENT — and an
+        # unexecuted document rots against code that moves under it (the playbook's Theme 1: a stale
+        # citation you carried forward is your finding, not the previous author's). So every anchor
+        # it quotes is checked against the LIVE pair_loop source, and the one line whose behavior the
+        # patch actually changes is EXECUTED here, in all three states.
+        print("-- 5e. the documented hook patch still fits the LIVE pair_loop")
+        try:
+            _pl2 = _import_pair_loop()
+            pls = _read_text(os.path.abspath(_pl2.__file__)) or ""
+            for label, anchor in (
+                    ("the import site (`import urllib.request`)", "import urllib.request"),
+                    ("the parser site (`--package-commit` to sit beside)", '"--package-commit"'),
+                    ("the guard site (`cm = step(\"commit:`)", 'cm = step("commit:'),
+                    ("the verdict-journal join the patch's step 4 replaces",
+                     '"; ".join(vres.get("findings", []))'),
+                    ("the fail-hook line the patch's step 5 replaces",
+                     'findings = vres.get("findings", ["(none given)"])')):
+                ck("hook anchor still present in pair_loop.py: %s" % label, anchor in pls,
+                   "the patch quotes it, but pair_loop no longer contains it — the patch must follow")
+            # ORDERING is the whole reason step 4 exists: the verdict journal must come BEFORE the
+            # fail-hook line, or a dict finding could never reach the join first.
+            ck("...and the verdict journal really does run BEFORE the fail hook (else step 4 is moot)",
+               -1 < pls.find('"; ".join(vres.get("findings", []))')
+               < pls.find('findings = vres.get("findings", ["(none given)"])'))
+        except ImportError as e:
+            ck("pair_loop importable for the hook-anchor check", False, str(e))
+
+        # The dict spelling repros() documents, run through pair_loop's REAL verdict-journal
+        # expression — raw, then patched-ON, then patched-OFF.
+        dict_v = {"verdict": "fail", "findings": [{"finding": "clamp is wrong at the bound", "repro": rep}]}
+
+        def _journal(v, on, patched):
+            """pair_loop.py's verdict-journal note, verbatim; `patched` picks the patch's step-4 arm."""
+            src = (worker_findings(v, on) if on else v.get("findings", [])) if patched \
+                else v.get("findings", [])
+            return "round %d verdict: %s%s" % (1, v.get("verdict"),
+                                               ("; findings: " + "; ".join(src)) if v.get("findings") else "")
+        try:
+            _journal(dict_v, False, patched=False)
+            ck("UNPATCHED, a dict finding raises at pair_loop's verdict journal (this is why the "
+               "patch's step 4 exists, not just step 5)", False, "no raise — step 4 would be needless")
+        except TypeError:
+            ck("UNPATCHED, a dict finding raises at pair_loop's verdict journal (this is why the "
+               "patch's step 4 exists, not just step 5)", True)
+        ck("PATCHED + capture ON, the same verdict journals as prose and never raises",
+           _journal(dict_v, True, patched=True) == "round 1 verdict: fail; findings: clamp is wrong at the bound",
+           _journal(dict_v, True, patched=True))
+        ck("PATCHED + capture ON, that journal line leaks no capture marker either",
+           leaks_capture(_journal(nasty_v, True, patched=True)) == [])
+        plain_v = {"verdict": "fail", "findings": ["a finding", "another"]}
+        ck("PATCHED + capture OFF is byte-for-byte the UNPATCHED line (OFF fixes nothing and "
+           "breaks nothing)",
+           _journal(plain_v, False, patched=True) == _journal(plain_v, False, patched=False)
+           == "round 1 verdict: fail; findings: a finding; another",
+           _journal(plain_v, False, patched=True))
 
         # ── 7. OFF changes nothing ──
         print("-- 7. OFF is a byte-for-byte no-op")
