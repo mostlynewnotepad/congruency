@@ -96,7 +96,30 @@ GRAB-BAG whose packages belong to SEVERAL DIFFERENT home repos. agent_tools_suit
 jail is NOT canonical and NOT a destination. The direction is REVERSED from what the topology
 suggests: jail merges HOME into agent_tools_suite and is then omitted. That decision is an
 operator fact, not a measurement, so it lives in OPERATOR_OVERRIDES below as data, applied like
-any `--override`, and this tool never names jail canonical.
+any `--override`.
+
+HOW "NEVER NAMES JAIL CANONICAL" IS ACTUALLY GUARANTEED. Being the default is not enough — the
+question is what happens when something goes WRONG, because raw topology nominates jail and every
+failure that discards the operator's decision therefore lands on the forbidden answer. Two
+independent mechanisms, either of which alone would hold:
+
+  * LAYERS THAT FALL THROUGH, NOT AWAY. The operator layers are separate and ordered: this run's
+    --override, then OPERATOR_OVERRIDES, then topology. A refused entry falls through to the NEXT
+    layer, so refusing an --override lands on the built-in rule, never on topology. (This is the
+    fix for a real defect: the command line was once MERGED into OPERATOR_OVERRIDES, so the typo
+    `--override 379ac05319=agent_tools_suite` — missing `.git` — overwrote the rule's canonical,
+    failed validation as a non-member, and dropped the family to topology, printing jail.git as
+    CANONICAL while exiting 0.)
+  * A HARD CONSTRAINT, CHECKED SEPARATELY. NEVER_CANONICAL lists jail.git as a ruled-out
+    destination. `build` refuses to emit ANY lineage naming a listed repo canonical, whatever the
+    topology says and whatever an override asks for — including `--override 379ac05319=jail.git`,
+    which names a perfectly real member and which no typo-check could ever catch. This check does
+    not depend on a rule lookup succeeding, so it holds even if the rule above is deleted.
+
+Both refuse the run with exit 2 and a message, rather than emitting a jail-canonical tree — a
+forbidden answer is never printed, and never printed with a 0 exit. To genuinely reverse the
+decision, edit OPERATOR_OVERRIDES / NEVER_CANONICAL: a deliberate, reviewable edit to the
+operator's own data, not a flag. --selftest proves every one of these paths.
 
 DO NOT USE omni.git AS THE SOURCE OF TRUTH — it is incomplete. It is not one of the 264 repos
 under remotes/ at all; it sits at config/forge/archives/omni.git, and it is missing
@@ -129,8 +152,9 @@ sys.dont_write_bytecode = True   # importing/being imported must not litter .pyc
 
 # ── the operator's decisions ──────────────────────────────────────────────────────────────────
 # Data, not logic. Keyed by LINEAGE ID (the sorted short root-commit shas of the family, joined by
-# '+') — a name is not stable across ingestions, a root set is. Each entry is applied exactly the
-# way a --override flag is, and can itself be overridden on the command line.
+# '+') — a name is not stable across ingestions, a root set is. This is the operator's own layer:
+# a --override on the command line is tried FIRST, but if it is invalid this layer still applies.
+# A bad command line can NEVER erase an operator decision back down to raw topology.
 OPERATOR_OVERRIDES = {
     "379ac05319": {
         "classification": "FORK-CAME-HOME",
@@ -143,6 +167,28 @@ OPERATOR_OVERRIDES = {
         "source": "ticket #445 §4 — operator-defined, not derived from the DAG",
     },
 }
+
+# Repos the operator has ruled OUT as a destination, mapped to why. This is a HARD CONSTRAINT, not
+# a default: no topology and no --override can name one of these canonical. Where OPERATOR_OVERRIDES
+# says what the answer IS for a lineage, this says what the answer may never BE, for every lineage,
+# whether or not a rule covers it. The two are checked independently on purpose — the guarantee
+# "this tool never names jail canonical" must not depend on a rule lookup succeeding.
+#
+# WHY A HARD CONSTRAINT AND NOT JUST A DEFAULT. Ticket #445 §4 is unconditional: jail is NOT
+# canonical and NOT a destination. An override is how an operator supplies INTENT the DAG cannot
+# hold (§3 FORK-CAME-HOME) — it is not a way to contradict a decision the operator already made.
+# So a run that would name a repo below canonical is REFUSED (exit 2) rather than emitted. To
+# genuinely reverse this decision, edit this dict: it is the operator's data, and changing it is a
+# deliberate, reviewable edit — not a typo on a command line.
+NEVER_CANONICAL = {
+    "jail.git": "jail is an expedient grab-bag whose packages belong to several different home "
+                "repos, cleaned up in a hurry — it merges HOME and is then omitted, so it can "
+                "never be a merge destination (ticket #445 §4)",
+}
+
+# where an operator entry came from, used in notes and in the JSON's `override_source`
+USER_LAYER = "the --override / --override-file supplied on this run"
+BUILTIN_LAYER = "the built-in operator rule (OPERATOR_OVERRIDES)"
 
 IDENTICAL, LINEAR, DIVERGED, SPLIT_STORE = "IDENTICAL", "LINEAR", "DIVERGED", "SPLIT-STORE"
 FORK_CAME_HOME = "FORK-CAME-HOME"
@@ -418,8 +464,13 @@ def _union_store(members, scratch):
     return union
 
 
-def classify(roots, members, overrides=None):
-    """Classify one lineage. Returns the lineage record described in the module docstring."""
+def classify(roots, members, overrides=None, builtins=None, never=None):
+    """Classify one lineage. Returns the lineage record described in the module docstring.
+
+    `overrides` is THIS RUN's operator layer (--override / --override-file) and `builtins` the
+    standing one (OPERATOR_OVERRIDES); they are kept apart all the way down to `_apply_overrides`,
+    which explains why. `never` is the ruled-out-destination map (NEVER_CANONICAL).
+    """
     lid = lineage_id(roots)
     tips = {m["repo"]: m["tip"] for m in members}
     lin = {
@@ -438,7 +489,7 @@ def classify(roots, members, overrides=None):
         lin.update({"topology": IDENTICAL, "candidate": cand["repo"], "tip": cand["tip"],
                     "stale_aliases": [], "duplicates": [m["repo"] for m in members
                                                         if m["repo"] != cand["repo"]]})
-        return _apply_overrides(lin, members, overrides)
+        return _apply_overrides(lin, members, overrides, builtins, never)
 
     cand = pick_candidate(members)
     store = cand["gitdir"]
@@ -459,7 +510,7 @@ def classify(roots, members, overrides=None):
                 lin["notes"].append(
                     "fetched every member into a scratch store and these tips are STILL absent, "
                     "so the object is nowhere in the forge: %s" % ", ".join(still))
-                return _apply_overrides(lin, members, overrides)
+                return _apply_overrides(lin, members, overrides, builtins, never)
             sub = _classify_in_store(union, roots, members, tips)
             lin["resolved_as"] = sub["topology"]
             lin["resolved"] = sub
@@ -470,12 +521,12 @@ def classify(roots, members, overrides=None):
                 "re-classifies there as %s (it is NOT unknown)" % (cand["repo"], sub["topology"]))
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
-        return _apply_overrides(lin, members, overrides)
+        return _apply_overrides(lin, members, overrides, builtins, never)
 
     # 3/4. LINEAR or DIVERGED, decided in the candidate's own store (which holds every tip).
     sub = _classify_in_store(store, roots, members, tips)
     lin.update(sub)
-    return _apply_overrides(lin, members, overrides)
+    return _apply_overrides(lin, members, overrides, builtins, never)
 
 
 def _classify_in_store(store, roots, members, tips):
@@ -516,37 +567,48 @@ def _classify_in_store(store, roots, members, tips):
                               **divergence(store, ctip, tips[m["repo"]])) for m in apart]}
 
 
-def _apply_overrides(lin, members, overrides):
-    """Set `classification` and the PROPOSED direction; let an operator override the direction.
+def _reject_reason(ov, names, never, candidate=None):
+    """Why this operator entry CANNOT be applied to this lineage, or None if it can.
 
-    Direction is never auto-decided for a fork: the topology is reported, a direction is PROPOSED,
-    and an override replaces it. Without an override, classification == topology.
+    An entry is refused when it names a repo that is not a member (a typo — the common case), when
+    applying it would name a ruled-out repo canonical, or when it makes a repo its own fork. The
+    caller must never apply a refused entry, and must never treat a refusal as "no decision".
     """
-    lin.setdefault("classification", lin["topology"])
-    lin["classification"] = lin["topology"]
-    lin["canonical"] = lin.get("candidate")
-    lin["override_applied"] = False
-    lin["proposed_direction"] = _propose(lin)
-
-    ov = (overrides or {}).get(lin["id"])
-    if not ov:
-        lin["name"] = _name_of(lin)
-        return lin
-
-    names = {m["repo"] for m in members}
     for key in ("canonical", "fork"):
-        if ov.get(key) and ov[key] not in names:
-            lin["notes"].append(
-                "override names %s=%s, which is NOT a member of this lineage — override IGNORED, "
-                "the topology stands" % (key, ov[key]))
-            lin["name"] = _name_of(lin)
-            return lin
+        v = ov.get(key)
+        if v and v not in names:
+            hint = ""
+            if v + ".git" in names:
+                hint = " — did you mean %s.git?" % v
+            else:
+                near = [n for n in sorted(names) if n.lower() in (v.lower(), v.lower() + ".git")]
+                if near:
+                    hint = " — did you mean %s?" % near[0]
+            return ("names %s=%s, which is not a member of this lineage%s (members: %s)"
+                    % (key, v, hint, ", ".join(sorted(names))))
+    # What this entry would ACTUALLY make canonical, which is what must be judged — not merely what
+    # it says. An entry with no `canonical` key still decides one: the topological candidate. That
+    # is how `{"classification": "LINEAR"}` alone, naming nothing at all, once landed on jail.git.
+    effective = ov.get("canonical") or candidate
+    if effective in never:
+        return ("would name %s canonical, which the operator has ruled OUT as a destination: %s"
+                % (effective, never[effective]))
+    # same reasoning for the fork: absent a `fork` key it defaults to the candidate, and a family
+    # whose fork and home are one repo describes a merge into itself
+    if ov.get("classification") == FORK_CAME_HOME and (ov.get("fork") or candidate) == effective:
+        return ("names %s as BOTH the fork and the home — a fork cannot merge into itself"
+                % effective)
+    return None
 
+
+def _use_override(lin, ov, source):
+    """Apply one VALIDATED operator entry to a lineage record. Never call this on a refused entry."""
     if ov.get("classification"):
         lin["classification"] = ov["classification"]
     if ov.get("canonical"):
         lin["canonical"] = ov["canonical"]
     lin["override_applied"] = True
+    lin["override_source"] = source
     lin["override"] = {k: v for k, v in ov.items() if k in ("classification", "canonical", "fork",
                                                             "why", "source")}
     if lin["classification"] == FORK_CAME_HOME:
@@ -561,6 +623,54 @@ def _apply_overrides(lin, members, overrides):
             % (fork, lin["canonical"], fork, fork, ov.get("why", "")))
     else:
         lin["proposed_direction"] = _propose(lin)
+
+
+def _apply_overrides(lin, members, overrides=None, builtins=None, never=None):
+    """Set `classification` and the PROPOSED direction, letting an operator override the direction.
+
+    Direction is never auto-decided for a fork: the topology is reported, a direction is PROPOSED,
+    and a valid operator entry replaces it. With no entry at all, classification == topology.
+
+    PRECEDENCE — first VALID layer wins, and a refused layer falls through to the NEXT one:
+
+        1. this run's --override / --override-file   (the operator speaking now)
+        2. OPERATOR_OVERRIDES                        (the operator's standing decision)
+        3. the topology                              (what the DAG alone proves)
+
+    WHY THE FALLTHROUGH MATTERS — this is the bug this structure exists to prevent. A refused
+    entry is NOT a decision, so it must not be able to CONSUME the layer below it. Earlier this
+    tool merged the command line into OPERATOR_OVERRIDES and validated the merged result: a single
+    typo (`--override 379ac05319=agent_tools_suite`, missing `.git`) overwrote the jail rule's
+    canonical, failed validation as a non-member, and dropped the family all the way to raw
+    topology — which nominates jail.git, the one thing ticket #445 §4 forbids. The layers are kept
+    SEPARATE here so that refusing layer 1 lands on layer 2, never on layer 3.
+
+    Refusals are recorded in `rejected_overrides` (and in the notes) rather than swallowed; `build`
+    turns a refused USER entry into a non-zero exit, so a typo can never quietly change the answer.
+    """
+    never = NEVER_CANONICAL if never is None else never
+    names = {m["repo"] for m in members}
+
+    lin["classification"] = lin["topology"]
+    lin["canonical"] = lin.get("candidate")
+    lin["override_applied"] = False
+    lin["override_source"] = None
+    lin["rejected_overrides"] = []
+    lin["proposed_direction"] = _propose(lin)
+
+    layers = [(src, table.get(lin["id"]))
+              for src, table in ((USER_LAYER, overrides or {}), (BUILTIN_LAYER, builtins or {}))]
+    layers = [(src, ent) for src, ent in layers if ent]
+
+    for i, (src, ent) in enumerate(layers):
+        why = _reject_reason(ent, names, never, lin.get("candidate"))
+        if why is None:
+            _use_override(lin, ent, src)
+            break
+        nxt = ("falling back to %s" % layers[i + 1][0] if i + 1 < len(layers)
+               else "no operator decision remains for this lineage, so the TOPOLOGY stands")
+        lin["rejected_overrides"].append({"source": src, "reason": why, "entry": dict(ent)})
+        lin["notes"].append("%s REJECTED: it %s. %s." % (src, why, nxt))
     lin["name"] = _name_of(lin)
     return lin
 
@@ -599,14 +709,61 @@ def _propose(lin):
 
 # ── build the whole tree ──────────────────────────────────────────────────────────────────────
 
-def build(remotes, overrides=None, only=None):
-    """Discover, cluster, and classify the whole forge. Returns the JSON-able document."""
+def build(remotes, overrides=None, only=None, builtins=None, never_canonical=None, strict=False):
+    """Discover, cluster, and classify the whole forge. Returns the JSON-able document.
+
+      overrides        THIS RUN's operator layer, from --override / --override-file. Default none.
+      builtins         the standing operator layer. Defaults to OPERATOR_OVERRIDES; the selftest
+                       passes its own so it can drive the real rule SHAPE over throwaway repos.
+      never_canonical  repos that may never be named canonical. Defaults to NEVER_CANONICAL.
+      strict           raise on a refused USER override instead of only noting it. The CLI passes
+                       True: a typo must not quietly produce a different answer.
+
+    Two guarantees are enforced here, AFTER classification and BEFORE anything is emitted, so no
+    caller can print a tree that breaks them:
+
+      1. no lineage names a NEVER_CANONICAL repo canonical — checked over EVERY lineage, not just
+         overridden ones, and independently of whether any rule matched. This is what actually
+         backs "this tool never names jail canonical": it holds even if the rule is deleted.
+      2. under `strict`, a refused user override fails the run rather than changing the answer.
+    """
     if not have_git():
         raise ForgeError("git is not on PATH — this tool needs git")
-    overrides = dict(OPERATOR_OVERRIDES if overrides is None else overrides)
+    overrides = dict(overrides or {})
+    builtins = dict(OPERATOR_OVERRIDES if builtins is None else builtins)
+    never = dict(NEVER_CANONICAL if never_canonical is None else never_canonical)
     members, no_refs = survey(remotes)
     fams = cluster(members)
-    lineages = [classify(roots, ms, overrides) for roots, ms in fams]
+    lineages = [classify(roots, ms, overrides, builtins, never) for roots, ms in fams]
+
+    # (1) the hard constraint, checked before --lineage filtering so a filter cannot hide a breach
+    breach = [l for l in lineages if l.get("canonical") in never]
+    if breach:
+        l = breach[0]
+        raise ForgeError(
+            "REFUSING to emit this tree: lineage %s (%s) names %s canonical, which is ruled out "
+            "as a destination — %s. No valid operator rule covered this lineage, so the raw "
+            "topology nominated it; restore its entry in OPERATOR_OVERRIDES."
+            % (l["id"], l["name"], l["canonical"], never[l["canonical"]]))
+
+    # (2) a refused user override is an input error: say so and emit nothing
+    if strict:
+        bad = []
+        for l in lineages:
+            for r in l["rejected_overrides"]:
+                if r["source"] != USER_LAYER:
+                    continue
+                # say which answer the refusal left in place, and be exact about WHY it stands:
+                # an operator rule and a bare topology are not the same fallback
+                stands = ("the operator's standing decision for it (canonical=%s) is untouched"
+                          % l["canonical"] if l["override_applied"] else
+                          "no operator rule covers this lineage, so its topology stands "
+                          "(canonical=%s)" % l["canonical"])
+                bad.append("lineage %s: --override %s. Nothing was emitted and %s"
+                           % (l["id"], r["reason"], stands))
+        if bad:
+            raise ForgeError("; ".join(bad))
+
     if only:
         keep = [l for l in lineages
                 if only == l["id"] or only == l["name"] or only == l["name"] + ".git"
@@ -847,13 +1004,20 @@ def _wrap(text, width, pad):
 # ── overrides from the command line ───────────────────────────────────────────────────────────
 
 def parse_overrides(pairs, path):
-    """Merge the built-in operator decisions with --override / --override-file.
+    """Parse THIS RUN's operator layer from --override / --override-file. Returns it ALONE.
 
     --override <lineage>=<repo.git> sets the canonical member and, because naming a canonical
     against the topology IS the fork-came-home assertion, marks the family FORK-CAME-HOME.
-    --override-file takes the same shape as OPERATOR_OVERRIDES for full control.
+    --override-file takes the same shape as OPERATOR_OVERRIDES for full control; --override then
+    updates the file's entry for the same lineage key by key, so a `why` from the file survives.
+
+    IT DOES NOT MERGE INTO OPERATOR_OVERRIDES, and that is the point. These two layers are kept
+    apart end to end (see `_apply_overrides`): merging here is exactly how a typo on the command
+    line used to silently overwrite the built-in jail rule and let raw topology name jail.git
+    canonical. An entry here REPLACES the built-in rule for that lineage only when it is valid; a
+    partial entry is therefore the WHOLE decision for that lineage, not a patch onto the built-in.
     """
-    ov = {k: dict(v) for k, v in OPERATOR_OVERRIDES.items()}
+    ov = {}
     if path:
         try:
             with open(path) as fh:
@@ -982,6 +1146,7 @@ def selftest():
         commit(w, "c.txt", "three\n", "three")
         publish(w, "lin_super.git")
         super_tip = _sh(w, "rev-parse", "HEAD")
+        lin_lid = _sh(w, "rev-list", "--max-parents=0", "HEAD")[:10]   # a family with NO rule
 
         # ---- family 3: ADDITIVE-DIVERGED — two sides, DISJOINT files
         w = work("addbase")
@@ -1076,6 +1241,31 @@ def selftest():
         rr_a_tip = _sh(base, "--git-dir", x, "rev-parse", "refs/heads/main")
         rr_b_tip = _sh(base, "--git-dir", y, "rev-parse", "refs/heads/main")
 
+        # ---- family 10: THE JAIL SHAPE — the live jail.git / agent_tools_suite.git family,
+        #      reproduced on throwaway repos: shared root, the home's tip an ancestor of the
+        #      fork's, the fork adding a file, the fork holding the superset tip.
+        #
+        #      The members carry the REAL names on purpose, so the REAL NEVER_CANONICAL entry
+        #      ("jail.git") governs this family unchanged — these checks exercise the shipped
+        #      constant, not a stand-in for it. Only the lineage id must differ: a synthetic root
+        #      commit cannot be handed the live sha 379ac05319, so the real rule is re-keyed to
+        #      this family's id. Its SHAPE — canonical=agent_tools_suite.git, fork=jail.git — is
+        #      what the checks below drive, and it is a copy of the shipped OPERATOR_OVERRIDES
+        #      entry (asserted field by field under "JAIL RULE" further down).
+        w = work("jail")
+        commit(w, "ats.py", "the home repo's package\n", "ats: root")
+        publish(w, "agent_tools_suite.git")
+        ats_tip = _sh(w, "rev-parse", "HEAD")
+        commit(w, "grabbag.py", "an expedient wrapped around some packages\n",
+               "jail: the fork adds a file")
+        publish(w, "jail.git")
+        jail_tip = _sh(w, "rev-parse", "HEAD")
+        jail_lid = _sh(w, "rev-list", "--max-parents=0", "HEAD")[:10]
+        real_rule = OPERATOR_OVERRIDES["379ac05319"]
+        JAIL_RULE = {"classification": real_rule["classification"],
+                     "canonical": real_rule["canonical"], "fork": real_rule["fork"],
+                     "why": real_rule["why"], "source": "selftest: the shipped rule, re-keyed"}
+
         # ---- the trap itself, asserted on the synthesized repo -----------------------------
         rc_v, _, _ = git(os.path.join(remotes, "unres_head.git"), "rev-parse", "--verify", "HEAD")
         rc_p, out_p, _ = git(os.path.join(remotes, "unres_head.git"), "rev-parse", "HEAD")
@@ -1083,22 +1273,61 @@ def selftest():
         ck("the trap is real: `rev-parse HEAD` prints the literal string 'HEAD'", out_p == "HEAD")
 
         # ---- run the tool over the throwaway forge -----------------------------------------
+        # The operator's standing layer for this throwaway forge: the re-keyed jail rule plus a
+        # generic fork rule. Passed as `builtins`, NOT as `overrides`, so the checks below can put
+        # a command-line layer on TOP of it and prove a refused --override falls back to it.
+        builtins = {
+            jail_lid: dict(JAIL_RULE),
+            fork_lid: {"classification": FORK_CAME_HOME, "canonical": "home_repo.git",
+                       "fork": "fork_repo.git", "why": "selftest: the fork is an expedient "
+                       "grab-bag; home_repo is the home. It merges home and retires.",
+                       "source": "selftest"},
+        }
         before = _fingerprint(remotes)
-        overrides = dict(OPERATOR_OVERRIDES)
-        overrides[fork_lid] = {"classification": FORK_CAME_HOME, "canonical": "home_repo.git",
-                               "fork": "fork_repo.git", "why": "selftest: the fork is an expedient "
-                               "grab-bag; home_repo is the home. It merges home and retires.",
-                               "source": "selftest"}
-        doc = build(remotes, overrides=overrides)
+        doc = build(remotes, builtins=builtins)
         after = _fingerprint(remotes)
 
-        by_name = {l["name"]: l for l in doc["lineages"]}
-
-        def fam(*repos):
-            for l in doc["lineages"]:
+        def fam_of(d, *repos):
+            if not d:
+                return None
+            for l in d["lineages"]:
                 if {m["repo"] for m in l["members"]} == set(repos):
                     return l
             return None
+
+        def fam(*repos):
+            return fam_of(doc, *repos)
+
+        def rebuild(**kw):
+            """build() over the throwaway forge, returning None if the run was REFUSED.
+
+            A refusal is an OUTCOME these checks assert, so it must not escape as an exception and
+            take every later check down with it: a crashed selftest prints no FAIL line and would
+            look, to anyone reading its exit code alone, exactly like a passing one that reported
+            nothing. Callers below treat None as "no tree was emitted" and fail their check.
+            """
+            kw.setdefault("builtins", builtins)
+            try:
+                return build(remotes, **kw)
+            except ForgeError:
+                return None
+
+        def jail_fam(**kw):
+            """The jail family as this override layer leaves it, or None if the run was refused."""
+            return fam_of(rebuild(**kw), "jail.git", "agent_tools_suite.git")
+
+        def canon(f):
+            return (f or {}).get("canonical") or "(the run emitted no tree at all)"
+
+        def refused(**kw):
+            """The ForgeError message from a strict build, or "" if it did not refuse."""
+            kw.setdefault("builtins", builtins)
+            kw.setdefault("strict", True)
+            try:
+                build(remotes, **kw)
+                return ""
+            except ForgeError as e:
+                return str(e)
 
         # 1. IDENTICAL
         f = fam("ident_home.git", "ident_mirror.git")
@@ -1190,7 +1419,9 @@ def selftest():
         ck("FORK-CAME-HOME: counted as LINEAR in the topology totals",
            doc["totals"]["by_topology"][LINEAR] >= 1)
         ck("FORK-CAME-HOME: counted as FORK-CAME-HOME in the classification totals",
-           doc["totals"]["by_classification"].get(FORK_CAME_HOME) == 1)
+           # two such families in this throwaway forge: home/fork, and the jail shape below
+           doc["totals"]["by_classification"].get(FORK_CAME_HOME) == 2,
+           str(doc["totals"]["by_classification"]))
 
         # 9. RE-ROOTED — one lineage (same root set), tips with no merge-base
         f = fam("reroot_a.git", "reroot_b.git")
@@ -1216,28 +1447,132 @@ def selftest():
         ck("RE-ROOTED: the tree says UNRELATED and prints no 'None'",
            "UNRELATED histories" in rr and "None" not in rr)
 
-        # an override that names a non-member must be refused, not obeyed blindly
-        bad = dict(OPERATOR_OVERRIDES)
-        bad[fork_lid] = {"classification": FORK_CAME_HOME, "canonical": "not_a_member.git",
-                         "why": "selftest: bogus", "source": "selftest"}
-        d2 = build(remotes, overrides=bad)
-        f2 = None
-        for l in d2["lineages"]:
-            if {m["repo"] for m in l["members"]} == {"home_repo.git", "fork_repo.git"}:
-                f2 = l
-        ck("OVERRIDE: one naming a non-member is IGNORED and noted, not obeyed",
-           f2 and f2["override_applied"] is False and f2["classification"] == LINEAR
-           and any("IGNORED" in n for n in f2["notes"]))
+        # ---- 10. THE JAIL SHAPE, end to end ------------------------------------------------
+        # These drive the TOOL'S OUTPUT over the jail-shaped family above. (An earlier selftest
+        # only asserted the OPERATOR_OVERRIDES dict literal — which is why it stayed green while
+        # the tool itself could be made to print jail.git as CANONICAL.)
+        f = fam("jail.git", "agent_tools_suite.git")
+        ck("JAIL: the family is found and its topology is LINEAR (jail holds the superset tip)",
+           f and f["topology"] == LINEAR and f.get("superset", {}).get("tip") == jail_tip,
+           f and f["topology"])
+        ck("JAIL: classified FORK-CAME-HOME", f and f["classification"] == FORK_CAME_HOME,
+           f and f["classification"])
+        ck("JAIL: agent_tools_suite.git is canonical, NOT the topological superset jail.git",
+           f and f["canonical"] == "agent_tools_suite.git", f and f.get("canonical"))
+        ck("JAIL: the direction is REVERSED — jail merges home, then is omitted",
+           f and f["fork_edges"][0]["direction"] == "jail.git -> agent_tools_suite.git"
+           and "OMIT jail.git" in f["proposed_direction"])
+        ck("JAIL: the home trails the fork, exactly the live shape (ats is behind jail)",
+           f and [(s["repo"], s["tip"]) for s in f.get("stale_aliases", [])]
+           == [("agent_tools_suite.git", ats_tip)],
+           f and str(f.get("stale_aliases")))
 
-        # the jail rule must be data the operator can point at
-        ck("JAIL RULE: the built-in override is keyed by root 379ac05319",
+        # THE REPORTED DEFECT, in every reported form. Each of these is a plausible operator typo
+        # aimed at the jail lineage. Every one of them once ended with canonical=jail.git,
+        # classification=LINEAR and exit 0. The decision must survive all of them.
+        typos = [
+            ("--override with '.git' missing", {"canonical": "agent_tools_suite"}),
+            ("--override naming a nickname", {"canonical": "ats.git"}),
+            ("--override with the wrong case", {"canonical": "Agent_Tools_Suite.git"}),
+            ("--override-file setting only a typo'd fork", {"fork": "jail"}),
+            ("--override-file entry that omits canonical entirely",
+             {"classification": "LINEAR"}),
+        ]
+        for label, entry in typos:
+            e = dict(entry)
+            e.setdefault("source", "selftest: a typo")
+            f2 = jail_fam(overrides={jail_lid: e})
+            ck("JAIL/typo (%s): canonical falls back to the operator rule, NOT to topology"
+               % label, f2 and f2["canonical"] == "agent_tools_suite.git", canon(f2))
+            ck("JAIL/typo (%s): jail.git is still never canonical" % label,
+               f2 and f2["canonical"] != "jail.git", canon(f2))
+            ck("JAIL/typo (%s): still FORK-CAME-HOME, not raw LINEAR" % label,
+               f2 and f2["classification"] == FORK_CAME_HOME,
+               (f2 or {}).get("classification") or "(no tree)")
+            ck("JAIL/typo (%s): the refusal is recorded, not swallowed" % label,
+               f2 and any(r["source"] == USER_LAYER for r in f2["rejected_overrides"])
+               and any("REJECTED" in n for n in f2["notes"]))
+            ck("JAIL/typo (%s): a strict run REFUSES rather than emitting a tree" % label,
+               bool(refused(overrides={jail_lid: e})))
+            ck("JAIL/typo (%s): the ASCII tree never marks jail.git canonical" % label,
+               f2 and "* jail.git" not in "\n".join(_render_lineage(f2)))
+
+        # A VALID member name is not a loophole: jail.git IS a member, so no typo-check could ever
+        # catch this one. NEVER_CANONICAL is what refuses it.
+        for label, entry in (("--override 379ac05319=jail.git", {"canonical": "jail.git"}),
+                             ("an override-file naming jail home",
+                              {"canonical": "jail.git", "classification": FORK_CAME_HOME,
+                               "fork": "agent_tools_suite.git"})):
+            f2 = jail_fam(overrides={jail_lid: dict(entry, source="selftest")})
+            ck("JAIL/forbidden (%s): refused even though jail.git IS a real member" % label,
+               f2 and f2["canonical"] == "agent_tools_suite.git", canon(f2))
+            msg = refused(overrides={jail_lid: dict(entry, source="selftest")})
+            ck("JAIL/forbidden (%s): a strict run refuses and says why" % label,
+               "ruled OUT as a destination" in msg, msg or "(no refusal)")
+
+        # A family cannot be its own fork. Both spellings: naming the fork explicitly, and letting
+        # it default to the candidate. Either would print the nonsense edge "X -> X".
+        for label, entry in (("fork named explicitly",
+                              {"canonical": "lin_super.git", "fork": "lin_super.git",
+                               "classification": FORK_CAME_HOME}),
+                             ("fork defaulting to the candidate",
+                              {"canonical": "lin_super.git", "classification": FORK_CAME_HOME})):
+            msg = refused(overrides={lin_lid: dict(entry, source="selftest")})
+            ck("SELF-FORK (%s): refused — a fork cannot merge into itself" % label,
+               "cannot merge into itself" in msg, msg or "(no refusal)")
+
+        # THE BACKSTOP: with the operator rule GONE, topology nominates jail.git — and the tool
+        # must refuse to emit that tree rather than print it. This is what makes the guarantee
+        # structural instead of a default that a missing rule can silently undo.
+        no_rule = {k: v for k, v in builtins.items() if k != jail_lid}
+        try:
+            build(remotes, builtins=no_rule)
+            ck("JAIL/backstop: with no operator rule, the tool REFUSES to emit a jail-canonical "
+               "tree", False, "it emitted one")
+        except ForgeError as e:
+            ck("JAIL/backstop: with no operator rule, the tool REFUSES to emit a jail-canonical "
+               "tree", "REFUSING to emit" in str(e) and "jail.git" in str(e), str(e))
+
+        # CONTROL (the adversary's own): the SAME typo against a lineage with NO operator rule
+        # must still fall back to TOPOLOGY — there is no decision to protect, so the fallthrough
+        # must not invent one. This is what proves the fix is specific, not a blanket suppression.
+        f2 = fam_of(rebuild(overrides={lin_lid: {"canonical": "nope.git", "source": "selftest"}}),
+                    "lin_super.git", "lin_stale.git")
+        ck("CONTROL: a refused override on a lineage with NO operator rule falls back to topology",
+           f2 and f2["canonical"] == "lin_super.git" and f2["classification"] == LINEAR
+           and f2["override_applied"] is False, canon(f2))
+        ck("CONTROL: and it is refused by a strict run all the same",
+           bool(refused(overrides={lin_lid: {"canonical": "nope.git", "source": "selftest"}})))
+
+        # A VALID override must still be obeyed — the guard must not have broken overriding itself.
+        f2 = fam_of(rebuild(overrides={lin_lid: {"canonical": "lin_stale.git",
+                                                 "classification": FORK_CAME_HOME,
+                                                 "why": "selftest: the operator reverses this one",
+                                                 "fork": "lin_super.git", "source": "selftest"}}),
+                    "lin_super.git", "lin_stale.git")
+        ck("OVERRIDE: a VALID operator override is obeyed and marked applied",
+           f2 and f2["canonical"] == "lin_stale.git"
+           and f2["classification"] == FORK_CAME_HOME and f2["override_applied"] is True
+           and f2["override_source"] == USER_LAYER, canon(f2))
+        f3 = jail_fam(overrides={jail_lid: {"canonical": "agent_tools_suite.git",
+                                            "classification": LINEAR, "source": "selftest"}})
+        ck("OVERRIDE: a valid one beats the built-in rule for the same lineage",
+           f3 and f3["classification"] == LINEAR and f3["override_source"] == USER_LAYER,
+           (f3 or {}).get("classification") or "(no tree)")
+        ck("OVERRIDE: a run with no overrides at all is clean (no spurious refusals)",
+           not any(l["rejected_overrides"] for l in doc["lineages"]))
+
+        # the jail rule must be data the operator can point at, keyed to the LIVE lineage
+        ck("JAIL RULE: the built-in rule is keyed by the live root 379ac05319",
            "379ac05319" in OPERATOR_OVERRIDES)
-        ck("JAIL RULE: it names agent_tools_suite.git canonical",
+        ck("JAIL RULE: it names agent_tools_suite.git canonical, never jail.git",
            OPERATOR_OVERRIDES["379ac05319"]["canonical"] == "agent_tools_suite.git")
-        ck("JAIL RULE: it never names jail.git canonical",
-           OPERATOR_OVERRIDES["379ac05319"]["canonical"] != "jail.git")
         ck("JAIL RULE: jail.git is the FORK that merges home and retires",
            OPERATOR_OVERRIDES["379ac05319"]["fork"] == "jail.git")
+        ck("JAIL RULE: jail.git is ruled out as a destination independently of that rule",
+           "jail.git" in NEVER_CANONICAL)
+        ck("JAIL RULE: the two agree — no rule may name a ruled-out repo canonical",
+           not any(r.get("canonical") in NEVER_CANONICAL for r in OPERATOR_OVERRIDES.values()))
 
         # totals must add up and the render must not explode
         ck("TOTALS: every lineage is counted exactly once by topology",
@@ -1250,6 +1585,10 @@ def selftest():
            "norefs_empty.git" in txt and "FORGE FAMILY TREE" in txt)
         ck("RENDER: the tree never calls the fork canonical",
            "fork_repo.git" in txt and "* fork_repo.git" not in txt)
+        ck("RENDER: the tree shows jail.git but never marks it canonical (the '*' bullet)",
+           "jail.git" in txt and "* jail.git" not in txt)
+        ck("RENDER: the tree marks agent_tools_suite.git as the canonical home",
+           "* agent_tools_suite.git" in txt)
         ck("JSON: the document is serialisable", bool(json.dumps(doc)))
 
         # side effects: the tool must only READ the repos it inspects
@@ -1264,6 +1603,12 @@ def selftest():
               % (len(checks) - len(bad_checks), len(checks),
                  ("   FAILED: " + "; ".join(bad_checks)) if bad_checks else ""))
         return 1 if bad_checks else 0
+    except ForgeError as e:
+        # A crash is not a pass. Without this, an unexpected refusal would abort the run with no
+        # FAIL line printed at all, and the only signal left would be an exit code that a reader
+        # could easily mistake for "nothing to report".
+        print("\n== selftest == ABORTED after %d checks by an unexpected error: %s" % (len(checks), e))
+        return 1
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -1289,9 +1634,14 @@ def main(argv=None):
                     help="show only the family matching this repo name, lineage name, or id")
     ap.add_argument("--override", action="append", metavar="ID=REPO.git",
                     help="name REPO.git canonical for lineage ID and mark it FORK-CAME-HOME "
-                         "(repeatable; overrides the built-in operator decisions)")
+                         "(repeatable; takes precedence over the built-in operator decisions). "
+                         "REPO.git must be a member of that lineage and must not be a repo ruled "
+                         "out as a destination (NEVER_CANONICAL) — either way the run is refused "
+                         "with exit 2 and the built-in operator decision stands untouched")
     ap.add_argument("--override-file", metavar="PATH",
-                    help="a JSON object keyed by lineage id, same shape as OPERATOR_OVERRIDES")
+                    help="a JSON object keyed by lineage id, same shape as OPERATOR_OVERRIDES. An "
+                         "entry REPLACES the built-in rule for its lineage (it is not merged into "
+                         "it), so a partial entry is the whole decision for that lineage")
     ap.add_argument("--verbose", action="store_true", help="more detail per lineage")
     ap.add_argument("--selftest", action="store_true",
                     help="synthesize one throwaway family per class in a temp dir and prove each "
@@ -1309,7 +1659,8 @@ def main(argv=None):
                 % os.path.dirname(os.path.realpath(__file__)))
         remotes = os.path.realpath(remotes)
         overrides = parse_overrides(args.override, args.override_file)
-        doc = build(remotes, overrides=overrides, only=args.lineage)
+        # strict: a refused override is an input error worth exit 2, not a silent change of answer
+        doc = build(remotes, overrides=overrides, only=args.lineage, strict=True)
     except ForgeError as e:
         sys.stderr.write("forge_family_tree: %s\n" % e)
         return 2
