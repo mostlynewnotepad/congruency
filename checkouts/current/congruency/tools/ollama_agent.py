@@ -190,20 +190,38 @@ the cerebras path — api flavor `openai` — and for the WORKER role only, this
 sends. NOTHING changes for the adversary, the dispatcher, the ollama flavor, or `--engine claude`,
 which stays the fallback engine the inference-routing policy names (GLM default, Claude fallback).
 
+  * ONLY WHERE ITS PREMISE HOLDS. The directive tells the worker its original is embedded and the
+    filesystem does not have it. That is a FORGE-REWRITE ticket's premise; on a tools/ or docs/ ticket
+    (this module's own #438 is one) it would be three falsehoods, and rule 3 would forbid exactly the
+    cross-module reads such a ticket needs. Since the inference-routing policy makes GLM the DEFAULT
+    engine, those workers are a live path — so the premise is TESTED, with the ticketer's own
+    predicate (has_embedded_source, mirroring forge_refactor_ticketer.body_has_source): no embedded
+    block, no directive, and pair_loop's prompt goes out untouched.
+
   * THE EMBEDDED SOURCE IS THE SOURCE. A forge-rewrite ticket already carries the original bytes
-    between ===ORIGINAL SOURCE=== and ===END SOURCE===, and the canaries went filesystem-hunting for
+    between ===ORIGINAL SOURCE and ===END SOURCE===, and the canaries went filesystem-hunting for
     them anyway (5 redundant Reads of docs/PLAYBOOK.md, then Globs) in a fresh forge2 tree where the
-    original does not exist. CEREBRAS_WORKER_DIRECTIVE rule 1 says so, ahead of the ticket.
+    original does not exist. Rule 1 says so ahead of the ticket, quoting THIS ticket's real fence
+    lines — the bare `===ORIGINAL SOURCE===` is never emitted; the real one carries a description and
+    may carry a `:<sha>` nonce (forge_refactor_ticketer.py:604-617). When that block is base64 the
+    rule points at the ticket's decode command, and when it is a TRUNCATED EXCERPT rule 1 stands down
+    and hands the worker back to the ticket, which orders the canonical source or a BLOCKED report.
 
   * EXACTLY THE GIVEN DELIVERABLE PATH. A canary wrote forge2/<repo>/<repo>/mod.py — a spurious
     second nesting level — instead of the flat forge2/<repo>/mod.py that forge_package.py's contract
     expects, so pair_loop's deliverable existence-check (pair_loop.py:485) failed a finished rewrite.
     Rule 2 says the path is verbatim, and when the birth prompt names one it is quoted into the
-    directive character for character.
+    directive character for character. Rule 2 does NOT forbid the rest of a forge package: for a
+    PACKAGE deliverable pair_loop orders the worker to build its pyproject.toml, config and entry
+    points (worker_scope, pair_loop.py:650-656), those are siblings of the module, and nothing else
+    writes them — so a blanket "no sibling files" would fail the very package-check #438's acceptance
+    demands. The rule reads the scope off the prompt (scope_of) and states the sibling ban only for
+    the lone-file branch that really does say "touch nothing else".
 
   * NO CROSS-MODULE EXPLORATION. A canary spent ~18 of its steps reading an UNRELATED module
     (forge2/audio_tagger/tagger.py) — unpredictable token burn with no bearing on its deliverable.
-    Rule 3 forbids reading, grepping or globbing any module but its own.
+    Rule 3 forbids reading, grepping or globbing any module but its own (for a package: any module
+    outside that package).
 
   * 40 STEPS, NOT 12. The canaries needed ~33 steps to reach their first Write, so the 12-step
     default cut GLM off mid-orientation and the envelope was demanded before the file existed. The
@@ -1134,51 +1152,226 @@ def system_prompt(ws, flavor="ollama"):
 # Each rule closes one measured failure of the #414/#416 canaries (see the module docstring). It is
 # PREPENDED to the birth prompt — pair_loop owns that prompt (WORKER_PROMPT, pair_loop.py:615-641)
 # and this module does not edit it, so the rules go in front and the ticket below stays verbatim.
-CEREBRAS_WORKER_DIRECTIVE = """WORKER DIRECTIVE — four rules for this run. They override every habit you have. Read them before the ticket that follows.
+#
+# A PREPENDED RULE THAT CONTRADICTS THE TICKET BELOW IT IS A BUG, NOT A TIGHTENING. This directive is
+# read by the least steerable model in the fleet, and it is framed as overriding — so any sentence
+# here that the ticket refutes is a sentence GLM will obey INSTEAD of the ticket. Two of the three
+# rules therefore do not assert anything about the prompt; they READ it and say what it says:
+#
+#   * THE PREMISE IS CHECKED, NOT ASSUMED (has_embedded_source). Rule 1 asserts the original is
+#     embedded in the ticket and that the filesystem does not hold it. That is true of a FORGE-REWRITE
+#     ticket and false of every other kind — a tools/ or docs/ ticket (this very module's #438 is one)
+#     carries no source block, and its original IS on disk. So the directive fires only when the
+#     ticket really carries the block, tested with the ticketer's OWN predicate
+#     (forge_refactor_ticketer.body_has_source, :940-946: both sentinels present). GLM is the DEFAULT
+#     engine per the inference-routing policy, so non-forge cerebras workers are a live path, not a
+#     hypothetical: they get pair_loop's prompt unchanged.
+#
+#   * THE SCOPE IS READ OFF THE PROMPT (scope_of). Rule 2's "no sibling files" is TRUE for a lone-file
+#     deliverable, whose scope line ends "touch nothing else" (worker_scope, pair_loop.py:648-649) —
+#     and FALSE for a forge PACKAGE, whose scope line orders the worker to "build the package there in
+#     full (its pyproject.toml, its config, its console entry points, any submodules)"
+#     (pair_loop.py:650-656). pyproject.toml IS a sibling of the module. Forbidding it would strand
+#     the package with no build backend, and pair_loop's install_check() (`pip install -e .`, :1001,
+#     plus the console-entry-point check at :1022-1026) would FAIL the package-check that #438's own
+#     acceptance requires — which is #401's regression, the one pair_loop's selftest (:1301-1303)
+#     guards by asserting the worker's prompt line matches what the harness commits. Nothing else can
+#     write that pyproject.toml: pair_loop never imports forge_package and never calls ensure(). So
+#     rule 2 states the sibling ban only where the prompt itself states it, and in a package defers to
+#     the ticket by name. #438(b)'s literal wording is kept verbatim for the lone-file case it
+#     describes; where it would contradict the ticket, the ticket wins — #438's ACCEPTANCE (a forge
+#     unit passing parse + pyproject + package-check) is the requirement, and a directive that fails
+#     that acceptance has not implemented the ticket, it has broken it.
+#
+#   * THE FENCES ARE QUOTED FROM THE TICKET, NOT FROM MEMORY. The bare `===ORIGINAL SOURCE===` of
+#     #438's wording is NEVER emitted: the real fence carries a parenthesised description
+#     (EMBED_BEGIN_FMT, forge_refactor_ticketer.py:604 -> "===ORIGINAL SOURCE (verbatim, the
+#     behavior-preserving basis)===") and takes a `:<sha>` nonce when the module's own text contains a
+#     marker (_marks, :840-851). Telling GLM to find a literal that is not there is how a canary
+#     starts hunting. Rule 1 quotes THIS ticket's actual begin/end lines, and the same read tells it
+#     when the block is base64 or a TRUNCATED EXCERPT — in which case the ticket orders the worker to
+#     the canonical source or to report BLOCKED (source_block, :926-934), and rules 1 and 3 stand down
+#     rather than order it to fabricate a rewrite from a prefix.
 
-1. THE ORIGINAL IS ALREADY IN YOUR TICKET. The ORIGINAL source you must rewrite is EMBEDDED in your
-   ticket between ===ORIGINAL SOURCE=== and ===END SOURCE===. Base your rewrite on THOSE bytes. Do
-   NOT search the filesystem for the original — it is not there (this is a fresh forge2 tree).
+# The sentinels, mirroring forge_refactor_ticketer.py:611-612. Both the plain fence and the nonce'd
+# one begin with these, so one test covers either — exactly as body_has_source() does it (:940-946).
+EMBED_BEGIN_SENTINEL = "===ORIGINAL SOURCE"
+EMBED_END_SENTINEL = "===END SOURCE"
 
-2. EXACTLY THE PATH YOU WERE GIVEN. Write your COMPLETE deliverable to EXACTLY the given deliverable
-   path, verbatim. Do not add package nesting, do not rename, do not create sibling files.%(deliverable)s
 
-3. DO NOT EXPLORE. Do NOT read, grep, or glob any module other than your own deliverable. You do not
-   need to explore the repo. Every step spent on another module is a step you do not get back.
+def has_embedded_source(prompt):
+    """True when the birth prompt carries an embedded ORIGINAL SOURCE block — i.e. it is a forge
+    rewrite, the one ticket kind whose premise CEREBRAS_WORKER_DIRECTIVE describes.
 
-4. ONE STEP IS ONE JSON OBJECT, IN THE EXACT SHAPE. Bash's `command` is a single STRING, never a
+    The predicate is forge_refactor_ticketer.body_has_source()'s, restated rather than imported: this
+    runner must stay importable in a bare forge2 tree where the ticketer is not on the path."""
+    p = prompt or ""
+    return EMBED_BEGIN_SENTINEL in p and EMBED_END_SENTINEL in p
+
+
+def source_fences_of(prompt):
+    """This ticket's actual (begin, end) fence lines, or (None, None).
+
+    Read out of the prompt instead of rebuilt from a format string, because the ticketer chooses among
+    four descriptions and may nonce BOTH markers (forge_refactor_ticketer.py:604-617, :840-851). The
+    first line that STARTS with each sentinel is the fence — the prose above the block names the
+    markers inline but never at the start of a line."""
+    begin = end = None
+    for ln in (prompt or "").splitlines():
+        s = ln.strip()
+        if begin is None and s.startswith(EMBED_BEGIN_SENTINEL):
+            begin = s
+        elif begin is not None and end is None and s.startswith(EMBED_END_SENTINEL):
+            end = s
+            break
+    return begin, end
+
+
+def scope_of(prompt):
+    """("package", "<root>") | ("file", None) | ("unknown", None) — what pair_loop told THIS worker.
+
+    Read off worker_scope()'s two branches (pair_loop.py:646-656) so the directive can never claim an
+    exclusivity the ticket did not: the package branch names "one module of the PACKAGE <root>/" and
+    pointedly does NOT say "touch nothing else", which is the lone-file branch's phrase. When neither
+    is present the scope is UNKNOWN and rule 2 says nothing about siblings — silence cannot
+    contradict."""
+    m = re.search(r"one module of the PACKAGE\s+(\S+?)/[,.]", prompt or "")
+    if m:
+        return "package", m.group(1)
+    if "touch nothing else" in (prompt or ""):
+        return "file", None
+    return "unknown", None
+
+
+_RULE_TRUNCATED = """1. YOUR TICKET'S SOURCE BLOCK IS A TRUNCATED EXCERPT — DO NOT REWRITE FROM IT. The block between
+       %s
+   and
+       %s
+   holds only the module's FIRST bytes, NOT the module. Do exactly what your ticket says under that
+   block: read the COMPLETE source from the canonical location it names, and report BLOCKED if you
+   cannot reach it. Do NOT rewrite from the excerpt and do NOT fabricate the missing bytes."""
+
+_RULE_EMBEDDED = """1. THE ORIGINAL IS ALREADY IN YOUR TICKET. The ORIGINAL source you must rewrite is EMBEDDED in your
+   ticket between ===ORIGINAL SOURCE and ===END SOURCE===. Base your rewrite on THOSE bytes. Do NOT
+   search the filesystem for the original — it is not there (this is a fresh forge2 tree). In THIS
+   ticket the block BEGINS at the line
+       %s
+   and ENDS at the first line
+       %s
+   Everything strictly between those two lines is the module.%s"""
+
+_RULE_B64 = """
+   Those bytes are BASE64 — decode them with the command your ticket gives under the block. Rewrite
+   the DECODED module, never the base64 text."""
+
+_RULE_PATH_FILE = """2. EXACTLY THE PATH YOU WERE GIVEN. Write your COMPLETE deliverable to EXACTLY the given deliverable
+   path, verbatim. Do not add package nesting, do not rename, do not create sibling files.%s"""
+
+_RULE_PATH_PKG = """2. EXACTLY THE PATH YOU WERE GIVEN. Write your COMPLETE deliverable to EXACTLY the given deliverable
+   path, verbatim. Do not add package nesting, do not rename, do not move it.%s
+   Your ticket below says this module is one part of the PACKAGE %s/ and tells you to build the rest
+   of that package — its pyproject.toml, its config, its console entry points, its submodules. DO
+   THAT: those files are required, and without them the package does not install and the ticket
+   fails. Put every one of them INSIDE %s/, and create nothing outside it."""
+
+_RULE_PATH_UNKNOWN = """2. EXACTLY THE PATH YOU WERE GIVEN. Write your COMPLETE deliverable to EXACTLY the given deliverable
+   path, verbatim. Do not add package nesting, do not rename. Anything else your ticket tells you to
+   create, create exactly where it says.%s"""
+
+_RULE_EXPLORE_FILE = """3. DO NOT EXPLORE. Do NOT read, grep, or glob any module other than your own deliverable. You do not
+   need to explore the repo. Every step spent on another module is a step you do not get back.%s"""
+
+_RULE_EXPLORE_PKG = """3. DO NOT EXPLORE. Do NOT read, grep, or glob any module outside your own package %s/. You do not
+   need to explore the rest of the repo. Every step spent on another module is a step you do not get
+   back.%s"""
+
+_EXPLORE_EXCEPT = """
+   The ONE exception is rule 1: your source block is truncated, so reaching the canonical source your
+   ticket names is part of this ticket, not exploration."""
+
+_RULE_SHAPE = """4. ONE STEP IS ONE JSON OBJECT, IN THE EXACT SHAPE. Bash's `command` is a single STRING, never a
    list: {"thought": "run it", "tool": "Bash", "args": {"command": "python3 -c 'print(1)'"}}. Its
-   argv[0] must be an allowlisted program.
+   argv[0] must be an allowlisted program."""
 
+_DIRECTIVE_HEAD = """WORKER DIRECTIVE — four rules for this run. They override every habit you have; they do NOT override
+the ticket that follows. Where a rule and your ticket differ, the TICKET wins. Read these first, then
+read the ticket in full.
+
+"""
+
+_ORDER_FILE = """
 Work in this order: read the source embedded in the ticket below; write the COMPLETE file to the
 deliverable path with ONE Write call (its `content` is the whole file, never a fragment); run it if
 you were granted Bash; then emit {"thought": "...", "tool": "finish", "args": {}}.
 
 """
 
+_ORDER_PKG = """
+Work in this order: read the source embedded in the ticket below; write the COMPLETE module to the
+deliverable path with ONE Write call (its `content` is the whole file, never a fragment); write the
+package's other required files (pyproject.toml and the rest the ticket names) inside %s/; run it if
+you were granted Bash; then emit {"thought": "...", "tool": "finish", "args": {}}.
+
+"""
+
 # Rule 2's teeth: the path itself, quoted in character for character, whenever the birth prompt names
-# one. A canary wrote forge2/<repo>/<repo>/mod.py for a ticket that said forge2/<repo>/mod.py.
+# one. A canary wrote forge2/<repo>/<repo>/mod.py for a ticket that said forge2/<repo>/mod.py. The
+# closing sentence names only the failures that are failures in THIS scope — for a package, a sibling
+# is not one of them.
 CEREBRAS_DELIVERABLE_LINE = """
    Your deliverable path, character for character, is:
        %s
-   Pass exactly that string as Write's `file_path`. Any other path — an extra directory level, a
-   renamed file, a sibling — fails the ticket even if the code inside is perfect."""
+   Pass exactly that string as Write's `file_path`. Any other path for it — an extra directory level,
+   a renamed file%s — fails the ticket even if the code inside is perfect."""
+
+_SIBLING_IS_A_FAILURE = ", a sibling"
 
 
 def cerebras_worker_prompt(prompt, deliverable=None):
-    """The birth prompt with CEREBRAS_WORKER_DIRECTIVE prepended — ticket #438 (a), (b), (c).
+    """The birth prompt with the tightened worker directive prepended — ticket #438 (a), (b), (c).
+
+    Returns the prompt UNCHANGED unless it carries an embedded ORIGINAL SOURCE block: the directive's
+    rule 1 asserts the original is in the ticket and not on disk, which is true of a forge rewrite and
+    false of a tools/docs ticket, so the premise is tested (has_embedded_source) rather than assumed.
+    That gate lives here — one place — and run_agent reports what it decided.
 
     Prepended, never merged or rewritten: the ticket's own text is returned unchanged BELOW the
     directive, so pair_loop's prompt still says everything it said and role_of/ticket_of/agent_of/
     deliverable_of still read the same values out of the result (the directive deliberately contains
     none of the phrases they match).
 
-    Applied to the cerebras path's WORKER only — see run_agent, which gates it on
-    `flavor == "openai" and role == "worker"`. The adversary and the dispatcher run gpt-oss and are
-    judged on their reasoning rather than on a deliverable path; the ollama flavor and --engine claude
-    see the birth prompt pair_loop built, unchanged."""
-    line = CEREBRAS_DELIVERABLE_LINE % deliverable if deliverable else ""
-    return CEREBRAS_WORKER_DIRECTIVE % {"deliverable": line} + prompt
+    The rules adapt to what the prompt SAYS, never contradicting it — see the block comment above:
+    rule 1 quotes this ticket's real fences and stands down on a truncated block; rule 2's sibling ban
+    holds only for a lone-file deliverable and defers to the ticket's package instructions for a forge
+    package; rule 3 bounds exploration by that same scope.
+
+    Applied to the cerebras path's WORKER only — see run_agent. The adversary and the dispatcher run
+    gpt-oss and are judged on their reasoning rather than on a deliverable path; the ollama flavor and
+    --engine claude see the birth prompt pair_loop built, unchanged."""
+    if not has_embedded_source(prompt):
+        return prompt
+    begin, end = source_fences_of(prompt)
+    begin = begin or (EMBED_BEGIN_SENTINEL + " ...===")
+    end = end or (EMBED_END_SENTINEL + "===")
+    truncated = "TRUNCATED EXCERPT" in begin
+    kind, pkg = scope_of(prompt)
+
+    if truncated:
+        rule1 = _RULE_TRUNCATED % (begin, end)
+    else:
+        rule1 = _RULE_EMBEDDED % (begin, end, _RULE_B64 if "base64" in begin else "")
+
+    path = (CEREBRAS_DELIVERABLE_LINE
+            % (deliverable, "" if kind == "package" else _SIBLING_IS_A_FAILURE)) if deliverable else ""
+    if kind == "package":
+        rule2 = _RULE_PATH_PKG % (path, pkg, pkg)
+        rule3 = _RULE_EXPLORE_PKG % (pkg, _EXPLORE_EXCEPT if truncated else "")
+        order = _ORDER_PKG % pkg
+    else:
+        rule2 = (_RULE_PATH_FILE if kind == "file" else _RULE_PATH_UNKNOWN) % path
+        rule3 = _RULE_EXPLORE_FILE % (_EXPLORE_EXCEPT if truncated else "")
+        order = _ORDER_FILE
+    return (_DIRECTIVE_HEAD + "\n\n".join([rule1, rule2, rule3, _RULE_SHAPE]) + "\n" + order + prompt)
 
 
 # ── #438(d): the step budget. GLM 4.7 is given room to orient; no other engine's default moves. ────
@@ -1295,9 +1488,10 @@ def run_agent(prompt, allowed_tools, cwd=None, model=None, role=None, channel="s
     deliverable = deliverable or deliverable_of(prompt)
     max_steps = max_steps_for(flavor, max_steps)
     # #438: the cerebras path's WORKER — and only it — gets the tightened directive in front of its
-    # ticket. Decided AFTER role/deliverable are read, so what is parsed is always pair_loop's own
-    # birth prompt, never this module's prefix.
-    tightened = flavor == "openai" and role == "worker"
+    # ticket, and only when the ticket is the forge rewrite the directive's rule 1 describes (a ticket
+    # carrying its own ===ORIGINAL SOURCE=== block). Decided AFTER role/deliverable are read, so what
+    # is parsed is always pair_loop's own birth prompt, never this module's prefix.
+    tightened = flavor == "openai" and role == "worker" and has_embedded_source(prompt)
     deadline = time.time() + timeout
 
     native_tools = None
@@ -1319,12 +1513,20 @@ def run_agent(prompt, allowed_tools, cwd=None, model=None, role=None, channel="s
             % (role, model, real_model(model), OPENAI_BASE, channel, ",".join(ws.names) or "none",
                "unrestricted" if ws.bash_prefixes is None else (",".join(ws.bash_prefixes) or "denied"),
                clamp_max_tokens(max_tokens), max_steps, ws.root))
+        # Say it on stderr either way, because "zero reads of unrelated modules in its step log"
+        # (#438's acceptance) is read off this same log — whether the directive is ON, and which
+        # scope it read, must be visible there rather than inferred from the model's behavior.
         if tightened:
-            # Say it on stderr, because "zero reads of unrelated modules in its step log" (#438's
-            # acceptance) is read off this same log — the directive being ON must be visible there.
+            kind, pkg = scope_of(prompt)
             log("== ollama_agent == #438 cerebras worker directive ON: embedded-source-first, no "
-                "cross-module exploration, exact deliverable path %s, %d steps"
-                % (deliverable or "(none named in the prompt)", max_steps))
+                "cross-module exploration, exact deliverable path %s, scope=%s%s, %d steps"
+                % (deliverable or "(none named in the prompt)", kind,
+                   " %s/ (its pyproject/config/entry points are the ticket's, and are NOT siblings "
+                   "to refuse)" % pkg if pkg else "", max_steps))
+        elif role == "worker":
+            log("== ollama_agent == #438 cerebras worker directive OFF: this ticket carries no "
+                "%s=== block, so its original is not embedded and the directive's premise does not "
+                "hold — pair_loop's birth prompt is sent unchanged." % EMBED_BEGIN_SENTINEL)
     else:
         caps = installed_models()
         if model not in caps:
@@ -2091,17 +2293,78 @@ def selftest():
             def flat(s):
                 return " ".join(s.split())
 
-            wp438 = ("You are coder-t438r1, the coder — the worker of a build pair on ticket #438.\n\n"
-                     "TICKET: forge rewrite of audio_tagger\n"
-                     "===ORIGINAL SOURCE===\nprint('original')\n===END SOURCE===\n\n"
-                     "Deliverable: write it to forge2/audio_tagger/tagger.py (create or overwrite "
-                     "that file; touch nothing else).\n"
-                     "GOVERNANCE: ticket #438 authorizes you — work on nothing else. You are "
-                     "registered as coder-t438r1 and every action is on the record.")
+            # THE FIXTURES ARE BUILT BY THE REAL CALLERS, NEVER HAND-WRITTEN. A directive whose only
+            # test is a prompt pair_loop cannot emit proves nothing about the run it governs: an
+            # earlier draft of this selftest paired the PACKAGE path forge2/audio_tagger/tagger.py
+            # with the lone-file scope line "touch nothing else" — a combination worker_scope() never
+            # produces — and so ran every #438 check against the wrong branch and missed a
+            # package-check failure. So the scope lines come from pair_loop.worker_scope() and the
+            # fences from forge_refactor_ticketer's own formats. Both live beside this module in the
+            # congruency checkout; in a bare forge2 tree they do not, and the differential SKIPS
+            # loudly rather than passing quietly.
+            def _sibling(name):
+                """Import a sibling tool by path, or None if it is not there.
+
+                dont_write_bytecode is forced exactly as load_pair_loop() forces it and for exactly
+                its reason: a normal import drops a __pycache__/<name>.cpython-*.pyc NEXT TO THE
+                SOURCE, i.e. a new file inside this repo, and --selftest's closing line claims the
+                repo was never touched. Gitignored is not the same as untouched, and a claim about
+                behavior is made true by the code, not softened in the prose (#153)."""
+                p = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+                if not os.path.isfile(p):
+                    return None
+                prev = sys.dont_write_bytecode
+                sys.dont_write_bytecode = True
+                try:
+                    spec = importlib.util.spec_from_file_location("_st_" + name, p)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    return mod
+                except Exception:
+                    return None
+                finally:
+                    sys.dont_write_bytecode = prev
+
+            # pair_loop goes through the module's own loader, which already holds this discipline.
+            try:
+                pl = load_pair_loop()
+            except Exception:
+                pl = None
+            frt = _sibling("forge_refactor_ticketer")
+
+            def _ticket(deliverable, payload="print('original')\n", desc=None, agent="coder-t438r1"):
+                """A birth prompt exactly as pair_loop + the ticketer would emit it."""
+                if frt:
+                    desc = desc or frt.EMBED_DESC_TEXT
+                    begin, end = frt.EMBED_BEGIN_FMT % desc, frt.EMBED_END
+                else:                                   # sibling absent: the shapes, still not bare
+                    begin = "===ORIGINAL SOURCE (%s)===" % (desc or "verbatim, the behavior-preserving basis")
+                    end = "===END SOURCE==="
+                scope = (pl.worker_scope(deliverable, pl.package_root_of(deliverable)) if pl else
+                         "write it to %s (create or overwrite that file; touch nothing else)." % deliverable)
+                return ("You are %s, the coder — the worker of a build pair on ticket #438.\n\n"
+                        "TICKET: forge rewrite of audio_tagger\n%s\n%s\n%s\n\n"
+                        "Deliverable: %s\n"
+                        "GOVERNANCE: ticket #438 authorizes you — work on nothing else. You are "
+                        "registered as %s and every action is on the record."
+                        % (agent, begin, payload, end, scope, agent))
+
+            if not (pl and frt):
+                print("   SKIP  pair_loop/forge_refactor_ticketer not importable beside this module "
+                      "— the #438 differential below runs on SHAPES, not the real callers")
+            ck("the fixture is the REAL caller's: pair_loop and the ticketer both imported",
+               bool(pl and frt), "pair_loop=%s forge_refactor_ticketer=%s" % (bool(pl), bool(frt)))
+
+            # The lone-file branch: a deliverable with no forge2 package around it.
+            FILE_D = "checkouts/current/congruency/tools/ollama_agent.py"
+            wp438 = _ticket(FILE_D)
             tight = cerebras_worker_prompt(wp438, deliverable_of(wp438))
+            if pl:
+                ck("the lone-file fixture really is worker_scope's NON-package branch",
+                   pl.package_root_of(FILE_D) is None and "touch nothing else" in wp438)
             ck("(a) embedded-source-first, in the ticket's own words",
                "The ORIGINAL source you must rewrite is EMBEDDED in your ticket between "
-               "===ORIGINAL SOURCE=== and ===END SOURCE===. Base your rewrite on THOSE bytes. Do NOT "
+               "===ORIGINAL SOURCE and ===END SOURCE===. Base your rewrite on THOSE bytes. Do NOT "
                "search the filesystem for the original — it is not there (this is a fresh forge2 "
                "tree)." in flat(tight))
             ck("(b) exactly the given deliverable path, in the ticket's own words",
@@ -2112,19 +2375,185 @@ def selftest():
                "need to explore the repo." in flat(tight))
             ck("(e) the Bash contract is restated in the directive too: a STRING, never a list",
                "Bash's `command` is a single STRING, never a list" in flat(tight))
-            ck("the FLAT deliverable path is quoted into the directive character for character",
-               "Your deliverable path, character for character, is: forge2/audio_tagger/tagger.py"
-               in flat(tight), "the path is not quoted into the directive verbatim")
+            ck("the deliverable path is quoted into the directive character for character",
+               "Your deliverable path, character for character, is: %s" % FILE_D in flat(tight),
+               "the path is not quoted into the directive verbatim")
             ck("the ticket is PREPENDED to, not rewritten: its own text survives below, byte for byte",
                tight.endswith(wp438) and tight != wp438)
             ck("prepending does not disturb the birth-prompt parse (role/ticket/agent/deliverable)",
                (role_of(tight), ticket_of(tight), agent_of(tight), deliverable_of(tight))
-               == ("worker", 438, "coder-t438r1", "forge2/audio_tagger/tagger.py"),
+               == ("worker", 438, "coder-t438r1", FILE_D),
                str((role_of(tight), ticket_of(tight), agent_of(tight), deliverable_of(tight))))
-            noded = cerebras_worker_prompt("You are w-1, the coder — the worker of a build pair on "
-                                           "ticket #438.")
+
+            # RULE 1 QUOTES THE TICKET'S REAL FENCES. The bare ===ORIGINAL SOURCE=== of #438's own
+            # wording is a literal the ticketer never emits; sending GLM hunting for it is the bug.
+            if frt:
+                ck("the REAL begin fence carries a description — the bare '===ORIGINAL SOURCE===' is "
+                   "never emitted, so the directive must not send GLM looking for that literal",
+                   (frt.EMBED_BEGIN_FMT % frt.EMBED_DESC_TEXT) != "===ORIGINAL SOURCE==="
+                   and "===ORIGINAL SOURCE===" not in wp438)
+                ck("...and rule 1 quotes THIS ticket's actual begin/end lines, verbatim",
+                   (frt.EMBED_BEGIN_FMT % frt.EMBED_DESC_TEXT) in tight and frt.EMBED_END in tight)
+                ck("the gate is the ticketer's OWN predicate: has_embedded_source agrees with "
+                   "body_has_source on the real fence, the nonce'd fence, and a bare body",
+                   all(has_embedded_source(b) == frt.body_has_source(b) for b in (
+                       wp438, "no source here",
+                       "%s\nx\n%s" % (frt.EMBED_BEGIN_NONCE_FMT % ("abc123", frt.EMBED_DESC_TEXT),
+                                      frt.EMBED_END_NONCE_FMT % "abc123"))))
+                nonced = _ticket(FILE_D, desc=frt.EMBED_DESC_TEXT)
+                nonced = nonced.replace(frt.EMBED_BEGIN_FMT % frt.EMBED_DESC_TEXT,
+                                        frt.EMBED_BEGIN_NONCE_FMT % ("abc123", frt.EMBED_DESC_TEXT)) \
+                               .replace("\n" + frt.EMBED_END, "\n" + frt.EMBED_END_NONCE_FMT % "abc123")
+                ck("a NONCE'D fence (the ticketer's collision case) is quoted verbatim too, not "
+                   "mistaken for the plain one",
+                   (frt.EMBED_BEGIN_NONCE_FMT % ("abc123", frt.EMBED_DESC_TEXT))
+                   in cerebras_worker_prompt(nonced, FILE_D)
+                   and (frt.EMBED_END_NONCE_FMT % "abc123") in cerebras_worker_prompt(nonced, FILE_D))
+
+            # ── THE ACCEPTANCE SCENARIO ITSELF: a forge PACKAGE unit ──
+            # #438's acceptance is "a forge unit ... passes the forge harvest gate (parse +
+            # pyproject + package-check)". pair_loop ORDERS that worker to build the pyproject.toml,
+            # and pyproject.toml is a SIBLING of the module. A directive that forbids siblings while
+            # framed as overriding the ticket makes the package-check unpassable — #401's regression,
+            # which pair_loop's own selftest guards. This is the check that scenario gets.
+            print("-- #438 acceptance: the forge PACKAGE branch — the directive must not forbid the "
+                  "pyproject.toml the gate requires")
+            PKG_D = "checkouts/current/forge2/audio_tagger/tagger.py"
+            wpkg = _ticket(PKG_D, agent="coder-t438r1")
+            tpkg = cerebras_worker_prompt(wpkg, deliverable_of(wpkg))
+            if pl:
+                ck("the package fixture really is worker_scope's PACKAGE branch (what pair_loop "
+                   "emits for a forge unit)",
+                   pl.package_root_of(PKG_D) == "checkouts/current/forge2/audio_tagger"
+                   and "one module of the PACKAGE" in wpkg and "touch nothing else" not in wpkg)
+                ck("...and that branch is what ORDERS the pyproject.toml the harvest gate checks",
+                   "build the package there in full (its pyproject.toml" in flat(wpkg))
+            ck("scope_of reads the package root straight off pair_loop's own scope line",
+               scope_of(wpkg) == ("package", "checkouts/current/forge2/audio_tagger"), str(scope_of(wpkg)))
+            ck("scope_of reads the lone-file branch as 'file'", scope_of(wp438) == ("file", None))
+            ck("scope_of says UNKNOWN when neither phrase is there — silence cannot contradict",
+               scope_of("You are w-1, the coder — the worker of a build pair.") == ("unknown", None))
+            ck("THE #401 REGRESSION IS GONE: the assembled package prompt does NOT both order the "
+               "pyproject.toml and forbid siblings",
+               not ("do not create sibling files" in flat(tpkg)
+                    and "build the package there in full" in flat(tpkg)),
+               "the directive forbids the siblings the ticket below it requires")
+            ck("...the directive never tells a package worker to create no sibling files",
+               "sibling" not in flat(tpkg).split("TICKET:")[0])
+            ck("...it names the package's required files as REQUIRED, by the ticket's own nouns",
+               "its pyproject.toml, its config, its console entry points, its submodules. DO THAT"
+               in flat(tpkg))
+            ck("...and bounds them INSIDE the package root, which is where the harness commits from",
+               "Put every one of them INSIDE checkouts/current/forge2/audio_tagger/, and create "
+               "nothing outside it." in flat(tpkg))
+            ck("...the quoted-path line drops 'a sibling' from its failure list for a package "
+               "(an extra level and a rename still fail)",
+               "an extra directory level, a renamed file — fails the ticket" in flat(tpkg)
+               and ", a sibling" not in flat(tpkg))
+            ck("...but the lone-file branch KEEPS the sibling ban, which its 'touch nothing else' "
+               "scope really does mean",
+               "a renamed file, a sibling — fails the ticket" in flat(tight))
+            ck("...rule 3 bounds exploration by the package, not by the single module",
+               "Do NOT read, grep, or glob any module outside your own package "
+               "checkouts/current/forge2/audio_tagger/." in flat(tpkg))
+            ck("...and the closing order tells it to write the package files too",
+               "write the package's other required files (pyproject.toml and the rest the ticket "
+               "names) inside checkouts/current/forge2/audio_tagger/" in flat(tpkg))
+            ck("the package ticket still parses and is still prepended to, byte for byte",
+               tpkg.endswith(wpkg) and (role_of(tpkg), deliverable_of(tpkg)) == ("worker", PKG_D))
+
+            # ── THE PREMISE GATE: a non-forge ticket must not be told three falsehoods ──
+            print("-- #438: the directive fires ONLY where its premise holds (an embedded source)")
+            nonforge = ("You are coder-t438r1, the coder — the worker of a build pair on ticket "
+                        "#438.\n\nTICKET: Tighten the cerebras worker path in ollama_agent.py\n\n"
+                        "Deliverable: %s\n"
+                        % (pl.worker_scope(FILE_D, pl.package_root_of(FILE_D)) if pl else
+                           "write it to %s (create or overwrite that file; touch nothing else)." % FILE_D))
+            ck("a NON-forge ticket carries no embedded source (this module's own #438 is one)",
+               not has_embedded_source(nonforge))
+            ck("...so the directive does NOT fire: its rule 1 would assert the original is embedded "
+               "when it is not, and rule 3 would forbid the cross-module reads such a ticket needs",
+               cerebras_worker_prompt(nonforge, FILE_D) == nonforge)
+            ck("...and a forge ticket DOES still get it (the gate is not simply off)",
+               cerebras_worker_prompt(wp438, FILE_D) != wp438)
+
+            # THE STEP LOG MUST NOT LIE ABOUT THE RUN. #438's acceptance is read off this log ("zero
+            # reads of unrelated modules in its step log"), so whether the directive fired is a fact
+            # the log has to state. run_agent holds the same gate as cerebras_worker_prompt; if that
+            # copy ever drifts, the prompt still goes out ungated (the function is authoritative) but
+            # the log would announce a directive that did not fire, and a canary post-mortem would be
+            # chasing a rule the model never saw. These two checks are what make that drift visible.
+            logged = []
+            real_log = globals()["log"]
+            globals()["log"] = lambda m: logged.append(m)
+            try:
+                del sent[:]
+                nf = ("You are coder-t438r1, the coder — the worker of a build pair on ticket "
+                      "#438.\n\nTICKET: Tighten the cerebras worker path\n\nDeliverable: %s\n"
+                      % (pl.worker_scope("docs/seed.md", pl.package_root_of("docs/seed.md")) if pl
+                         else "write it to docs/seed.md (create or overwrite that file; touch "
+                              "nothing else)."))
+                scripted[:] = [reply('{"thought": "done", "tool": "finish", "args": {}}'),
+                               reply('{"done": true, "ref": "docs/seed.md", "note": "n"}')]
+                run_agent(nf, "Read,Write", cwd=base, flavor="openai", retries=1, timeout=60)
+                off_log = "\n".join(logged)
+                ck("a non-forge cerebras WORKER is really sent pair_loop's prompt unchanged, end to end",
+                   [b for p, b in sent if p == "/v1/chat/completions"][0]["messages"][1]["content"] == nf)
+                ck("...and its step log SAYS the directive is OFF, and why — a log that claims a "
+                   "directive the model never saw sends the next post-mortem hunting a ghost",
+                   "#438 cerebras worker directive OFF" in off_log
+                   and "premise does not hold" in off_log, off_log[-140:])
+
+                del logged[:], sent[:]
+                scripted[:] = [
+                    reply('{"thought": "rewrite", "tool": "Write", "args": {"file_path": "%s", '
+                          '"content": "print(1)\\n"}}' % PKG_D),
+                    reply('{"thought": "done", "tool": "finish", "args": {}}'),
+                    reply('{"done": true, "ref": "%s", "note": "n"}' % PKG_D)]
+                run_agent(wpkg, "Read,Write", cwd=base, flavor="openai", retries=1, timeout=60)
+                on_log = "\n".join(logged)
+                ck("...while the forge worker's log says ON and names the SCOPE it read, so the log "
+                   "shows which branch of rule 2 the model was actually given",
+                   "#438 cerebras worker directive ON" in on_log and "scope=package" in on_log
+                   and "are NOT siblings to refuse" in on_log, on_log[-140:])
+            finally:
+                globals()["log"] = real_log
+
+            # ── THE TRUNCATED BLOCK: the ticket says go read the forge; the directive must not
+            # ── override that into "rewrite from the excerpt".
+            if frt:
+                print("-- #438: a TRUNCATED source block — rule 1 stands down rather than order a "
+                      "rewrite from a prefix")
+                cut = _ticket(FILE_D, desc=frt.EMBED_DESC_TEXT_CUT)
+                tcut = cerebras_worker_prompt(cut, FILE_D)
+                ck("the ticketer's truncated fence is recognised as truncated",
+                   "TRUNCATED EXCERPT" in (frt.EMBED_BEGIN_FMT % frt.EMBED_DESC_TEXT_CUT))
+                ck("rule 1 does NOT claim the embedded bytes are the module",
+                   "Base your rewrite on THOSE bytes" not in tcut)
+                ck("...does NOT forbid the filesystem the ticket sends it to",
+                   "Do NOT search the filesystem for the original" not in tcut)
+                ck("...and hands it back to the ticket: canonical source, or report BLOCKED",
+                   "read the COMPLETE source from the canonical location it names, and report "
+                   "BLOCKED if you cannot reach it" in flat(tcut)
+                   and "Do NOT rewrite from the excerpt" in flat(tcut))
+                ck("...rule 3 grants the matching exception, so the two rules do not contradict",
+                   "The ONE exception is rule 1" in flat(tcut))
+                b64 = cerebras_worker_prompt(_ticket(FILE_D, desc=frt.EMBED_DESC_B64), FILE_D)
+                ck("a BASE64 block points at the ticket's decode command instead of calling the "
+                   "blob 'the source'",
+                   "Those bytes are BASE64 — decode them with the command your ticket gives under "
+                   "the block. Rewrite the DECODED module, never the base64 text." in flat(b64))
+                ck("...and a plain text block says nothing about base64",
+                   "BASE64" not in tight)
+
+            ck("the directive never claims to override the TICKET — only habits",
+               "they do NOT override the ticket that follows. Where a rule and your ticket differ, "
+               "the TICKET wins." in flat(tight))
+            noded = cerebras_worker_prompt(_ticket(FILE_D).replace("Deliverable: write it to %s "
+                                                                   "(create or overwrite that file; "
+                                                                   "touch nothing else)." % FILE_D, ""))
             ck("a prompt naming no deliverable still gets rules (a)/(b)/(c), just no quoted path",
-               "===END SOURCE===" in noded and "do not create sibling files." in flat(noded)
+               "===END SOURCE===" in noded and "EXACTLY the given deliverable" in flat(noded)
                and "character for character" not in noded)
 
             print("-- #438(d): 40 steps on the cerebras path, 12 everywhere else, override wins")
@@ -2165,25 +2594,37 @@ def selftest():
                 ck("broken shell quoting is refused with a message, not a traceback",
                    "could not parse the command" in str(e), str(e))
 
-            print("-- #438: end to end — what the cerebras WORKER is actually SENT, and the flat file")
+            print("-- #438: end to end — the ACCEPTANCE run: a forge unit, sent the real package "
+                  "prompt, writing the FLAT module and the pyproject the gate requires")
+            # The scripted replies are the behavior #438's acceptance names: the flat deliverable at
+            # exactly the ticket's path, plus the package's pyproject.toml beside it. The point is
+            # that the directive PERMITS this run — under the old blanket sibling ban a compliant
+            # worker could not have written that second file at all.
             del sent[:]
             scripted[:] = [
                 reply('{"thought": "rewrite the embedded source", "tool": "Write", "args": '
-                      '{"file_path": "forge2/audio_tagger/tagger.py", "content": "print(1)\\n"}}'),
+                      '{"file_path": "%s", "content": "print(1)\\n"}}' % PKG_D),
+                reply('{"thought": "the package needs its pyproject", "tool": "Write", "args": '
+                      '{"file_path": "checkouts/current/forge2/audio_tagger/pyproject.toml", '
+                      '"content": "[project]\\nname = \\"audio_tagger\\"\\n"}}'),
                 reply('{"thought": "done", "tool": "finish", "args": {}}'),
-                reply('{"done": true, "ref": "forge2/audio_tagger/tagger.py", "note": "rewrote it"}'),
+                reply('{"done": true, "ref": "%s", "note": "rewrote it"}' % PKG_D),
             ]
-            run_agent(wp438, "Read,Write,Bash(python3:*)", cwd=base, flavor="openai", retries=1,
+            run_agent(wpkg, "Read,Write,Bash(python3:*)", cwd=base, flavor="openai", retries=1,
                       timeout=60)
             first = [b for p, b in sent if p == "/v1/chat/completions"][0]
             ck("the cerebras worker's user message IS the directive followed by the ticket",
-               first["messages"][1]["content"] == tight, first["messages"][1]["content"][:70])
+               first["messages"][1]["content"] == tpkg, first["messages"][1]["content"][:70])
             ck("...and its system prompt carries the reinforced Bash contract",
                "NEVER a list" in first["messages"][0]["content"])
+            pkg_dir = os.path.join(base, "checkouts", "current", "forge2", "audio_tagger")
             ck("...and the FLAT deliverable really exists at the path the ticket named",
-               os.path.isfile(os.path.join(base, "forge2", "audio_tagger", "tagger.py")))
+               os.path.isfile(os.path.join(pkg_dir, "tagger.py")))
             ck("...with no spurious double-nesting beside it (forge2/<repo>/<repo>/mod.py)",
-               not os.path.exists(os.path.join(base, "forge2", "audio_tagger", "audio_tagger")))
+               not os.path.exists(os.path.join(pkg_dir, "audio_tagger")))
+            ck("...and the pyproject.toml the harvest gate (parse + pyproject + package-check) "
+               "requires landed FLAT beside it, which the directive must never forbid",
+               os.path.isfile(os.path.join(pkg_dir, "pyproject.toml")))
 
             # The directive is the WORKER's. The adversary is gpt-oss judging an artifact — it has no
             # deliverable to write and every rule above would be a lie to it.
@@ -2228,11 +2669,13 @@ def selftest():
             ck("...consuming every scripted reply (so the count is the budget, not the script)",
                scripted == [], str(len(scripted)))
 
+            # The prompt below is wpkg — the SAME forge ticket that just triggered the directive on
+            # the cerebras path. So this proves the ollama flavor is untouched by the engine gate,
+            # not merely that some prompt with no source block was left alone.
             print("-- #438: the OLLAMA flavor is untouched — same prompt, no directive, plain Bash")
             osent = []
             oscript = [{"message": {"content": '{"thought": "done", "tool": "finish", "args": {}}'}},
-                       {"message": {"content": '{"done": true, "ref": "forge2/audio_tagger/tagger.py",'
-                                               ' "note": "n"}'}}]
+                       {"message": {"content": '{"done": true, "ref": "%s", "note": "n"}' % PKG_D}}]
 
             def ollama_stub(path, body=None, timeout=600):
                 osent.append((path, body))
@@ -2245,15 +2688,16 @@ def selftest():
             _CTX_CACHE[ROLE_MODELS["worker"]] = 32768
             globals()["_ollama"] = ollama_stub
             try:
-                run_agent(wp438, "Read,Write,Bash(python3:*)", cwd=base, flavor="ollama", retries=1,
+                run_agent(wpkg, "Read,Write,Bash(python3:*)", cwd=base, flavor="ollama", retries=1,
                           timeout=60)
             finally:
                 globals()["_ollama"] = real_ollama
                 _TAGS_CACHE.pop(ROLE_MODELS["worker"], None)
                 _CTX_CACHE.pop(ROLE_MODELS["worker"], None)
             ochat = [b for p, b in osent if p == "/api/chat"]
-            ck("the ollama-flavor worker is sent pair_loop's birth prompt UNCHANGED (no directive)",
-               bool(ochat) and ochat[0]["messages"][1]["content"] == wp438,
+            ck("the ollama-flavor worker is sent pair_loop's birth prompt UNCHANGED (no directive), "
+               "even for the very forge ticket that triggers it on cerebras",
+               bool(ochat) and ochat[0]["messages"][1]["content"] == wpkg,
                (ochat[0]["messages"][1]["content"][:70] if ochat else "no /api/chat call"))
             ck("...and the plain Bash description, without the openai contract",
                bool(ochat) and "NEVER a list" not in ochat[0]["messages"][0]["content"])
