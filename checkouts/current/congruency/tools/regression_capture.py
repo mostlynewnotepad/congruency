@@ -26,7 +26,12 @@ WHAT IT DOES, in the order it does it:
                  nonce fence, the base64 case, and REFUSING a truncated excerpt); the entrypoint is
                  executed against them in a temp dir.
     3. MINT      a test asserting `entrypoint(input) == expected` is generated into the HARNESS-OWNED
-                 path `tests/regression/` under the unit's package.
+                 path `tests/regression/` under the unit's package ROOT — which is the commit's scope
+                 — while the guard resolves its module at the module's REAL position under that root
+                 (module_dir_parts(); 6 of the 9 forge2 units keep it a level deeper than the root).
+                 The guard's bytes are a pure function of what it guards, so a later round that
+                 re-captures the same repro re-mints the same path with the same bytes: idempotent,
+                 never a collision (mint_test_source()).
     4. VALIDATE  the minted test is proven RED against the exact worker blob that produced the
                  finding, GREEN against the original, and RED again under mutation — before it is
                  written. A test that fails any of the three is REJECTED and nothing is written.
@@ -96,6 +101,21 @@ THROWAWAY git repo, and proves: red-on-buggy, green-on-original, mutation-resist
 rejection, oracle-independence from both the worker and the finding, worker-scope exclusion of
 tests/regression/, guard-restores-tampering, no leak into prompt/lesson/playbook, and that OFF
 changes nothing. It never touches this repo, the db, or the network.
+
+Two of its checks are worth naming, because each is a defect this module shipped and no longer does,
+and both were invisible to a selftest that looked complete:
+  * IT RUNS THE MINTED GUARD FROM THE PATH IT LANDED AT, for a FLAT unit and a NESTED one, against
+    the pre-fix blob and the post-fix blob. run_test() lays out its own temp dir, which makes it the
+    wrong witness for a claim about the production layout: a guard that hard-coded the flat shape
+    passed all three validation gates and was still ModuleNotFoundError-red forever in a nested
+    worktree — against the buggy blob, the fixed blob, and the very original it had just been
+    validated green against. The nesting claims are checked against the LIVE pair_loop resolver and
+    this checkout's real forge2 paths, not against a comment.
+  * IT RE-CAPTURES THE SAME REPRO IN A LATER ROUND, which is #440's own premise (a failed round
+    re-runs a fresh worker on the same defect) and must be idempotent, not a collision. It also
+    forces the ledger-conflict rejection to prove the ORDERING: the ledger is consulted BEFORE the
+    file is written, so no rejection can leave the tree changed, disk and ledger disagreeing, and the
+    next guard() journaling the harness's own write as worker tampering.
 
 Exit codes:
     0  every check passed (--selftest) / the scope report printed (--verify-scope, --print-hook)
@@ -224,9 +244,48 @@ def tests_dir_for(deliverable, package=None):
     outside the fileset that gets committed. With no package (a lone-file deliverable) it falls back
     to the deliverable's own directory, and the minted test is then outside the single-file commit
     scope — which capture() handles by staging it explicitly. See stage in capture()'s docstring.
+
+    The guard lands at the PACKAGE ROOT even when the module is nested deeper (see
+    module_dir_parts()): the package root is the commit's scope, and a guard outside that scope is
+    a guard that never lands. It is module_dir_parts(), not this path, that tells the guard where
+    its module actually lives.
     """
     root = package or "/".join(_parts(deliverable)[:-1])
     return "/".join([p for p in (root, TESTS_DIR) if p])
+
+
+def module_dir_parts(deliverable, package=None):
+    """The path from the package ROOT down to the directory the module actually SITS in, as a list
+    of components. `[]` when the module sits flat at the root. None if the deliverable is not under
+    the package root at all (capture() then rejects rather than minting a guard that cannot import).
+
+    THIS IS THE FIX FOR THE NESTED UNIT. The guard is minted at `<pkg>/tests/regression/`
+    (tests_dir_for(), because that is the commit's scope), but the module it must import is NOT
+    necessarily at `<pkg>/<module>.py`. pair_loop's package_root_of() resolves the package to
+    `<...>/forge2/<repo>` (its `len(parts) - i >= 3` rule), and BOTH shapes are live in this corpus —
+    read off the checkout, not assumed:
+
+        forge2/artifact_tree_gen/add.py                    -> pkg .../artifact_tree_gen, dir []
+        forge2/agent_tools_suite/audit_guard.py            -> dir []                     (flat)
+        forge2/audio_tagger/audio_tagger/tagger.py         -> dir ['audio_tagger']
+        forge2/coupler/coupler/server.py                   -> dir ['coupler']            (nested)
+
+    ...and `forge2/code__code-invalid__coupler/` holds BOTH in one package: `coupler_tool.py` at the
+    root and `coupler/bridge.py` a level down. So the module's directory is a property of the
+    DELIVERABLE, never of the repo — there is no per-repo shape to hard-code, and --selftest checks
+    all of these against the LIVE pair_loop resolver rather than against this comment.
+
+    A guard that assumed the flat shape resolved its module to `<pkg>/<module>.py`, which for a
+    nested unit does not exist — so it raised ModuleNotFoundError against EVERY blob: the buggy one,
+    the fixed one, and the original the harness had just validated it green against. Red forever, and
+    worker-immutable, which is the worst possible artifact this module could mint. The guard now
+    computes its module's directory from THIS function and puts that directory on sys.path.
+    """
+    dp = _parts(deliverable)
+    root = _parts(package) if package else dp[:-1]
+    if dp[: len(root)] != root or len(dp) <= len(root):
+        return None
+    return dp[len(root): -1]
 
 
 def capture_enabled(mode=DEFAULT_MODE, registry=None):
@@ -271,15 +330,23 @@ def repros(verdict):
     """
     v = verdict or {}
     out = []
+    # The prose the verdict states alongside a top-level/plural repro, which names no finding of its
+    # own. It is PROVENANCE — the ledger's record of what the adversary said this repro was about —
+    # and it must be carried here, because the guard's own bytes deliberately do not hold it
+    # (mint_test_source()). Prose that reaches neither is prose the record loses.
+    loose = "; ".join(_finding_text(f) for f in (v.get("findings") or [])
+                      if _finding_text(f).strip() and not isinstance(f, dict))
     if isinstance(v.get("repro"), dict):
         out.append(dict(v["repro"]))
     for r in (v.get("repros") or []):
         if isinstance(r, dict):
             out.append(dict(r))
+    for r in out:
+        r.setdefault("finding", loose)
     for f in (v.get("findings") or []):
         if isinstance(f, dict) and isinstance(f.get("repro"), dict):
             r = dict(f["repro"])
-            r.setdefault("finding", _finding_text(f))
+            r.setdefault("finding", _finding_text(f))       # its OWN prose, not the loose prose
             out.append(r)
     return out
 
@@ -456,7 +523,10 @@ def _clean_env():
 
 @contextlib.contextmanager
 def _candidate_dir(module_src, module):
-    """A throwaway directory holding ONE candidate module, laid out like the package root."""
+    """A throwaway directory holding ONE candidate module, imported by BARE NAME — which is exactly
+    how the minted guard imports it (with the module's own directory on sys.path). The module's
+    position under the package root is irrelevant HERE for that reason, and this dir deliberately
+    does not model it; run_test(), whose whole subject is the guard's import walk, does."""
     d = tempfile.mkdtemp(prefix="rc-run-")
     try:
         with open(os.path.join(d, module + ".py"), "w", encoding="utf-8", newline="\n") as fh:
@@ -527,12 +597,28 @@ def _call_args(rep):
 #   * It runs under plain `python3 <file>` AND under pytest. pytest is not installable in a pair
 #     worktree (`pip install` needs an approval that never comes), so a guard only pytest can run is
 #     a guard the harness cannot validate — and an unvalidated guard is exactly what #440 forbids.
-#   * It finds its module by walking up from its own location (<pkg>/tests/regression/ -> <pkg>),
-#     which is how validation can run it against a candidate blob by laying a temp dir out the same
-#     way. No env var, no conftest, nothing for a worker to lean on.
+#   * It finds its module by walking up from its own location (<pkg>/tests/regression/ -> <pkg>) and
+#     then back DOWN the module's own directory (module_dir_parts(), baked in at mint time), which is
+#     how validation can run it against a candidate blob by laying a temp dir out the same way. No env
+#     var, no conftest, nothing for a worker to lean on.
+#     It puts ONLY that directory on sys.path — not the package root as well. Adding the root would
+#     be a harmless-looking belt-and-braces that quietly destroys the validation: run_test() lays the
+#     candidate out under a temp ROOT, so a root on sys.path lets a MISPLACED module be found anyway,
+#     and run_test() would go green on a layout it had got wrong. The one path that must work is the
+#     one path that is offered. (Mutation-tested: laying run_test()'s temp dir out flat is caught
+#     only because of this line.)
+#
+# The guard's BYTES are a pure function of (ticket, module, module dir, entrypoint, input, expected)
+# — the same tuple its filename digests. Nothing about WHICH ROUND filed the finding, or what the
+# adversary wrote about it, is in here; that provenance lives in the harness ledger. See
+# mint_test_source() for why: re-capturing the same defect in a later round is the normal flow, and a
+# guard whose bytes drifted with provenance would collide with its own path every time it happened.
 _TEST_TEMPLATE = '''# GENERATED — HARNESS-OWNED REGRESSION GUARD. DO NOT EDIT, WEAKEN OR DELETE (#440).
 #
-# Minted by tools/regression_capture.py from ticket #%(tid)d's CONFIRMED round-%(rnd)d finding.
+# Minted by tools/regression_capture.py from ticket #%(tid)d's CONFIRMED adversary finding. Which
+# round filed it, what the adversary wrote, and what the failing blob actually returned are recorded
+# in the harness ledger beside this file's sha256 — deliberately not in these bytes, which are a pure
+# function of the behavior being guarded.
 #
 # EXPECTED WAS NOT TAKEN FROM ANYONE'S OPINION. It was DERIVED by executing this entrypoint against
 # the ticket's embedded ===ORIGINAL SOURCE=== block: the original module is the oracle, because a
@@ -552,12 +638,12 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(os.path.dirname(_HERE))          # <pkg>/tests/regression/ -> <pkg>
-if _PKG not in sys.path:
-    sys.path.insert(0, _PKG)
+_MODDIR = os.path.join(_PKG, *%(moddir)r)   # ...then back DOWN to where the module actually sits
+if _MODDIR not in sys.path:                 # ONLY this dir: == _PKG when the module is flat, and
+    sys.path.insert(0, _MODDIR)             # for a nested module _PKG holds no module to import
 
 import %(module)s as _mod
 
-FINDING = %(prose)r
 ENTRYPOINT = %(entrypoint)r
 ARGS = %(args)r
 KWARGS = %(kwargs)r
@@ -578,7 +664,7 @@ def %(func)s():
     assert _outcome == EXPECTED, (
         "regression #%(tid)d: " + ENTRYPOINT + " with args=" + repr(ARGS) + " kwargs=" + repr(KWARGS)
         + " gives " + repr(_outcome) + "; the ORIGINAL module gives " + repr(EXPECTED)
-        + ". The finding this guards: " + repr(FINDING))
+        + ". This module (" + _mod.__file__ + ") must preserve the original's behavior here.")
 
 
 if __name__ == "__main__":
@@ -595,22 +681,48 @@ def _digest(*bits):
     return hashlib.sha256("\x00".join(json.dumps(b, sort_keys=True) for b in bits).encode()).hexdigest()
 
 
-def mint_test_source(tid, rnd, module, entrypoint, args, kwargs, expected, prose):
-    """The guard's source, and the function name inside it. Deterministic in every input.
+def guard_key(module, moddir, entrypoint, args, kwargs, expected):
+    """The tuple that determines a guard's bytes — and therefore also its filename (see mint_path()).
 
-    Deterministic on purpose: the filename carries a digest of (entrypoint, input, expected), so
-    re-capturing the same repro rewrites the same path with the same bytes — minting is additive and
-    idempotent, and two different expectations can never collide onto one file.
+    The two must be the same tuple. If the bytes depended on anything the path does not digest, two
+    different guards would collide onto one path; if the path digested anything the bytes do not use,
+    one guard would sprawl across many paths. Keeping them literally the same function of the same
+    inputs is what makes minting idempotent ACROSS ROUNDS, which is the flow #440 is built on: a
+    failed round re-runs a fresh worker against the same defect, and the same repro is re-captured.
+    """
+    return (module, list(moddir), entrypoint, args, kwargs, expected)
+
+
+def mint_path(tid, tests_dir, key):
+    """Where a guard lands: `<tests_dir>/test_t<tid>_<entrypoint>_<digest>.py`, digest over key."""
+    return "%s/test_t%d_%s_%s.py" % (tests_dir, tid, _slug(key[2]), _digest(tid, *key)[:8])
+
+
+def mint_test_source(tid, key):
+    """The guard's source, and the function name inside it. A PURE FUNCTION of (tid, key).
+
+    PURE ON PURPOSE, and this is the second fix this module carries. `key` is guard_key()'s tuple —
+    module, module dir, entrypoint, args, kwargs, expected — and mint_path() digests that same tuple
+    into the filename. So re-capturing the same repro produces the same path holding the SAME BYTES:
+    Ledger.add() sees an identical record and no-ops, and re-capture is idempotent rather than a
+    collision.
+
+    What is deliberately NOT in the bytes: the round number and the adversary's prose. They were,
+    once, and it was a defect — re-capturing the same defect in round 2 (the NORMAL flow: a failed
+    round re-runs a fresh worker on the same defect) landed the same path with different bytes, the
+    append-only ledger refused it, and a capture that had passed red-on-buggy, green-on-original and
+    mutation was journaled as a REJECTION. Provenance belongs in the ledger entry (which records the
+    round, the prose, the claimed `observed`, and what the worker's blob actually returned) and on the
+    journal. The guard asserts BEHAVIOR; who reported it and when is not behavior.
 
     Every value is emitted through repr() of a JSON-decoded object (dict/list/str/int/float/bool/
-    None), whose repr is always a valid Python literal. That is also why the adversary's prose goes
-    in as `FINDING = <repr>` rather than into a docstring: prose is arbitrary text and a docstring
-    would let a stray triple-quote or backslash write code into the guard.
+    None), whose repr is always a valid Python literal — so no value can write code into the guard.
     """
+    module, moddir, entrypoint, args, kwargs, expected = key
     func = "test_t%d_%s" % (tid, _slug(entrypoint))
     return _TEST_TEMPLATE % {
-        "tid": tid, "rnd": rnd, "module": module, "entrypoint": entrypoint, "func": func,
-        "args": args, "kwargs": kwargs, "expected": expected, "prose": prose or "(no prose given)",
+        "tid": tid, "module": module, "moddir": list(moddir), "entrypoint": entrypoint, "func": func,
+        "args": args, "kwargs": kwargs, "expected": expected,
     }, func
 
 
@@ -633,21 +745,35 @@ def _mutate(original_src, entrypoint):
                            "def %s(*_a, **_k):\n    return %r\n" % (top, MUTANT_SENTINEL))
 
 
-def run_test(test_src, module_src, module, timeout=RUN_TIMEOUT):
+def run_test(test_src, module_src, module, moddir=(), timeout=RUN_TIMEOUT):
     """Run a minted guard against one candidate blob. -> (passed, detail).
 
-    The temp dir is laid out EXACTLY like production — the module at the package root, the guard at
-    <root>/tests/regression/ — so the file being validated is the file that will be committed, byte
-    for byte, exercising the same import walk. Validating a rewritten or relocated copy would prove
-    something about a file nobody ever runs.
+    The temp dir is laid out like production AT THE ONE THING THAT DECIDES THE ANSWER: the module
+    sits at `<root>/<moddir>/<module>.py` — its real position relative to the package root, from
+    module_dir_parts() — and the guard at `<root>/tests/regression/`. So the file being validated is
+    the file that will be committed, byte for byte, resolving its module through the same walk it
+    will resolve it through in the worktree.
+
+    `moddir` is not an ornament. Laying every candidate out FLAT (module at the root, whatever its
+    real position) is what let a guard hard-coded to the flat shape pass all three validation gates
+    and still land red-forever on the 6 of 9 forge2 units whose module is nested: validation proved
+    a layout that only the validator ever built. A temp dir that does not reproduce the production
+    walk cannot validate the walk.
+
+    What is NOT reproduced, stated rather than implied: the candidate is the ONLY module in the tree.
+    A module needing its package siblings will not import here — but it will not import for
+    run_entrypoint() either, so the oracle comes back `import_error` and capture() rejects the repro
+    before a guard is ever minted. Fail-closed, and never a guard that passes here and fails there.
     """
     d = tempfile.mkdtemp(prefix="rc-validate-")
     try:
-        with open(os.path.join(d, module + ".py"), "w", encoding="utf-8", newline="\n") as fh:
+        md = os.path.join(d, *moddir)
+        os.makedirs(md, exist_ok=True)
+        with open(os.path.join(md, module + ".py"), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(module_src)
         td = os.path.join(d, "tests", "regression")
-        os.makedirs(td)
-        tp = os.path.join(td, "test_guard.py")
+        os.makedirs(td, exist_ok=True)      # exist_ok: a moddir of tests/regression/ is degenerate,
+        tp = os.path.join(td, "test_guard.py")      # but it must not crash the validator
         with open(tp, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(test_src)
         try:
@@ -703,9 +829,11 @@ class Ledger:
     """Every guard minted for one ticket: its path, its bytes and their sha256. Append-only.
 
     Append-only in the same sense the journal is: an entry is added and never rewritten. Re-minting
-    an identical guard is a no-op; a DIFFERENT source for a path already recorded is refused, which
-    cannot happen through mint_test_source() (the filename carries a digest of what determines the
-    bytes) and would mean something is wrong if it did.
+    an identical guard is a NO-OP that returns the ALREADY-RECORDED entry — so the first capture's
+    provenance (its round, its prose) survives every later re-capture of the same defect, which is
+    what append-only means here. A DIFFERENT source for a path already recorded is refused; that
+    cannot happen through mint_test_source(), whose bytes are a pure function of exactly the tuple
+    mint_path() digests, and it would mean the ledger or the digest is broken if it ever did.
     """
 
     def __init__(self, dirpath, tid):
@@ -722,20 +850,22 @@ class Ledger:
             return []
 
     def add(self, entry):
-        os.makedirs(self.dir, exist_ok=True)
+        """Record `entry`. -> (the RECORDED entry, is_new). Raises on a same-path/different-bytes
+        conflict, having written nothing."""
         tests = self.entries()
         for e in tests:
             if e["path"] == entry["path"]:
                 if e["sha256"] != entry["sha256"]:
                     raise Unexpected("ledger refuses to rewrite %s: it is already recorded with a "
                                      "different sha256 (append-only)" % entry["path"])
-                return False
+                return e, False          # already guarded: the FIRST capture's record stands
         tests.append(entry)
+        os.makedirs(self.dir, exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump({"ticket": self.tid, "tests": tests}, fh, indent=1)
         os.replace(tmp, self.path)
-        return True
+        return entry, True
 
 
 def _sha(text):
@@ -810,7 +940,15 @@ def _reject(rep, why, check=None):
 
 
 def _mint_one(worktree, tid, rnd, deliverable, package, original_src, rep, led, timeout):
-    """One repro -> (minted_entry, None) or (None, rejection). Writes NOTHING on a rejection."""
+    """One repro -> (minted_entry, None) or (None, rejection). Writes NOTHING on a rejection.
+
+    "Writes nothing on a rejection" is an ORDERING, not an intention: every gate below returns before
+    the single write at the bottom, and that write happens only AFTER the ledger has accepted the
+    entry. It used to run before, which meant a rejection could still change the tree and leave disk
+    and ledger disagreeing — after which the next guard() read the harness's own write as worker
+    tampering and journaled a false accusation to an append-only record. The ledger is the authority,
+    so the ledger goes first: if add() refuses, nothing was written and there is nothing to diverge.
+    """
     ep = rep.get("entrypoint")
     if not isinstance(ep, str) or not ep or not all(p.isidentifier() for p in ep.split(".")):
         return None, _reject(rep, "the repro names no usable `entrypoint` (want a dotted attribute "
@@ -823,6 +961,11 @@ def _mint_one(worktree, tid, rnd, deliverable, package, original_src, rep, led, 
     module = module[:-3]
     if not module.isidentifier():
         return None, _reject(rep, "the deliverable's module name %r is not importable" % module)
+    moddir = module_dir_parts(deliverable, package)
+    if moddir is None:
+        return None, _reject(rep, "the deliverable %s does not live under the package root %s that "
+                                  "pair_loop resolved, so the guard could not be given a working "
+                                  "path to its module" % (deliverable, package))
     args, kwargs = _call_args(rep)
     try:
         args, kwargs = json.loads(json.dumps(args)), json.loads(json.dumps(kwargs))
@@ -847,39 +990,46 @@ def _mint_one(worktree, tid, rnd, deliverable, package, original_src, rep, led, 
                              check="green-on-original")
     actual = run_entrypoint(worker_src, module, ep, args, kwargs, timeout)
 
-    prose = rep.get("finding") or ""
-    src, func = mint_test_source(tid, rnd, module, ep, args, kwargs, expected, prose)
-    rel = "%s/test_t%d_%s_%s.py" % (tests_dir_for(deliverable, package), tid, _slug(ep),
-                                    _digest(ep, args, kwargs, expected)[:8])
+    key = guard_key(module, moddir, ep, args, kwargs, expected)
+    src, func = mint_test_source(tid, key)
+    rel = mint_path(tid, tests_dir_for(deliverable, package), key)
 
     # 4. THE VALIDATION INVARIANT — all three, or nothing is written.
-    red, red_out = run_test(src, worker_src, module, timeout)
+    red, red_out = run_test(src, worker_src, module, moddir, timeout)
     if red:
         return None, _reject(rep, "BOGUS CAPTURE: the minted guard PASSES against the exact worker "
                                   "blob that produced the finding, so this repro does not reproduce "
                                   "the failure (the worker agrees with the original at this input: "
                                   "%r). Nothing minted." % (expected,), check="red-on-buggy")
-    green, green_out = run_test(src, original_src, module, timeout)
+    green, green_out = run_test(src, original_src, module, moddir, timeout)
     if not green:
         return None, _reject(rep, "the minted guard FAILS against the ticket's embedded original — "
                                   "the oracle or the input is malformed, so the guard would outlaw "
                                   "the original's own behavior. Nothing minted. Detail: %s" % green_out,
                              check="green-on-original")
-    mut, _ = run_test(src, _mutate(original_src, ep), module, timeout)
+    mut, _ = run_test(src, _mutate(original_src, ep), module, moddir, timeout)
     if mut:
         return None, _reject(rep, "the minted guard SURVIVES re-introducing the defect — it asserts "
                                   "nothing load-bearing about %s. Nothing minted." % ep,
                              check="mutation-resistant")
 
+    # THE LEDGER FIRST, THE TREE SECOND. add() raises only on a same-path/different-bytes conflict —
+    # impossible while the bytes and the path digest the same tuple (guard_key()), so this is a
+    # fail-closed backstop against a broken digest, not a path a normal round can reach. A later
+    # round re-capturing this same repro lands here with byte-identical `src`: add() no-ops, returns
+    # round 1's record, and the write below rewrites the file with the bytes it already holds.
+    entry = {"path": rel, "sha256": _sha(src), "source": src, "entrypoint": ep, "round": rnd,
+             "expected": expected, "actual": actual, "observed_claimed": rep.get("observed"),
+             "finding": rep.get("finding") or "", "minted": time.strftime("%Y-%m-%dT%H:%M:%S"),
+             "func": func, "module_dir": list(moddir)}
+    recorded, is_new = led.add(entry)
     p = os.path.join(worktree, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(src)
-    entry = {"path": rel, "sha256": _sha(src), "source": src, "entrypoint": ep, "round": rnd,
-             "expected": expected, "actual": actual, "observed_claimed": rep.get("observed"),
-             "minted": time.strftime("%Y-%m-%dT%H:%M:%S"), "func": func}
-    led.add(entry)
-    return entry, None
+        fh.write(recorded["source"])
+    out = dict(recorded)
+    out["recaptured"] = not is_new       # this repro was already guarded by an earlier round
+    return out, None
 
 
 def capture(worktree, tid, deliverable, package, ticket_body, verdict, rnd=1, mode=DEFAULT_MODE,
@@ -952,11 +1102,13 @@ def _note(out, extra=""):
     if g:
         bits.append(g)
     for m in out["minted"]:
-        bits.append("regression guard MINTED %s (%s): validated red against the round's worker blob, "
+        bits.append("regression guard %s %s (%s): validated red against the round's worker blob, "
                     "green against the ticket's embedded original, and red again under mutation. "
                     "`expected` was derived from the ORIGINAL, not from the worker or the finding. "
                     "It is an additive floor, not the round gate."
-                    % (m["path"], m["entrypoint"]))
+                    % ("RE-CONFIRMED (already guarded since round %s; the guard's bytes are "
+                       "unchanged)" % m.get("round") if m.get("recaptured") else "MINTED",
+                       m["path"], m["entrypoint"]))
         if m.get("observed_claimed") is not None and m["observed_claimed"] != (m["actual"][1] if
                                                                                m["actual"][0] == "return" else None):
             bits.append("...the finding CLAIMED observed=%r; the worker blob actually gives %r. The "
@@ -1377,12 +1529,189 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
            not run_test(guard_src, _ST_BUGGY, "clamp")[0]
            and all(s in run_test(guard_src, _ST_BUGGY, "clamp")[1] for s in ("clamp", "[10, 0, 5]", "5")),
            run_test(guard_src, _ST_BUGGY, "clamp")[1])
-        ck("minting is deterministic and idempotent (same repro -> same path, same bytes)",
-           mint_test_source(440, 1, "clamp", "clamp", [10, 0, 5], {}, ["return", 5], "p")[0]
-           == mint_test_source(440, 1, "clamp", "clamp", [10, 0, 5], {}, ["return", 5], "p")[0])
+        k = guard_key("clamp", [], "clamp", [10, 0, 5], {}, ["return", 5])
+        ck("minting is deterministic (same key -> same bytes)",
+           mint_test_source(440, k)[0] == mint_test_source(440, k)[0])
+        ck("the guard's bytes carry NEITHER the round number NOR the adversary's prose — the two "
+           "things that vary between rounds. They are provenance and they live in the ledger; if "
+           "they were in these bytes, re-capturing the same repro would collide with its own path",
+           "clamp is wrong at the upper bound" not in guard_src and "round-1" not in guard_src,
+           guard_src[:200])
+        ck("...and the ledger holds that provenance instead, so nothing is lost",
+           led.entries()[0]["finding"] == "clamp is wrong at the upper bound"
+           and led.entries()[0]["round"] == 1, str(led.entries()[0].get("finding")))
+        ck("the path digests exactly the tuple the bytes are built from (no collision, no sprawl)",
+           mint_path(440, "p", k) == mint_path(440, "p", guard_key("clamp", [], "clamp", [10, 0, 5],
+                                                                   {}, ["return", 5]))
+           and mint_path(440, "p", k) != mint_path(440, "p", guard_key("clamp", [], "clamp",
+                                                                       [10, 0, 5], {}, ["return", 6])))
         ck("the ledger recorded the guard's sha256 OUTSIDE the worktree",
            led.entries() and led.entries()[0]["sha256"] == _sha(guard_src)
            and not os.path.abspath(led.path).startswith(os.path.abspath(wt)), str(led.path))
+
+        # ── 3b. THE GUARD MUST RUN WHERE IT LANDS — flat AND nested, executed in the worktree ──
+        # run_test() validates in a temp dir it lays out itself, which makes it the wrong witness for
+        # a claim about the production layout: a guard hard-coded to the flat shape passed all three
+        # gates in a flat temp dir and was still red-forever in a nested worktree. So this proves the
+        # acceptance criterion the way the acceptance criterion is written — the file where the
+        # harness put it, run against the pre-fix and post-fix blobs, in the tree.
+        print("-- 3b. the minted guard runs from the path it LANDED at — flat and nested")
+
+        def run_landed(wt_, rel_, deliv_, blob):
+            """Run the guard where the harness actually put it, with `blob` as the module. No temp
+            dir, no relocation, no run_test(): if the two ever disagree, run_test() is the liar."""
+            with open(os.path.join(wt_, deliv_), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(blob)
+            r_ = subprocess.run([sys.executable, "-B", os.path.join(wt_, rel_)], cwd=wt_,
+                                capture_output=True, text=True, timeout=RUN_TIMEOUT, env=_clean_env())
+            return r_.returncode, ((r_.stdout or "") + (r_.stderr or "")).strip()[-200:]
+
+        cb, ob = run_landed(wt, rel, deliv, _ST_BUGGY)
+        cf, of = run_landed(wt, rel, deliv, _ST_FIXED)
+        run_landed(wt, rel, deliv, _ST_BUGGY)          # leave the worktree as the later checks expect
+        ck("FLAT unit: the landed guard is RED on the pre-fix blob and GREEN after the fix",
+           cb == 1 and cf == 0, "buggy exit=%s (%s) | fixed exit=%s (%s)" % (cb, ob, cf, of))
+
+        # The NESTED unit: <repo>/<subpkg>/<module>.py — the shape a flat assumption mints a
+        # permanently-red, worker-immutable guard for. pair_loop resolves the package to <repo>, so
+        # the guard lands at <repo>/tests/regression/ while the module sits at <repo>/<subpkg>/;
+        # module_dir_parts() is what bridges the two.
+        npkg = "checkouts/current/forge2/rc_nested"
+        ndeliv = npkg + "/rc_nested/clamp.py"
+        wtN2 = os.path.join(tmp, "wtNested")
+        os.makedirs(os.path.join(wtN2, npkg, "rc_nested"))
+        with open(os.path.join(wtN2, ndeliv), "w") as fh:
+            fh.write(_ST_BUGGY)
+        ledN2 = Ledger(os.path.join(tmp, "lNest"), 453)
+        rN2 = capture(wtN2, 453, ndeliv, npkg, _st_body(), verdict, 1, mode="on", ledger=ledN2)
+        ck("a NESTED unit mints a guard", len(rN2["minted"]) == 1 and not rN2["rejected"], str(rN2["rejected"]))
+        relN2 = rN2["minted"][0]["path"] if rN2["minted"] else ""
+        ck("...at the PACKAGE ROOT's %s/ (the #409 commit scope), not beside the module" % TESTS_DIR,
+           relN2.startswith(npkg + "/" + TESTS_DIR + "/"), relN2)
+        ck("...and it knows the module sits a level deeper", rN2["minted"] and
+           rN2["minted"][0]["module_dir"] == ["rc_nested"], str(rN2["minted"][0].get("module_dir") if rN2["minted"] else None))
+        if relN2:
+            cb, ob = run_landed(wtN2, relN2, ndeliv, _ST_BUGGY)
+            cf, of = run_landed(wtN2, relN2, ndeliv, _ST_FIXED)
+            co, oo = run_landed(wtN2, relN2, ndeliv, _ST_ORIGINAL)
+            ck("NESTED unit, THE ACCEPTANCE CRITERION: the landed guard is RED on the pre-fix blob "
+               "and GREEN after the fix (a flat-layout assumption makes this red forever, against "
+               "every blob including the original it was validated green against)",
+               cb == 1 and cf == 0, "buggy exit=%s (%s) | fixed exit=%s (%s)" % (cb, ob, cf, of))
+            ck("...and GREEN against the original in the tree, agreeing with the validation that "
+               "let it be written (run_test()'s answer and the worktree's answer are the same answer)",
+               co == 0, "original exit=%s (%s)" % (co, oo))
+
+        ck("module_dir_parts(): flat -> [], nested -> the subpackage, outside the root -> None "
+           "(rejected, never a guard that cannot import)",
+           module_dir_parts(deliv, pkg) == [] and module_dir_parts(ndeliv, npkg) == ["rc_nested"]
+           and module_dir_parts("a/b/c.py", "x/y") is None)
+
+        # Grounded against the REAL corpus paths and the LIVE pair_loop, not against my idea of them.
+        try:
+            _pl = _import_pair_loop()
+            real = ("checkouts/current/forge2/audio_tagger/audio_tagger/tagger.py",
+                    "checkouts/current/forge2/coupler/coupler/server.py",
+                    "checkouts/current/forge2/code__code-invalid__coupler/coupler/bridge.py")
+            ck("the LIVE pair_loop resolves the real nested corpus units to <...>/forge2/<repo>, "
+               "which is why the guard's module is NOT at the package root for them",
+               all(_pl.package_root_of(p) == "/".join(p.split("/")[:4]) for p in real),
+               str([(p, _pl.package_root_of(p)) for p in real]))
+            ck("...and module_dir_parts() finds each one's real module directory",
+               [module_dir_parts(p, _pl.package_root_of(p)) for p in real]
+               == [["audio_tagger"], ["coupler"], ["coupler"]],
+               str([module_dir_parts(p, _pl.package_root_of(p)) for p in real]))
+            flats = ("checkouts/current/forge2/artifact_tree_gen/add.py",
+                     "checkouts/current/forge2/agent_tools_suite/audit_guard.py")
+            ck("...while the real FLAT corpus units resolve to [] — both shapes are live in forge2, "
+               "so neither may be hard-coded",
+               all(module_dir_parts(p, _pl.package_root_of(p)) == [] for p in flats),
+               str([(p, module_dir_parts(p, _pl.package_root_of(p))) for p in flats]))
+            # The decisive one: ONE package holding BOTH shapes. There is no per-repo answer to
+            # hard-code — the module's directory is a property of the DELIVERABLE.
+            mixed = "checkouts/current/forge2/code__code-invalid__coupler"
+            ck("...and one real package holds BOTH shapes at once (coupler_tool.py at the root, "
+               "coupler/bridge.py a level down), so the shape is per-DELIVERABLE, not per-repo",
+               module_dir_parts(mixed + "/coupler_tool.py", _pl.package_root_of(mixed + "/coupler_tool.py")) == []
+               and module_dir_parts(mixed + "/coupler/bridge.py",
+                                    _pl.package_root_of(mixed + "/coupler/bridge.py")) == ["coupler"])
+            ck("...and those two real corpus paths exist as described (the claim above is about this "
+               "checkout, not about a remembered layout)",
+               all(os.path.isfile(os.path.join(ROOT, mixed, x))
+                   for x in ("coupler_tool.py", "coupler/bridge.py")))
+        except Exception as e:  # noqa: BLE001
+            ck("pair_loop importable so the nesting claim can be grounded in its real resolver",
+               False, str(e))
+
+        # ── 3c. cross-round RE-CAPTURE — pair_loop's normal flow, and it must not be an error ──
+        # #440's premise IS this flow: a failed round journals the findings and re-runs a FRESH
+        # worker on the same defect. Round 2's adversary re-files the same repro in different words.
+        print("-- 3c. re-capturing the same repro in a later round is idempotent, not a collision")
+        wtR = os.path.join(tmp, "wtRounds")
+        os.makedirs(os.path.join(wtR, pkg))
+        with open(os.path.join(wtR, deliv), "w") as fh:
+            fh.write(_ST_BUGGY)
+        ledR = Ledger(os.path.join(tmp, "lR"), 454)
+        rr1 = capture(wtR, 454, deliv, pkg, _st_body(), verdict, 1, mode="on", ledger=ledR)
+        relR = rr1["minted"][0]["path"] if rr1["minted"] else ""
+        sha_r1 = _sha(_read_text(os.path.join(wtR, relR))) if relR else ""
+        with open(os.path.join(wtR, deliv), "w") as fh:      # a fresh worker; the same defect
+            fh.write(_ST_BUGGY)
+        v2 = {"verdict": "fail",
+              "findings": ["round two: the upper bound is STILL off by one and this prose is new"],
+              "repro": {"entrypoint": "clamp", "input": {"args": [10, 0, 5]}, "observed": 4}}
+        rr2 = capture(wtR, 454, deliv, pkg, _st_body(), v2, 2, mode="on", ledger=ledR)
+        ck("round 2 re-capturing the same repro is NOT rejected — it re-confirms the guard",
+           len(rr2["minted"]) == 1 and not rr2["rejected"], str(rr2["rejected"]))
+        ck("...landing the SAME path with BYTE-IDENTICAL content, though the round and the prose "
+           "both changed",
+           rr2["minted"] and rr2["minted"][0]["path"] == relR
+           and _sha(_read_text(os.path.join(wtR, relR))) == sha_r1)
+        ck("...the ledger still holds exactly ONE entry, still stamped round 1 and round 1's prose "
+           "(append-only: a re-capture re-confirms, it does not rewrite the record)",
+           len(ledR.entries()) == 1 and ledR.entries()[0]["round"] == 1
+           and ledR.entries()[0]["finding"] == "clamp is wrong at the upper bound",
+           str([(e["round"], e["finding"][:30]) for e in ledR.entries()]))
+        ck("...it is reported as a re-capture, not passed off as a fresh mint",
+           rr2["minted"] and rr2["minted"][0].get("recaptured") is True)
+        ck("...and journaled as RE-CONFIRMED, accusing nobody",
+           "RE-CONFIRMED" in rr2["note"] and "the worker modified" not in rr2["note"], rr2["note"][:180])
+        ck("...disk and ledger AGREE afterwards", relR and
+           _sha(_read_text(os.path.join(wtR, relR))) == ledR.entries()[0]["sha256"])
+        gR = guard(wtR, 454, mode="on", ledger=ledR)
+        ck("...so the next guard() finds it INTACT and journals nothing: the harness never accuses "
+           "the worker of the harness's own write",
+           not gR["tampered"] and gR["intact"] == [relR] and guard_note(gR) == "", str(gR))
+        rr3 = capture(wtR, 454, deliv, pkg, _st_body(), verdict, 3, mode="on", ledger=ledR)
+        ck("...and a THIRD round is still stable (idempotent, not merely two-round-tolerant)",
+           len(rr3["minted"]) == 1 and not rr3["rejected"] and len(ledR.entries()) == 1
+           and not guard(wtR, 454, mode="on", ledger=ledR)["tampered"], str(rr3["rejected"]))
+
+        # The ledger-CONFLICT rejection. mint_test_source() cannot reach it (bytes and path are the
+        # same function of the same tuple), so it is FORCED here, because the ORDERING is the point:
+        # a rejection must not leave a write behind. Writing the file before the ledger accepted it
+        # is what turned a refused capture into a tree change, disk/ledger divergence, and a false
+        # tampering accusation on the append-only record.
+        wtC = os.path.join(tmp, "wtConflict")
+        os.makedirs(os.path.join(wtC, pkg))
+        with open(os.path.join(wtC, deliv), "w") as fh:
+            fh.write(_ST_BUGGY)
+        ledC = Ledger(os.path.join(tmp, "lC"), 455)
+        relC = mint_path(455, tests_dir_for(deliv, pkg),
+                         guard_key("clamp", [], "clamp", [10, 0, 5], {}, ["return", 5]))
+        ledC.add({"path": relC, "sha256": _sha("other bytes"), "source": "other bytes"})
+        # capture() restores the ledger's guards before it mints — that write is guard() doing its
+        # job, not the subject here. Let it happen first, THEN snapshot, so the only thing the
+        # before/after diff can attribute to the rejection is the rejection.
+        guard(wtC, 455, mode="on", ledger=ledC)
+        beforeC = _tree(wtC)
+        rC = capture(wtC, 455, deliv, pkg, _st_body(), verdict, 1, mode="on", ledger=ledC)
+        ck("a ledger CONFLICT (same path, different bytes) is REJECTED, not silently overwritten",
+           not rC["minted"] and rC["rejected"] and "append-only" in rC["rejected"][0]["reason"],
+           str(rC["rejected"]))
+        ck("...and wrote NOTHING to the tree: the ledger is consulted BEFORE the file is written, so "
+           "no rejection can leave disk and ledger disagreeing",
+           _tree(wtC) == beforeC, str(set(_tree(wtC)) ^ set(beforeC)))
 
         # a `raises` expectation mints and validates the same way
         rep_raise = {"entrypoint": "kind", "input": {"args": ["x"]}}
