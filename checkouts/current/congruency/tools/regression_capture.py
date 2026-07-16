@@ -10,21 +10,39 @@ and drops the repro. This module captures that repro and mints a regression test
 
 THE ORACLE IS THE ORIGINAL — NOT THE WORKER, NOT THE FINDING. A forge rewrite is behavior-preserving
 against the original module, whose bytes are embedded VERBATIM in the ticket body between the marker
-lines `===ORIGINAL SOURCE (...)===` and `===END SOURCE===` (forge_refactor_ticketer.py:604-612,
-embed_source():854-891). `expected` is therefore DERIVED here, by executing `entrypoint(input)`
-against those embedded bytes in a throwaway directory. The worker's output is never consulted for
-correctness, and the finding's `observed` field is recorded but never trusted. The worker cannot
-define correctness, and neither can the adversary.
+lines `===ORIGINAL SOURCE (...)===` and `===END SOURCE===` (forge_refactor_ticketer.py, its
+embed_source()/_marks()/source_block()). `expected` is therefore DERIVED here, by executing
+`entrypoint(input)` against those embedded bytes in a throwaway directory. The worker's output is
+never consulted for correctness, and the finding's `observed` field is recorded but never trusted.
+The worker cannot define correctness, and neither can the adversary.
+
+READ parse_original() BEFORE TRUSTING THAT PARAGRAPH: those marker lines appear in a real ticket body
+FOUR times, not two. source_block() writes a preamble that QUOTES both of them indented four spaces
+before it emits the real, unindented fence — so the first pair is a DECOY, and a parser that compares
+`line.strip()` reads the one line between the decoys, `'and ENDS at the first line'`, as if it were
+the module. This module did exactly that, and the oracle was broken on 100% of real tickets while
+--selftest stayed green, because the fixture hand-rolled the body instead of calling the owner. Both
+halves are fixed (_fence_begins() anchors on column 0; _st_body() CALLS source_block()), and both
+fixes are mutation-tested — see parse_original() and _strip_anchored().
 
 WHAT IT DOES, in the order it does it:
 
+    0. PRODUCE   AUDITOR_REPRO_SCHEMA is the text that makes an adversary EMIT a repro at all —
+                 spliced into the ADVERSARY's birth prompt only (HOOK_PATCH site 6), never the
+                 worker's. Today's AUDITOR_PROMPT offers no repro slot, so without this site every
+                 other step below is dead code on every real round: the consumer was complete and
+                 the feature was inert. See "1b. THE PRODUCER".
     1. SCHEMA    repros() reads a fail verdict's structured repro — {entrypoint, input, observed} —
                  from any of three backward-compatible spellings (see repros()). `expected` is NOT
                  part of the schema: it is derived (2). A verdict with no repro mints nothing and is
-                 not an error: prose findings are still first-class.
+                 not an error: prose findings are still first-class. --selftest proves the PRODUCER
+                 and the CONSUMER agree by parsing the schema's own example back out of the text an
+                 adversary is shown and feeding it through repros().
     2. ORACLE    parse_original() lifts the original's bytes out of the ticket body (handling the
-                 nonce fence, the base64 case, and REFUSING a truncated excerpt); the entrypoint is
-                 executed against them in a temp dir.
+                 DECOY the owner's preamble plants, the nonce fence, the base64 case, and REFUSING a
+                 truncated excerpt); the entrypoint is executed against them in a temp dir. Measured
+                 against the live db: 56/56 real ticket bodies that carry an embedded original parse
+                 BYTE-IDENTICAL to the git blob sha1 the ticket itself declares.
     3. MINT      a test asserting `entrypoint(input) == expected` is generated into the HARNESS-OWNED
                  path `tests/regression/` under the unit's package ROOT — which is the commit's scope
                  — while the guard resolves its module at the module's REAL position under that root
@@ -72,6 +90,13 @@ ANTI-GAMING:
     playbook is compiled from those lessons (--compile-playbook), the capture details cannot reach
     docs/PLAYBOOK.md either. --selftest proves the whole chain — verdict -> worker prompt -> lesson
     -> playbook body — clean, using pair_loop's REAL prompt template and REAL body expression.
+  * THE PRODUCER IS ADVERSARY-FACING, STRUCTURALLY. AUDITOR_REPRO_SCHEMA reaches the adversary's
+    prompt through a `%(repro_schema)s` slot that exists ONLY in AUDITOR_PROMPT. pair_loop formats
+    both templates from one ctx, and %-formatting drops a key the template does not name — so the
+    worker cannot see the schema even though its own prompt is built from the dict carrying it. Not
+    a filter that could be forgotten: the shape of the templates. --selftest renders pair_loop's REAL
+    worker prompt with capture ON to prove it, and the schema names no capture machinery anyway, so
+    an adversary parroting its own prompt into its prose still leaks nothing.
   * NOT A SECRET FILE. The minted test lives in the worktree and the worker can read it; that is
     unavoidable, because a guard that does not land is not a guard. It is stated here rather than
     over-claimed: "invisible" means the two channels above, not the filesystem. Reading it wins
@@ -90,9 +115,11 @@ TOGGLE — DEFAULT OFF, and OFF is a byte-for-byte no-op:
 
 USAGE — this module is a LIBRARY with a self-proving CLI. It is called by pair_loop through a thin
 hook: two one-line calls (guard() before the commit, capture() after a fail verdict) plus an import,
-a flag, and ONE changed line at the verdict journal — five small sites, deliberately NOT a pair_loop
-rewrite, because the #279 regression came from exactly that. `--print-hook` prints the exact patch
-and --selftest checks every line it quotes against the live pair_loop:
+a flag, ONE changed line at the verdict journal, and the adversary's verdict schema (the PRODUCER,
+without which the rest is inert) — six small sites, deliberately NOT a pair_loop rewrite, because
+the #279 regression came from exactly that. `--print-hook` prints the exact patch and --selftest
+checks every line it quotes against the live pair_loop, and renders its REAL prompt templates in
+both toggle states:
 
     python3 regression_capture.py --selftest        # prove the method; no network, no db, no repo writes
     python3 regression_capture.py --verify-scope    # re-prove the scoping claims above against pair_loop
@@ -104,8 +131,22 @@ rejection, oracle-independence from both the worker and the finding, worker-scop
 tests/regression/, guard-restores-tampering, no leak into prompt/lesson/playbook, and that OFF
 changes nothing. It never touches this repo, the db, or the network.
 
-Two of its checks are worth naming, because each is a defect this module shipped and no longer does,
-and both were invisible to a selftest that looked complete:
+Four of its checks are worth naming, because each is a defect this module SHIPPED and no longer does,
+and every one of them was invisible to a selftest that looked complete:
+  * IT BUILDS ITS TICKET-BODY FIXTURE BY CALLING source_block(), the owner's whole function, rather
+    than re-implementing its final append. The re-implementation omitted the marker-quoting preamble
+    — the DECOY — so parse_original() was proven against a format nothing writes, and the oracle was
+    broken on 100% of real tickets behind a green selftest. The parse is now anchored on column 0 and
+    the fixture carries the decoy; --selftest asserts the decoy is THERE, asserts the old
+    `line.strip()` anchor still reads `'and ENDS at the first line'` out of it (_strip_anchored(), a
+    mutation test of the check itself), and round-trips six blob shapes through the owner byte for
+    byte. Reverting either half turns --selftest red.
+  * IT RENDERS pair_loop's REAL AUDITOR_PROMPT AND ASSERTS THE REPRO SLOT IS ACTUALLY OFFERED. The
+    module once implemented only the CONSUMER: nothing made an adversary emit {entrypoint, input,
+    observed}, the live prompt has no slot for one, and so capture() took its "no repro — nothing
+    minted" path on every real round. A complete, well-tested, inert feature. The producer is
+    AUDITOR_REPRO_SCHEMA (hook site 6), and the loop is closed by parsing the schema's own example
+    back out of the rendered prompt and feeding it to repros().
   * IT RUNS THE MINTED GUARD FROM THE PATH IT LANDED AT, for a FLAT unit and a NESTED one, against
     the pre-fix blob and the post-fix blob. run_test() lays out its own temp dir, which makes it the
     wrong witness for a claim about the production layout: a guard that hard-coded the flat shape
@@ -178,7 +219,7 @@ class Unexpected(RuntimeError):
 # ── the embedded-original fence (forge_refactor_ticketer.py:604-612 — its OWNER) ─────────────────
 # Mirrored, not imported: this module must stand alone (it is called from a hook and must not drag a
 # ticket factory in with it). Mirroring risks DRIFT, so --selftest imports the owner and asserts
-# these five constants still match it — if the fence ever moves, that check goes red here first.
+# these six constants still match it — if the fence ever moves, that check goes red here first.
 EMBED_BEGIN_SENTINEL = "===ORIGINAL SOURCE"
 EMBED_END_SENTINEL = "===END SOURCE"
 EMBED_BEGIN_FMT = "===ORIGINAL SOURCE (%s)==="
@@ -362,6 +403,86 @@ def _finding_text(f):
     return str(f)
 
 
+# ── 1b. THE PRODUCER: the text that makes an adversary EMIT a repro ──────────────────────────────
+# Everything above this line CONSUMES a repro. Nothing above it makes one exist — and the live
+# AUDITOR_PROMPT (pair_loop.py) mandates the adversary's last line as exactly
+#     {"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}
+# whose `findings` is a list of STRINGS with no slot for a repro, while neither build/bug audit_focus
+# asks for one. So a verdict conforming to today's prompt carries nothing for repros() to read, and
+# capture() takes its "no repro — nothing minted" path on EVERY round: the consumer was complete and
+# the feature was inert. This constant is the missing half, and HOOK_PATCH's site 6 is where
+# pair_loop splices it into the ADVERSARY's prompt (never the worker's — see below).
+#
+# THREE PROPERTIES, each load-bearing and each checked by --selftest:
+#   * IT ASKS FOR EXACTLY WHAT repros() READS. The example below is not decoration: --selftest parses
+#     it back out of this text and feeds it through repros() and _call_args(), so the shape the
+#     adversary is SHOWN is proven to be a shape this module can READ. A schema whose own example its
+#     consumer rejects is the inert feature all over again, one layer down.
+#   * IT OFFERS NO SLOT FOR `expected`, and says so. The oracle is the original (capture()); an
+#     adversary that could state the right answer would define correctness, which is exactly the
+#     authority requirement 2 takes away from the worker. `observed` is recorded and never trusted.
+#   * IT IS ADVERSARY-FACING ONLY. WORKER_PROMPT has no %(repro_schema)s slot, so this text cannot
+#     reach a worker even though pair_loop formats both templates from the same ctx dict — an extra
+#     key is simply unused by %-formatting. That is a STRUCTURAL guarantee, not a filter, and
+#     --selftest renders pair_loop's REAL worker prompt with capture on to prove it. It also names
+#     no capture machinery at all, so an adversary that parrots this prompt verbatim into its prose
+#     still leaks nothing (leaks_capture() over the rendered auditor prompt is empty).
+AUDITOR_REPRO_SCHEMA = '''
+WHEN YOU PROVE A FAILURE BY RUNNING A CONCRETE CALL, RECORD THE CALL — not only your prose about it.
+A fail verdict MAY carry a top-level "repro" (or "repros": [...]) beside its findings, which stay a
+list of plain strings:
+
+  {"verdict": "fail", "findings": ["clamp() is wrong at the upper bound"],
+   "repro": {"entrypoint": "clamp", "input": {"args": [10, 0, 5]}, "observed": 4}}
+
+  entrypoint  a dotted attribute path inside the deliverable's own module — "clamp", "Cls.method"
+  input       {"args": [...], "kwargs": {...}}, JSON data only: exactly what you passed
+  observed    what the artifact actually gave you, as a JSON value (omit it if the call raised)
+
+Record only a call you REALLY RAN and really saw fail, and give the input verbatim. Do NOT state what
+the right answer would have been: you are not the authority on that, this schema has no slot for it,
+and any such claim is ignored. The repro is OPTIONAL and adds NOTHING to your verdict — a prose-only
+finding is still a complete finding, and your verdict is still judged on the required behavior you
+executed point by point, exactly as it is today.'''
+
+
+def auditor_repro_schema(mode=DEFAULT_MODE, registry=None):
+    """The text pair_loop splices into the ADVERSARY's birth prompt — and "" when capture is off.
+
+    "" is the whole of the toggle at this site: HOOK_PATCH's site 6 puts `%(repro_schema)s` directly
+    against `%(workspace)s`, so an empty value renders the adversary's prompt byte-for-byte as it is
+    today (--selftest checks that identity against pair_loop's REAL template). Nothing asks for a
+    repro while capture is off, which is also why the opt-in schema can never reach the join in
+    site 4 with capture off.
+    """
+    return AUDITOR_REPRO_SCHEMA if capture_enabled(mode, registry) else ""
+
+
+def _example_verdict(text=None):
+    """The example fail-verdict parsed back OUT of the adversary's schema text. None if absent.
+
+    This exists for --selftest: it closes the producer/consumer loop by proving the example the
+    adversary is shown is one repros() actually reads, rather than two hand-written shapes that agree
+    only in this module's author's head.
+    """
+    t = AUDITOR_REPRO_SCHEMA if text is None else text
+    i = t.find('{"verdict"')
+    if i < 0:
+        return None
+    depth = 0
+    for j in range(i, len(t)):
+        if t[j] == "{":
+            depth += 1
+        elif t[j] == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(t[i:j + 1])
+                except ValueError:
+                    return None
+    return None
+
+
 def leaks_capture(text):
     """The capture markers present in `text` — [] means it leaks nothing. The anti-gaming detector.
 
@@ -411,11 +532,32 @@ def worker_findings(verdict, scrub_markers=True):
 
 
 # ── 2. the oracle: the ticket's embedded ORIGINAL SOURCE block ───────────────────────────────────
+def _fence_begins(line):
+    """(nonce, desc) if `line` OPENS an embedded-original block, else None. UNINDENTED ONLY.
+
+    THE INDENTATION IS THE WHOLE POINT — it is the only thing that tells the real marker from the
+    DECOY, and reading it as decoration is a defect this module shipped. See parse_original().
+
+    `nonce` is the `:<module-sha>` suffix the owner adds when the module's own text contains a marker
+    line (_marks(), forge_refactor_ticketer.py), else None. `desc` is the parenthesised description
+    that says which of the owner's four cases produced the block.
+    """
+    if not line.startswith(EMBED_BEGIN_SENTINEL):       # startswith(line), NOT line.strip() — the
+        return None                                     # decoy is this same text, indented 4 spaces
+    s = line.rstrip()
+    if not s.endswith("==="):
+        return None
+    head = s[len(EMBED_BEGIN_SENTINEL):]
+    nonce = head[1:].split(" ", 1)[0].strip() if head.startswith(":") else None
+    desc = s.split("(", 1)[1].rsplit(")", 1)[0] if "(" in s and ")" in s else ""
+    return nonce, desc
+
+
 def parse_original(body):
     """The original module's bytes, lifted out of a ticket body. Returns (source, None) or (None, why).
 
-    Mirrors forge_refactor_ticketer.py's embed_source()/_marks() (:840-891), which is what PUT the
-    block there, and handles all four of the cases that tool can emit:
+    Mirrors forge_refactor_ticketer.py's embed_source()/_marks()/source_block(), which is what PUT
+    the block there, and handles all four of the cases that tool can emit:
 
       VERBATIM   the bytes as text, between the marker lines. The normal case.
       BASE64     the block is base64 when the module is not UTF-8 text or holds a NUL; the begin
@@ -427,48 +569,76 @@ def parse_original(body):
       TRUNCATED  REFUSED. An over-cap module is embedded as its first 256 KiB under a TRUNCATED
                  banner; that excerpt is a different program and cannot define `expected`. The
                  capture is rejected with a reason rather than minted against a prefix.
+
+    THE DECOY, and why this function anchors on column 0. The owner does not write the block bare: it
+    writes a PREAMBLE first, and that preamble QUOTES both marker lines, indented four spaces —
+
+        The block BEGINS at the line
+            ===ORIGINAL SOURCE (verbatim, the behavior-preserving basis)===
+        and ENDS at the first line
+            ===END SOURCE===
+        Everything strictly between those two lines is the module — <N> byte(s), byte for byte...
+
+    — and only THEN appends the real, unindented fence (source_block(), whose `out[0]` is that
+    preamble and whose last element is the block; the two are joined with "\\n\\n"). So every real
+    ticket body carries FOUR marker-looking lines, and the first two are the decoy. This function
+    once compared `line.strip()`, which erases the indentation that is the only difference between
+    them — so it took the decoy's begin, the decoy's end, and returned the ONE line between them:
+    `'and ENDS at the first line'`. That is not a module, so every capture on every real ticket died
+    at the oracle and was journaled as a malformed repro.
+
+    Measured against the live db before and after the fix (counts as of this writing; the db grows,
+    the ratio is the claim): of 59 ticket bodies naming the sentinel, 56 carried a real block — 0/56
+    parsed before, 56/56 now parse BYTE-IDENTICAL to the `blob : <sha>` git blob sha1 the ticket
+    itself declares. The other 3 (#346, #438 and #440 — the tickets that DESCRIBE this mechanism)
+    only mention the fence in indented prose and are correctly refused: a mention is not a block.
+
+    Anchoring on column 0 is not a heuristic: it is what the owner writes (source_block() emits the
+    fence at the start of a line; the preamble indents its quotes by four spaces). Candidates are
+    tried in order, and one that never closes or fences an empty payload is passed over rather than
+    accepted, so a body carrying prose about the fence cannot strand a real block behind it.
     """
     if not body:
         return None, "the ticket body is empty — no embedded original to derive `expected` from"
     lines = body.splitlines()
-    begin_i, nonce, desc = None, None, ""
+    tried = []
     for i, line in enumerate(lines):
-        s = line.strip()
-        if s.startswith(EMBED_BEGIN_SENTINEL) and s.endswith("==="):
-            head = s[len(EMBED_BEGIN_SENTINEL):]
-            if head.startswith(":"):
-                nonce = head[1:].split(" ", 1)[0].strip()
-            desc = s.split("(", 1)[1].rsplit(")", 1)[0] if "(" in s and ")" in s else ""
-            begin_i = i
-            break
-    if begin_i is None:
-        return None, ("the ticket body carries no `%s ...` block — this unit's original was never "
-                      "embedded, so there is no oracle and nothing may be minted" % EMBED_BEGIN_SENTINEL)
-    end_marker = EMBED_END_NONCE_FMT % nonce if nonce else EMBED_END
-    end_i = None
-    for i in range(begin_i + 1, len(lines)):
-        if lines[i].strip() == end_marker:
-            end_i = i
-            break
-    if end_i is None:
-        return None, "the embedded original block opens at %r but never closes with %r" % (
-            lines[begin_i].strip()[:60], end_marker)
-    if DESC_CUT_MARK in desc:
-        return None, ("the embedded original is a TRUNCATED EXCERPT (%r), not the module — an excerpt "
-                      "cannot define `expected`, so nothing is minted" % desc)
-    payload = "\n".join(lines[begin_i + 1:end_i])
-    if DESC_B64_MARK in desc:
-        try:
-            raw = base64.b64decode("".join(payload.split()), validate=True)
-        except Exception as e:  # noqa: BLE001
-            return None, "the embedded original claims base64 (%r) but does not decode: %s" % (desc, e)
-        try:
-            payload = raw.decode("utf-8")
-        except UnicodeDecodeError as e:
-            return None, "the embedded original decodes from base64 to non-UTF-8 bytes: %s" % e
-    if not payload.strip():
-        return None, "the embedded original block is empty"
-    return payload, None
+        fence = _fence_begins(line)
+        if fence is None:
+            continue
+        nonce, desc = fence
+        end_marker = EMBED_END_NONCE_FMT % nonce if nonce else EMBED_END
+        end_i = None
+        for j in range(i + 1, len(lines)):
+            if lines[j].rstrip() == end_marker:         # the END marker is unindented too
+                end_i = j
+                break
+        if end_i is None:
+            tried.append("the block opening on line %d (%r) never closes with %r"
+                         % (i + 1, line[:60], end_marker))
+            continue
+        if DESC_CUT_MARK in desc:
+            return None, ("the embedded original is a TRUNCATED EXCERPT (%r), not the module — an "
+                          "excerpt cannot define `expected`, so nothing is minted" % desc)
+        payload = "\n".join(lines[i + 1:end_i])
+        if DESC_B64_MARK in desc:
+            try:
+                raw = base64.b64decode("".join(payload.split()), validate=True)
+            except Exception as e:  # noqa: BLE001
+                return None, "the embedded original claims base64 (%r) but does not decode: %s" % (desc, e)
+            try:
+                payload = raw.decode("utf-8")
+            except UnicodeDecodeError as e:
+                return None, "the embedded original decodes from base64 to non-UTF-8 bytes: %s" % e
+        if not payload.strip():
+            tried.append("the block opening on line %d fences an empty payload" % (i + 1))
+            continue
+        return payload, None
+    if tried:
+        return None, ("the ticket body's embedded-original block is unusable: %s" % "; ".join(tried))
+    return None, ("the ticket body carries no `%s ...` block at the start of a line — this unit's "
+                  "original was never embedded, so there is no oracle and nothing may be minted"
+                  % EMBED_BEGIN_SENTINEL)
 
 
 # ── executing a candidate module, always in a THROWAWAY dir, never in the worktree ───────────────
@@ -1126,11 +1296,12 @@ def _note(out, extra=""):
 
 # ── the pair_loop hook, stated exactly (this module does not edit pair_loop.py) ──────────────────
 HOOK_PATCH = '''\
-THE pair_loop.py HOOK — five small sites: an import, a flag, TWO one-line calls (the guard and the
-capture), and ONE changed line at the verdict journal. #440 asks for a MINIMAL pair_loop change on
-purpose: the #279 regression came from a large pair_loop rewrite, so this module carries all of the
-logic and pair_loop only calls it. Sites 4 and 5 are BOTH required and neither is optional — they are
-two different join sites over the same findings, and the one in 4 fires first (see 4).
+THE pair_loop.py HOOK — six small sites: an import, a flag, TWO one-line calls (the guard and the
+capture), ONE changed line at the verdict journal, and the adversary's verdict schema (the PRODUCER,
+site 6 — without it the other five are inert). #440 asks for a MINIMAL pair_loop change on purpose:
+the #279 regression came from a large pair_loop rewrite, so this module carries all of the logic and
+pair_loop only calls it. Sites 4 and 5 are BOTH required and neither is optional — they are two
+different join sites over the same findings, and the one in 4 fires first (see 4).
 
 THIS PATCH IS NOT APPLIED BY THIS MODULE, and could not be: ticket #440's worker mandate is "write it
 to checkouts/current/congruency/tools/regression_capture.py (create or overwrite that file; touch
@@ -1208,8 +1379,46 @@ its own ticket. `--verify-scope` reports whether it is installed in the live pai
        lessons from these same findings and --compile-playbook compiles the playbook from those
        lessons, scrubbing here keeps the mechanism out of docs/PLAYBOOK.md too.
 
+6) THE PRODUCER — the adversary's verdict schema. Sites 1-5 CONSUME a repro; this is the only site
+   that makes one EXIST, and without it the feature is inert on every real round no matter how well
+   the other five work. Today's AUDITOR_PROMPT mandates the adversary's last line as exactly
+   `{"verdict": "fail", "findings": ["<finding>", ...]}` — `findings` a list of STRINGS, no repro
+   slot — and neither build/bug audit_focus asks for one, so repros() returns [] for every verdict
+   the live prompt can produce. Two edits, and BOTH are gated on the flag so OFF renders the
+   adversary's prompt byte-for-byte as it is today:
+
+   a) the AUDITOR_PROMPT template — one slot, spliced against `%(workspace)s` so an empty value
+      leaves the surrounding bytes untouched (WORKSPACE already ends in a newline):
+
+     alone: no context, no charity. %(audit_focus)s Nitpicks are not findings.
+   - %(workspace)s
+   + %(workspace)s%(repro_schema)s
+     Print as your LAST line:
+     {"verdict": "pass", "findings": []}   or   {"verdict": "fail", "findings": ["<finding>", ...]}
+
+   b) the per-round `ctx` dict in pair(), beside audit_focus — ONE key:
+
+         worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"],
+   +     repro_schema=regression_capture.auditor_repro_schema(a.regression_capture),
+
+   THE WORKER NEVER SEES IT, structurally rather than by filtering. pair_loop formats BOTH templates
+   from this one ctx (`WORKER_PROMPT % {**ctx, ...}`), but WORKER_PROMPT has no `%(repro_schema)s`
+   slot and %-formatting simply ignores a key it is not asked for. So the schema reaches the
+   adversary and cannot reach the worker — requirement 5's "keep the mechanism invisible to the
+   worker", enforced by the shape of the templates. --selftest renders pair_loop's REAL worker prompt
+   with capture ON and asserts it leaks nothing; it renders the REAL auditor prompt with capture ON
+   and asserts the repro slot is actually offered, with capture OFF and asserts byte-identity to the
+   unpatched render.
+
+   The schema asks for a TOP-LEVEL "repro" and keeps `findings` a list of plain strings — the
+   spelling that needs neither join site to change. repros() also accepts the per-finding dict
+   spelling because an adversary may reach for it unasked, and site 4 is what stops that spelling
+   crashing the harness; this site does not invite it.
+
 NOTHING ELSE CHANGES. No verdict is touched, no ordering is touched — in particular ticket.assign
-still runs before process_status ACTIVE in pair(), which is the #279 regression and must stay.
+still runs before process_status ACTIVE in pair(), which is the #279 regression and must stay. Site 6
+adds no round, no gate and no authority: the adversary's verdict is still the adversary's alone, and
+the repro it may now attach changes nothing about how that verdict is reached.
 
 Every anchor line quoted above is checked against the LIVE pair_loop.py by --selftest (see "the hook
 patch applies to the pair_loop that is actually here"), because a patch citing a line that has since
@@ -1322,7 +1531,7 @@ def verify_scope():
             if not ok:
                 print("        %s" % detail)
         print("\nSee WORKER-IMMUTABILITY in this module's docstring: the package case is why guard() "
-              "exists.\nRun --print-hook for all five of the hook's sites.")
+              "exists.\nRun --print-hook for all six of the hook's sites.")
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1367,19 +1576,37 @@ def kind(v):
 '''
 
 
-def _st_body(source=None, desc=None, begin=None, end=None):
-    """A ticket body carrying an embedded original, assembled EXACTLY as the owner assembles it.
+def _frt():
+    """forge_refactor_ticketer — the OWNER of the fence, imported from tools/ beside this module."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import forge_refactor_ticketer as frt
+    return frt
 
-    The assembly is forge_refactor_ticketer.py's source_block():936 — `"%s\\n%s\\n%s" % (begin,
-    payload, end)` — and the newline between the payload and the end marker is load-bearing: it is
-    what puts the marker on its own line, and it is why "\\n".join() over the lines BETWEEN the
-    markers reconstructs the payload byte for byte, trailing newline included. Hand-rolling this
-    fixture with a plausible-looking assembly instead of the real one is how a parser gets "proven"
-    against a format nothing writes.
+
+def _st_body(source=None, raw=None, frt=None):
+    """A ticket body carrying an embedded original — built by CALLING THE OWNER, never re-implemented.
+
+    THIS FIXTURE IS ITSELF A FIX, and the defect it hid is the reason it may never be hand-rolled
+    again. It used to assemble the body as `begin + "\\n" + payload + "\\n" + end`, citing
+    source_block():936 as its authority — but :936 is only the LAST element source_block() appends to
+    its `out` list, and the function RETURNS "\\n\\n".join(out), whose out[0] is a preamble that
+    quotes both marker lines indented four spaces. So the fixture omitted the DECOY that every real
+    ticket body carries, parse_original() was proven green against a format nothing writes, and the
+    oracle was broken on 100% of real tickets while --selftest stayed green. A fixture that
+    re-implements the producer can only ever prove the re-implementation.
+
+    So it calls source_block() — the whole function, preamble and all — with the embed dict
+    embed_source() really builds. `raw` overrides `source` for the cases only bytes can express (a
+    NUL byte, an over-cap blob); the owner then decides verbatim vs base64 vs truncated, exactly as
+    it does for a real unit.
     """
-    payload = _ST_ORIGINAL if source is None else source
-    b = begin or (EMBED_BEGIN_FMT % (desc or "verbatim, the behavior-preserving basis"))
-    return "Rewrite the unit.\n\n%s\n%s\n%s\n\nEnds.\n" % (b, payload, end or EMBED_END)
+    f = frt or _frt()
+    b = raw if raw is not None else (_ST_ORIGINAL if source is None else source).encode()
+    e = f.embed_source(b, hashlib.sha1(b).hexdigest())
+    return ("Rewrite this unit, preserving its behavior.\n\n%s\n\nEnds.\n"
+            % f.source_block({"embed": e}))
 
 
 def _tree(root):
@@ -1421,18 +1648,24 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
         # ── the fence: still the one forge_refactor_ticketer writes (anti-drift) ──
         print("-- the embedded-original fence tracks its owner")
         try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            import forge_refactor_ticketer as frt
+            _f = _frt()
             ck("the fence constants still match forge_refactor_ticketer (mirrored, not imported)",
-               (frt.EMBED_BEGIN_SENTINEL, frt.EMBED_END_SENTINEL, frt.EMBED_BEGIN_FMT, frt.EMBED_END,
-                frt.EMBED_BEGIN_NONCE_FMT, frt.EMBED_END_NONCE_FMT)
+               (_f.EMBED_BEGIN_SENTINEL, _f.EMBED_END_SENTINEL, _f.EMBED_BEGIN_FMT, _f.EMBED_END,
+                _f.EMBED_BEGIN_NONCE_FMT, _f.EMBED_END_NONCE_FMT)
                == (EMBED_BEGIN_SENTINEL, EMBED_END_SENTINEL, EMBED_BEGIN_FMT, EMBED_END,
                    EMBED_BEGIN_NONCE_FMT, EMBED_END_NONCE_FMT),
                "the owner's fence moved — parse_original() must follow it")
             ck("the owner's four block descriptions still classify as this module reads them",
-               DESC_B64_MARK in frt.EMBED_DESC_B64 and DESC_B64_MARK in frt.EMBED_DESC_B64_CUT
-               and DESC_CUT_MARK in frt.EMBED_DESC_TEXT_CUT and DESC_CUT_MARK in frt.EMBED_DESC_B64_CUT
-               and DESC_B64_MARK not in frt.EMBED_DESC_TEXT and DESC_CUT_MARK not in frt.EMBED_DESC_TEXT)
+               DESC_B64_MARK in _f.EMBED_DESC_B64 and DESC_B64_MARK in _f.EMBED_DESC_B64_CUT
+               and DESC_CUT_MARK in _f.EMBED_DESC_TEXT_CUT and DESC_CUT_MARK in _f.EMBED_DESC_B64_CUT
+               and DESC_B64_MARK not in _f.EMBED_DESC_TEXT and DESC_CUT_MARK not in _f.EMBED_DESC_TEXT)
+            # The DECOY is not an accident of one release: it is unconditional in source_block(), the
+            # first thing it appends. If the owner ever stops quoting the markers, this goes red and
+            # the (harmless) column-0 anchoring can be revisited — it does not go red silently.
+            ck("the owner's source_block() still emits the marker-quoting preamble UNCONDITIONALLY "
+               "(the decoy is structural, not incidental — parse_original() must keep anchoring on "
+               "column 0)",
+               "The block BEGINS at the line" in (_read_text(os.path.abspath(_f.__file__)) or ""))
         except ImportError as e:
             ck("forge_refactor_ticketer importable for the fence check", False, str(e))
 
@@ -1456,6 +1689,52 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
         ck("worker_findings(scrub=False) over plain strings is byte-for-byte today's list (OFF is unchanged)",
            worker_findings({"findings": plain}, False) == plain)
 
+        # ── 1b. THE PRODUCER: the schema an adversary is actually shown ──
+        # Everything above tests the CONSUMER. A consumer with no producer is an inert feature: the
+        # live AUDITOR_PROMPT offers no repro slot, so repros() returns [] for every verdict today's
+        # prompt can produce, and capture() mints nothing on every real round. These checks are the
+        # producer half — and the decisive one is the HANDSHAKE: the example the adversary is SHOWN
+        # is parsed back out of the schema text and fed through the real consumer.
+        print("-- 1b. the producer: the repro schema the ADVERSARY is shown")
+        ck("today's live verdict shape (findings = plain strings) carries no repro — which is why a "
+           "producer is needed at all, not merely nice to have",
+           repros({"verdict": "fail", "findings": ["clamp() is wrong at the upper bound"]}) == [])
+        ck("the schema names the three fields of the repro, and nothing else",
+           all(k in AUDITOR_REPRO_SCHEMA for k in ("entrypoint", "input", "observed")))
+        ck("the schema offers NO slot for `expected` and says the adversary may not state it — the "
+           "oracle is the original, so correctness is not the adversary's to define either",
+           "expected" not in AUDITOR_REPRO_SCHEMA
+           and "Do NOT state what" in AUDITOR_REPRO_SCHEMA)
+        ck("the schema says the repro is OPTIONAL and adds nothing to the verdict (a prose-only "
+           "finding stays a complete finding — the round gate is untouched)",
+           "OPTIONAL" in AUDITOR_REPRO_SCHEMA and "adds NOTHING to your verdict" in AUDITOR_REPRO_SCHEMA)
+        ex = _example_verdict()
+        ck("THE HANDSHAKE — the example verdict printed IN the adversary's schema parses as JSON",
+           isinstance(ex, dict) and ex.get("verdict") == "fail", str(ex))
+        # .get()/len-guarded, never indexed blind: a broken example must report FAIL here, not raise
+        # a KeyError that exits 2 and files a bug report instead of showing the failure.
+        ex_reps = repros(ex or {})
+        ck("...and repros() READS it: the shape the adversary is shown is a shape this module "
+           "consumes (a schema whose own example its consumer rejects is the inert feature again)",
+           len(ex_reps) == 1 and ex_reps[0].get("entrypoint") == "clamp", str(ex_reps))
+        ck("...and its `input` is callable data: _call_args() turns it into real args/kwargs",
+           bool(ex_reps) and _call_args(ex_reps[0]) == ([10, 0, 5], {}),
+           str(_call_args(ex_reps[0]) if ex_reps else None))
+        ck("...and its `findings` stays a list of plain STRINGS — the spelling that needs neither of "
+           "pair_loop's two `\"; \".join(findings)` sites to change",
+           all(isinstance(f, str) for f in (ex or {}).get("findings", [])) and (ex or {}).get("findings"))
+        ck("...so the example journals cleanly through pair_loop's real join, unpatched",
+           "; ".join((ex or {}).get("findings", [])) == "clamp() is wrong at the upper bound")
+        ck("the schema text names no capture machinery, so even an adversary that parrots its own "
+           "prompt into its prose leaks nothing", leaks_capture(AUDITOR_REPRO_SCHEMA) == [],
+           str(leaks_capture(AUDITOR_REPRO_SCHEMA)))
+        ck("auditor_repro_schema() is EMPTY when capture is off (the toggle, at the producer)",
+           auditor_repro_schema("off") == "" and auditor_repro_schema() == "")
+        ck("...and is the schema when capture is on", auditor_repro_schema("on") == AUDITOR_REPRO_SCHEMA)
+        ck("...and follows the registry under `auto` (A/B with no code edit reaches the producer too)",
+           auditor_repro_schema("auto", {REGISTRY_KEY: {"enabled": True}}) == AUDITOR_REPRO_SCHEMA
+           and auditor_repro_schema("auto", {REGISTRY_KEY: {"enabled": False}}) == "")
+
         # ── 6. the toggle ──
         print("-- 6. the toggle: default OFF, registry live under `auto`")
         ck("the default mode is off", DEFAULT_MODE == "off" and capture_enabled() is False)
@@ -1474,41 +1753,74 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
 
         # ── 2. the oracle: parse_original over every case the owner emits ──
         print("-- 2. the oracle = the ticket's embedded ORIGINAL SOURCE")
-        src, why = parse_original(_st_body())
+        body = _st_body()
+        src, why = parse_original(body)
         ck("a verbatim block is lifted whole, trailing newline included", src == _ST_ORIGINAL, str(why))
 
-        # THE DIFFERENTIAL. The bodies above are this module's idea of the format; these are the
-        # OWNER's. Each blob goes through forge_refactor_ticketer's real embed_source() and its real
-        # assembly (source_block():936), and parse_original must hand back the ORIGINAL BYTES —
-        # exactly, for every case that tool can emit. Anything less is a parser proven against a
-        # format nothing writes.
-        try:
-            for label, raw in (("a plain module", _ST_ORIGINAL.encode()),
-                               ("a module with no trailing newline", b"x = 1"),
-                               ("a module ending in blank lines", b"x = 1\n\n\n"),
-                               ("a module whose OWN text contains `===END SOURCE===` (nonce fence)",
-                                (_ST_ORIGINAL + '\nBANNER = "%s"\n' % EMBED_END).encode()),
-                               ("a module with a NUL byte (base64 fence)", b'X = "\x00"\n')):
-                sha = hashlib.sha1(raw).hexdigest()
-                e = frt.embed_source(raw, sha)
-                body = "preamble\n\n%s\n%s\n%s\n\nends\n" % (e["begin"], e["payload"], e["end"])
-                src, why = parse_original(body)
-                ck("DIFFERENTIAL vs the owner's embed_source(): %s round-trips byte for byte" % label,
-                   src is not None and src.encode() == raw, "%r -> %r" % (raw[:40], (src or why)[:60]))
-            ck("...and the nonce case really did take the nonce fence (else the check above is vacuous)",
-               frt.embed_source((_ST_ORIGINAL + '\nBANNER = "%s"\n' % EMBED_END).encode(), "deadbeef")["end"]
-               == EMBED_END_NONCE_FMT % "deadbeef")
-            ck("...and the NUL case really did take the base64 fence (else that check is vacuous)",
-               frt.embed_source(b'X = "\x00"\n', "deadbeef")["binary"] is True)
-        except NameError:
-            ck("forge_refactor_ticketer available for the round-trip differential", False, "not imported")
-        src, why = parse_original(_st_body(desc="TRUNCATED EXCERPT — NOT the whole module"))
+        # THE DECOY. This is the defect that broke the oracle on 100% of real tickets, and these are
+        # the checks that would have caught it. source_block() writes a PREAMBLE before the block, and
+        # that preamble QUOTES both marker lines indented four spaces — so a real body carries FOUR
+        # marker-looking lines and the first two are fake. The fixture is the owner's own output now
+        # (_st_body()), so the decoy is really there; both facts are asserted rather than assumed.
+        marks = [l for l in body.splitlines()
+                 if l.strip().startswith(EMBED_BEGIN_SENTINEL) or l.strip().startswith(EMBED_END_SENTINEL)]
+        ck("the owner's REAL body carries FOUR marker-looking lines: the preamble's two QUOTED ones "
+           "(indented four spaces) and then the real, unindented fence",
+           len(marks) == 4 and all(m.startswith("    ") for m in marks[:2])
+           and not any(m.startswith(" ") for m in marks[2:]), str(marks))
+        ck("...and the fixture is the owner's OWN source_block() output, decoy included — a "
+           "hand-rolled begin+payload+end fixture omits the decoy and proves nothing",
+           "The block BEGINS at the line" in body and "and ENDS at the first line" in body)
+        # MUTATION-TESTING THE CHECK ABOVE: the OLD anchor, restored here and only here, must still
+        # take the decoy. Without this the two checks above are just description — this is what makes
+        # them load-bearing, and it pins the exact wrong answer the module used to return.
+        old = _strip_anchored(body)
+        ck("...and the OLD `line.strip()` anchor really does read the DECOY — returning the single "
+           "line between the preamble's two quoted markers, %r, instead of the module. Column-0 "
+           "anchoring (_fence_begins()) is what defeats it" % "and ENDS at the first line",
+           old == "and ENDS at the first line" and parse_original(body)[0] == _ST_ORIGINAL, repr(old)[:80])
+
+        # THE DIFFERENTIAL. Every blob goes through the owner's REAL embed_source() and its REAL
+        # source_block() — the whole function, not its last append — and parse_original must hand back
+        # the ORIGINAL BYTES exactly, for every case that tool can emit.
+        frt = _frt()
+        for label, raw in (("a plain module", _ST_ORIGINAL.encode()),
+                           ("a module with no trailing newline", b"x = 1"),
+                           ("a module ending in blank lines", b"x = 1\n\n\n"),
+                           ("a module whose OWN text contains `===END SOURCE===` (nonce fence)",
+                            (_ST_ORIGINAL + '\nBANNER = "%s"\n' % EMBED_END).encode()),
+                           ("a module that quotes the fence UNINDENTED at column 0 (nonce fence)",
+                            (_ST_ORIGINAL + "\nDOC = '''\n%s\n%s\n'''\n" % (EMBED_BEGIN_FMT % "x", EMBED_END)).encode()),
+                           ("a module with a NUL byte (base64 fence)", b'X = "\x00"\n')):
+            src, why = parse_original(_st_body(raw=raw, frt=frt))
+            ck("DIFFERENTIAL vs the owner's embed_source()+source_block(): %s round-trips byte for "
+               "byte" % label,
+               src is not None and src.encode() == raw, "%r -> %r" % (raw[:40], (src or why)[:60]))
+        ck("...and the nonce case really did take the nonce fence (else the checks above are vacuous)",
+           frt.embed_source((_ST_ORIGINAL + '\nBANNER = "%s"\n' % EMBED_END).encode(), "deadbeef")["end"]
+           == EMBED_END_NONCE_FMT % "deadbeef")
+        ck("...and the NUL case really did take the base64 fence (else that check is vacuous)",
+           frt.embed_source(b'X = "\x00"\n', "deadbeef")["binary"] is True)
+
+        # TRUNCATION is decided by the OWNER from the blob's size, never by a description this module
+        # hands it: an over-cap blob is what a real truncated ticket is made of.
+        big = b"x = 1\n" * ((frt.MAX_EMBED_BYTES // 6) + 100)
+        cut_body = _st_body(raw=big, frt=frt)
+        ck("...and an over-cap blob really is TRUNCATED by the owner (else the refusal below is vacuous)",
+           frt.embed_source(big, "deadbeef")["truncated"] is True and len(big) > frt.MAX_EMBED_BYTES)
+        src, why = parse_original(cut_body)
         ck("a TRUNCATED excerpt is REFUSED as an oracle (a prefix is a different program)",
-           src is None and "TRUNCATED" in why, str(why))
+           src is None and "TRUNCATED" in why, str(why)[:120])
         src, why = parse_original("a body with no source block at all")
         ck("a body with no block is refused with a reason", src is None and "never embedded" in why, str(why))
         src, why = parse_original(EMBED_BEGIN_FMT % "verbatim, the behavior-preserving basis")
         ck("an unclosed block is refused with a reason", src is None and "never closes" in why, str(why))
+        # A body that only TALKS about the fence — #346, #438 and #440 are exactly this on the live db
+        # — must be refused, not mined for prose. The indented mention is not a block.
+        ck("a body that only MENTIONS the fence in prose (indented, unfenced) is refused, not parsed "
+           "into prose masquerading as a module",
+           parse_original("we embed it between\n    %s\nand\n    %s\nas #346 does.\n"
+                          % (EMBED_BEGIN_FMT % "verbatim", EMBED_END))[0] is None)
 
         print("-- 2b. run_entrypoint(): the outcome currency")
         ck("the original's outcome is derived by EXECUTION",
@@ -1579,7 +1891,23 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
         ck("capture() returns NO verdict key — it is a floor, not the gate",
            "verdict" not in r and "pass" not in r, str(sorted(r)))
 
-        guard_src = _read_text(os.path.join(wt, rel))
+        # Every check below reads the guard capture() just wrote. If minting ever breaks, they must
+        # report FAIL — not raise a TypeError deep in run_test() that exits 2 and files a bug report,
+        # which is what "no guard was minted" USED to look like from the outside. The stand-in below
+        # keeps the run going so the remaining checks speak; the FAIL above is the real signal (a
+        # stand-in that always exits non-zero satisfies the RED checks vacuously, but the run is
+        # already red and the cause is already named).
+        guard_src = _read_text(os.path.join(wt, rel)) if rel else None
+        if guard_src is None:
+            ck("the minted guard is readable at the path capture() reported — every check below "
+               "depends on it", False, "no guard at %r; capture rejected: %s" % (rel, r["rejected"]))
+            guard_src = "raise SystemExit(1)\n"
+            rel = rel or (tests_dir_for(deliv, pkg) + "/test_nothing_was_minted.py")
+            _p = os.path.join(wt, rel)
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
+            with open(_p, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(guard_src)
+            led.add({"path": rel, "sha256": _sha(guard_src), "source": guard_src})
         ck("THE INVARIANT — the minted guard is RED against the worker blob that produced the finding",
            not run_test(guard_src, _ST_BUGGY, "clamp")[0])
         ck("THE INVARIANT — the minted guard is GREEN against the original", run_test(guard_src, _ST_ORIGINAL, "clamp")[0],
@@ -1603,9 +1931,10 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
            "they were in these bytes, re-capturing the same repro would collide with its own path",
            "clamp is wrong at the upper bound" not in guard_src and "round-1" not in guard_src,
            guard_src[:200])
+        e0 = (led.entries() or [{}])[0]          # never indexed blind — a FAIL must not be a traceback
         ck("...and the ledger holds that provenance instead, so nothing is lost",
-           led.entries()[0]["finding"] == "clamp is wrong at the upper bound"
-           and led.entries()[0]["round"] == 1, str(led.entries()[0].get("finding")))
+           e0.get("finding") == "clamp is wrong at the upper bound" and e0.get("round") == 1,
+           str(e0.get("finding")))
         ck("the path digests exactly the tuple the bytes are built from (no collision, no sprawl)",
            mint_path(440, "p", k) == mint_path(440, "p", guard_key("clamp", [], "clamp", [10, 0, 5],
                                                                    {}, ["return", 5]))
@@ -1977,6 +2306,62 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
            leaks_capture(prompt) == [], str(leaks_capture(prompt)))
         ck("...and never tells the worker there is an assertion to satisfy",
            "make this assertion pass" not in prompt.lower() and rel not in prompt)
+
+        # ── 5d(ii). THE PRODUCER, against pair_loop's REAL templates: site 6 of the hook ──
+        # The producer is a prompt edit, and a prompt edit that does not fit the live template is a
+        # patch that cannot be applied as written (this repo's playbook, Theme 1). So the patch's
+        # step-6 template edit is performed HERE on pair_loop's real AUDITOR_PROMPT and rendered in
+        # both states — the anchor is proven to exist by the replace itself.
+        print("-- 5d(ii). the producer (hook site 6) against pair_loop's REAL prompt templates")
+        anchor = "%(workspace)s\nPrint as your LAST line:"
+        ck("the step-6 anchor is present EXACTLY ONCE in the live AUDITOR_PROMPT",
+           pl.AUDITOR_PROMPT.count(anchor) == 1, "count=%d" % pl.AUDITOR_PROMPT.count(anchor))
+        ck("...and today's live AUDITOR_PROMPT offers NO repro slot (the producer is missing, which "
+           "is exactly what site 6 fixes — findings is a list of strings and nothing asks for more)",
+           "repro" not in pl.AUDITOR_PROMPT and '{"verdict": "fail", "findings": ["<finding>", ...]}'
+           in pl.AUDITOR_PROMPT)
+        patched_tmpl = pl.AUDITOR_PROMPT.replace(
+            anchor, "%(workspace)s%(repro_schema)s\nPrint as your LAST line:")
+
+        def _actx(mode):
+            """pair_loop's per-round ctx, with the patch's step-6 key. Mirrors pair(), including the
+            fact that ONE ctx feeds BOTH templates."""
+            return {"tid": 440, "kind": "build", "title": "t", "body": _st_body(), "playbook": "",
+                    "deliverable": deliv, "branch": "ticket/440",
+                    "worker_scope": pl.worker_scope(deliv, pkg), "auditor_scope": pl.auditor_scope(deliv, pkg),
+                    "workspace": pl.WORKSPACE % {"branch": "ticket/440"},
+                    "worker_focus": pl.FOCUS["build"]["worker_focus"],
+                    "audit_focus": pl.FOCUS["build"]["audit_focus"],
+                    "repro_schema": auditor_repro_schema(mode)}
+
+        ap_on = patched_tmpl % {**_actx("on"), "agent": "tester-t440r2", "role": "tester"}
+        ap_off = patched_tmpl % {**_actx("off"), "agent": "tester-t440r2", "role": "tester"}
+        ap_raw = pl.AUDITOR_PROMPT % {**_actx("off"), "agent": "tester-t440r2", "role": "tester"}
+        ck("PATCHED + capture OFF, the adversary's REAL birth prompt is BYTE-FOR-BYTE the unpatched "
+           "one (OFF is unchanged at the producer too, not merely at the consumer)", ap_off == ap_raw,
+           "%d vs %d bytes" % (len(ap_off), len(ap_raw)))
+        ck("PATCHED + capture ON, the adversary's REAL birth prompt ACTUALLY OFFERS the repro slot — "
+           "the feature is no longer inert: something now asks the adversary to stop dropping the "
+           "repro it already holds",
+           all(s in ap_on for s in ('"repro"', "entrypoint", "observed", '"input"')),
+           "missing: %s" % [s for s in ('"repro"', "entrypoint", "observed", '"input"') if s not in ap_on])
+        ck("...and the example inside that rendered prompt still round-trips through repros() — the "
+           "handshake holds through pair_loop's own %%-formatting, not just in the constant",
+           len(repros(_example_verdict(ap_on) or {})) == 1, str(_example_verdict(ap_on)))
+        ck("...and the rendered auditor prompt leaks no capture marker either",
+           leaks_capture(ap_on) == [], str(leaks_capture(ap_on)))
+        # THE STRUCTURAL GUARANTEE. ONE ctx feeds both templates, and the worker's has no slot for it.
+        wp_on = pl.WORKER_PROMPT % {**_actx("on"), "agent": "coder-t440r2", "role": "coder", "findings": fx}
+        ck("THE WORKER NEVER SEES THE SCHEMA, structurally: pair_loop formats WORKER_PROMPT from the "
+           "SAME ctx that carries it, but WORKER_PROMPT has no %(repro_schema)s slot, so %-formatting "
+           "drops the key. Rendered with capture ON, the worker's real prompt still leaks nothing and "
+           "holds no part of the schema",
+           leaks_capture(wp_on) == [] and "entrypoint" not in wp_on
+           and AUDITOR_REPRO_SCHEMA.strip() not in wp_on,
+           str(leaks_capture(wp_on)))
+        ck("...and that is not vacuous: the schema IS in the adversary's prompt built from that very "
+           "same ctx (same dict, two templates, one of them blind to it)",
+           AUDITOR_REPRO_SCHEMA.strip() in ap_on and "%(repro_schema)s" not in pl.WORKER_PROMPT)
         # the harvester's note -> lessons.recent -> --compile-playbook's body, exactly as pair_loop builds it
         lesson = ("passed in 2 rounds. Rework forced by the adversary — round 1 findings: %s. "
                   "Resolution: fixed" % " | ".join(wf))
@@ -2019,7 +2404,11 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
                     ("the verdict-journal join the patch's step 4 replaces",
                      '"; ".join(vres.get("findings", []))'),
                     ("the fail-hook line the patch's step 5 replaces",
-                     'findings = vres.get("findings", ["(none given)"])')):
+                     'findings = vres.get("findings", ["(none given)"])'),
+                    ("the step-6b ctx site (`audit_focus=focus[\"audit_focus\"]`, where the "
+                     "producer's one key is added)", 'audit_focus=focus["audit_focus"]'),
+                    ("the step-6a template site (the adversary's last-line schema the producer "
+                     "extends)", '{"verdict": "pass", "findings": []}')):
                 ck("hook anchor still present in pair_loop.py: %s" % label, anchor in pls,
                    "the patch quotes it, but pair_loop no longer contains it — the patch must follow")
             # ORDERING is the whole reason step 4 exists: the verdict journal must come BEFORE the
@@ -2108,6 +2497,24 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         print("== selftest == throwaway workspace removed (no db, no agents, no network, no repo writes)")
+
+
+def _strip_anchored(body):
+    """THE OLD, BROKEN ANCHOR — `line.strip().startswith(...)` — kept for ONE purpose: to prove in
+    --selftest that the fixture really carries the owner's decoy and that column-0 anchoring is what
+    defeats it. It is never called by capture(); parse_original() is the live parser.
+
+    Returns whatever that anchor reads out of `body` ("" if it finds no fence). On any real ticket
+    body it returns the string `'and ENDS at the first line'` — the one line between the preamble's
+    two quoted markers — which is the wrong answer this module used to give on 100% of real tickets.
+    """
+    lines = body.splitlines()
+    b = next((i for i, l in enumerate(lines)
+              if l.strip().startswith(EMBED_BEGIN_SENTINEL) and l.strip().endswith("===")), None)
+    if b is None:
+        return ""
+    e = next((i for i in range(b + 1, len(lines)) if lines[i].strip() == EMBED_END), None)
+    return "\n".join(lines[b + 1:e]) if e is not None else ""
 
 
 def _ledger_refuses(led, rel):
