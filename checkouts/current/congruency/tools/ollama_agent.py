@@ -183,6 +183,40 @@ THE GLM 4.7 CONTRACT (openai flavor; every claim here was measured against the l
     pair_loop's placeholder `["claude -p"]` (pair_loop.py:1551). The route is INSERT OR REPLACE, so
     re-registering an id pair_loop already created UPDATES it and erases nothing.
 
+THE CEREBRAS/GLM 4.7 WORKER PATH IS TIGHTENED (ticket #438). GLM 4.7 is less steerable than Claude,
+and two live canaries (#414, #416, 2026-07-15) proved the gap is OPERATIONAL rather than
+intellectual: GLM produced a genuinely good 504-line rewrite and still failed the pair gate. So on
+the cerebras path — api flavor `openai` — and for the WORKER role only, this runner tightens what it
+sends. NOTHING changes for the adversary, the dispatcher, the ollama flavor, or `--engine claude`,
+which stays the fallback engine the inference-routing policy names (GLM default, Claude fallback).
+
+  * THE EMBEDDED SOURCE IS THE SOURCE. A forge-rewrite ticket already carries the original bytes
+    between ===ORIGINAL SOURCE=== and ===END SOURCE===, and the canaries went filesystem-hunting for
+    them anyway (5 redundant Reads of docs/PLAYBOOK.md, then Globs) in a fresh forge2 tree where the
+    original does not exist. CEREBRAS_WORKER_DIRECTIVE rule 1 says so, ahead of the ticket.
+
+  * EXACTLY THE GIVEN DELIVERABLE PATH. A canary wrote forge2/<repo>/<repo>/mod.py — a spurious
+    second nesting level — instead of the flat forge2/<repo>/mod.py that forge_package.py's contract
+    expects, so pair_loop's deliverable existence-check (pair_loop.py:485) failed a finished rewrite.
+    Rule 2 says the path is verbatim, and when the birth prompt names one it is quoted into the
+    directive character for character.
+
+  * NO CROSS-MODULE EXPLORATION. A canary spent ~18 of its steps reading an UNRELATED module
+    (forge2/audio_tagger/tagger.py) — unpredictable token burn with no bearing on its deliverable.
+    Rule 3 forbids reading, grepping or globbing any module but its own.
+
+  * 40 STEPS, NOT 12. The canaries needed ~33 steps to reach their first Write, so the 12-step
+    default cut GLM off mid-orientation and the envelope was demanded before the file existed. The
+    cerebras path's default is 40 (max_steps_for); every other engine keeps 12, and an explicit
+    --ollama-max-steps (engine mode) / --max-steps (agent mode) still wins on either.
+
+  * THE BASH CONTRACT IS RESTATED WHERE IT IS READ. The canaries emitted Bash `command` as a LIST
+    and with broken shell quoting. Both are already REFUSED with a message the model can react to
+    (validate() against Bash's inputSchema, whose `command` is type:string; shlex in check_bash), but
+    a refusal costs a step and steps are the scarce resource — so the openai channel's Bash
+    description states the contract up front (tool_description). The ollama flavor's description is
+    byte-for-byte what it was.
+
 TOOLS ARE RESTRICTED TO THE ALLOWLIST, AND THE ALLOWLIST IS THE ONE pair_loop ALREADY PASSES.
 `--allowedTools` takes the exact strings from pair_loop's FOCUS table (pair_loop.py:696-720; the
 build pair's worker_tools at :716), e.g. "Read,Grep,Glob,Write,Edit,Bash(python3:*)". Enforcement is
@@ -1036,10 +1070,37 @@ def step_schema(ws):
             "required": ["tool", "args"]}
 
 
-def tools_payload(ws):
-    """The allowlisted tools in Ollama's native `tools` shape — used only by --channel tools."""
+# ── #438(e): the Bash tool contract, reinforced for the openai/GLM 4.7 channel and nowhere else ───
+BASH_OPENAI_CONTRACT = (
+    " TOOL-CALL CONTRACT: `command` is a single STRING — NEVER a list and never an object. "
+    "Right: {\"tool\": \"Bash\", \"args\": {\"command\": \"python3 -c 'print(1)'\"}}. "
+    "Wrong: {\"tool\": \"Bash\", \"args\": {\"command\": [\"python3\", \"-c\", \"print(1)\"]}}. "
+    "argv[0] must be one of the allowlisted programs named above. Quotes must balance: the string is "
+    "split with shlex and run with no shell, so ';', '&&' and '|' are literal arguments, not chaining."
+)
+
+
+def tool_description(name, flavor="ollama"):
+    """The description the model is shown for one tool.
+
+    Flavor-aware for exactly one reason (ticket #438(e)): on the cerebras/GLM 4.7 path the #414/#416
+    canaries emitted Bash's `command` as a LIST and with broken shell quoting. Neither can do damage
+    — a list is refused by validate() against Bash's inputSchema (`command` is type:string) and a
+    broken quote by shlex in Workspace.check_bash, and both come back to the model as a REFUSED tool
+    result it can correct — but each costs a step, and #438's whole premise is that GLM's steps are
+    the scarce resource. So the contract is stated where the model reads it before spending a step
+    learning it. Every other tool, and the ollama flavor's Bash, are byte-for-byte unchanged."""
+    d = _BY_NAME[name]["description"]
+    if name == "Bash" and flavor == "openai":
+        d += BASH_OPENAI_CONTRACT
+    return d
+
+
+def tools_payload(ws, flavor="ollama"):
+    """The allowlisted tools in Ollama's native `tools` shape — used only by --channel tools. (The
+    OpenAI function-tool shape is the same object, which is why the openai flavor sends this too.)"""
     return [{"type": "function",
-             "function": {"name": _BY_NAME[n]["name"], "description": _BY_NAME[n]["description"],
+             "function": {"name": _BY_NAME[n]["name"], "description": tool_description(n, flavor),
                           "parameters": _BY_NAME[n]["inputSchema"]}} for n in ws.names]
 
 
@@ -1064,9 +1125,79 @@ Rules:
 """
 
 
-def system_prompt(ws):
-    return SYSTEM % {"tools": "\n".join("  %s — %s" % (_BY_NAME[n]["name"], _BY_NAME[n]["description"])
+def system_prompt(ws, flavor="ollama"):
+    return SYSTEM % {"tools": "\n".join("  %s — %s" % (_BY_NAME[n]["name"], tool_description(n, flavor))
                                         for n in ws.names)}
+
+
+# ── ticket #438: the tightened cerebras/GLM 4.7 WORKER directive ──────────────────────────────────
+# Each rule closes one measured failure of the #414/#416 canaries (see the module docstring). It is
+# PREPENDED to the birth prompt — pair_loop owns that prompt (WORKER_PROMPT, pair_loop.py:615-641)
+# and this module does not edit it, so the rules go in front and the ticket below stays verbatim.
+CEREBRAS_WORKER_DIRECTIVE = """WORKER DIRECTIVE — four rules for this run. They override every habit you have. Read them before the ticket that follows.
+
+1. THE ORIGINAL IS ALREADY IN YOUR TICKET. The ORIGINAL source you must rewrite is EMBEDDED in your
+   ticket between ===ORIGINAL SOURCE=== and ===END SOURCE===. Base your rewrite on THOSE bytes. Do
+   NOT search the filesystem for the original — it is not there (this is a fresh forge2 tree).
+
+2. EXACTLY THE PATH YOU WERE GIVEN. Write your COMPLETE deliverable to EXACTLY the given deliverable
+   path, verbatim. Do not add package nesting, do not rename, do not create sibling files.%(deliverable)s
+
+3. DO NOT EXPLORE. Do NOT read, grep, or glob any module other than your own deliverable. You do not
+   need to explore the repo. Every step spent on another module is a step you do not get back.
+
+4. ONE STEP IS ONE JSON OBJECT, IN THE EXACT SHAPE. Bash's `command` is a single STRING, never a
+   list: {"thought": "run it", "tool": "Bash", "args": {"command": "python3 -c 'print(1)'"}}. Its
+   argv[0] must be an allowlisted program.
+
+Work in this order: read the source embedded in the ticket below; write the COMPLETE file to the
+deliverable path with ONE Write call (its `content` is the whole file, never a fragment); run it if
+you were granted Bash; then emit {"thought": "...", "tool": "finish", "args": {}}.
+
+"""
+
+# Rule 2's teeth: the path itself, quoted in character for character, whenever the birth prompt names
+# one. A canary wrote forge2/<repo>/<repo>/mod.py for a ticket that said forge2/<repo>/mod.py.
+CEREBRAS_DELIVERABLE_LINE = """
+   Your deliverable path, character for character, is:
+       %s
+   Pass exactly that string as Write's `file_path`. Any other path — an extra directory level, a
+   renamed file, a sibling — fails the ticket even if the code inside is perfect."""
+
+
+def cerebras_worker_prompt(prompt, deliverable=None):
+    """The birth prompt with CEREBRAS_WORKER_DIRECTIVE prepended — ticket #438 (a), (b), (c).
+
+    Prepended, never merged or rewritten: the ticket's own text is returned unchanged BELOW the
+    directive, so pair_loop's prompt still says everything it said and role_of/ticket_of/agent_of/
+    deliverable_of still read the same values out of the result (the directive deliberately contains
+    none of the phrases they match).
+
+    Applied to the cerebras path's WORKER only — see run_agent, which gates it on
+    `flavor == "openai" and role == "worker"`. The adversary and the dispatcher run gpt-oss and are
+    judged on their reasoning rather than on a deliverable path; the ollama flavor and --engine claude
+    see the birth prompt pair_loop built, unchanged."""
+    line = CEREBRAS_DELIVERABLE_LINE % deliverable if deliverable else ""
+    return CEREBRAS_WORKER_DIRECTIVE % {"deliverable": line} + prompt
+
+
+# ── #438(d): the step budget. GLM 4.7 is given room to orient; no other engine's default moves. ────
+DEFAULT_MAX_STEPS = 12      # every engine but cerebras — unchanged
+CEREBRAS_MAX_STEPS = 40     # --engine cerebras / --api-flavor openai
+
+
+def max_steps_for(flavor, override=None):
+    """The tool-step budget for one run: 40 on the cerebras/GLM 4.7 path, 12 everywhere else.
+
+    Measured, not guessed: the #414/#416 canaries needed ~33 steps to reach their first Write, so the
+    12-step default demanded the envelope while GLM was still orienting and the deliverable did not
+    yet exist. CEREBRAS_WORKER_DIRECTIVE is what makes 33 steps of orientation unnecessary; 40 is
+    what makes a slow orientation survivable anyway.
+
+    An explicit override always wins — `is not None`, not truthiness, so `--max-steps 0` means 0
+    steps rather than silently meaning 'the default'."""
+    return int(override) if override is not None else (
+        CEREBRAS_MAX_STEPS if flavor == "openai" else DEFAULT_MAX_STEPS)
 
 
 def chat(model, messages, fmt=None, tools=None, num_ctx=None, temperature=DEFAULT_TEMPERATURE,
@@ -1144,20 +1275,29 @@ def constrained(model, messages, schema, retries, deadline, tools=None, num_pred
 
 
 def run_agent(prompt, allowed_tools, cwd=None, model=None, role=None, channel="schema",
-              max_steps=12, retries=2, timeout=900, num_ctx=None, deliverable=None,
+              max_steps=None, retries=2, timeout=900, num_ctx=None, deliverable=None,
               flavor="ollama", max_tokens=None, openai_temperature=OPENAI_TEMPERATURE,
               openai_top_p=OPENAI_TOP_P):
     """Run one agent to completion and return its envelope dict — the value spawn_claude returns.
 
-    The loop: act (tool calls) until the model finishes or --max-steps is spent, then ONE final
-    schema-constrained call for the envelope. Identical on both flavors; only the transport and the
-    role->model map differ."""
+    The loop: act (tool calls) until the model finishes or the step budget is spent, then ONE final
+    schema-constrained call for the envelope. Identical on both flavors; only the transport, the
+    role->model map and #438's cerebras-worker tightening differ.
+
+    max_steps=None means max_steps_for(flavor) — 40 on the cerebras/GLM 4.7 path, 12 elsewhere
+    (#438(d)). The CLIs resolve it too, so the number is logged and journaled; resolving it here as
+    well makes the default right for ANY caller and is idempotent (an int overrides itself)."""
     ws = Workspace(os.path.realpath(cwd or os.getcwd()), allowed_tools)
     role = role or role_of(prompt)
     default_models = PROXY_ROLE_MODELS if flavor == "openai" else ROLE_MODELS
     model = model or default_models.get(role, default_models["worker"])
     env = ENVELOPES.get(role, ENVELOPES["worker"])
     deliverable = deliverable or deliverable_of(prompt)
+    max_steps = max_steps_for(flavor, max_steps)
+    # #438: the cerebras path's WORKER — and only it — gets the tightened directive in front of its
+    # ticket. Decided AFTER role/deliverable are read, so what is parsed is always pair_loop's own
+    # birth prompt, never this module's prefix.
+    tightened = flavor == "openai" and role == "worker"
     deadline = time.time() + timeout
 
     native_tools = None
@@ -1173,12 +1313,18 @@ def run_agent(prompt, allowed_tools, cwd=None, model=None, role=None, channel="s
         if channel == "tools":
             # Same OpenAI function-tool shape tools_payload() already emits; Cerebras accepts it and
             # replies with native tool_calls, which extract_json prefers.
-            native_tools = tools_payload(ws)
+            native_tools = tools_payload(ws, flavor)
         log("== ollama_agent == role=%s model=%s (%s) flavor=openai base=%s channel=%s tools=[%s] "
-            "bash=%s max_tokens=%d cwd=%s"
+            "bash=%s max_tokens=%d max_steps=%d cwd=%s"
             % (role, model, real_model(model), OPENAI_BASE, channel, ",".join(ws.names) or "none",
                "unrestricted" if ws.bash_prefixes is None else (",".join(ws.bash_prefixes) or "denied"),
-               clamp_max_tokens(max_tokens), ws.root))
+               clamp_max_tokens(max_tokens), max_steps, ws.root))
+        if tightened:
+            # Say it on stderr, because "zero reads of unrelated modules in its step log" (#438's
+            # acceptance) is read off this same log — the directive being ON must be visible there.
+            log("== ollama_agent == #438 cerebras worker directive ON: embedded-source-first, no "
+                "cross-module exploration, exact deliverable path %s, %d steps"
+                % (deliverable or "(none named in the prompt)", max_steps))
     else:
         caps = installed_models()
         if model not in caps:
@@ -1191,15 +1337,17 @@ def run_agent(prompt, allowed_tools, cwd=None, model=None, role=None, channel="s
                                  "(capabilities: %s). Use the default --channel schema, which carries tool "
                                  "calls as schema-constrained JSON and works on every model (research "
                                  "#175 §5.1)." % (model, ", ".join(caps.get(model) or []) or "none"))
-            native_tools = tools_payload(ws)
+            native_tools = tools_payload(ws, flavor)
 
-        log("== ollama_agent == role=%s model=%s flavor=ollama channel=%s tools=[%s] bash=%s ctx<=%d cwd=%s"
+        log("== ollama_agent == role=%s model=%s flavor=ollama channel=%s tools=[%s] bash=%s ctx<=%d "
+            "max_steps=%d cwd=%s"
             % (role, model, channel, ",".join(ws.names) or "none",
                "unrestricted" if ws.bash_prefixes is None else (",".join(ws.bash_prefixes) or "denied"),
-               context_cap(model), ws.root))
+               context_cap(model), max_steps, ws.root))
 
-    messages = [{"role": "system", "content": system_prompt(ws)},
-                {"role": "user", "content": prompt}]
+    messages = [{"role": "system", "content": system_prompt(ws, flavor)},
+                {"role": "user", "content": cerebras_worker_prompt(prompt, deliverable) if tightened
+                                            else prompt}]
     schema = step_schema(ws)
     steps, corrections = 0, 0
     while steps < max_steps:
@@ -1399,7 +1547,9 @@ def parse_engine_args(argv):
     eap.add_argument("--ollama-model", dest="model")
     eap.add_argument("--ollama-channel", dest="channel", choices=("schema", "tools"), default="schema")
     eap.add_argument("--ollama-num-ctx", dest="num_ctx", type=int)
-    eap.add_argument("--ollama-max-steps", dest="max_steps", type=int, default=12)
+    # default=None so the DEFAULT can depend on the engine (#438(d)): resolved below by
+    # max_steps_for() to 40 for cerebras and 12 for ollama/claude. An explicit value wins on both.
+    eap.add_argument("--ollama-max-steps", dest="max_steps", type=int, default=None)
     eap.add_argument("--ollama-retries", dest="retries", type=int, default=2)
     eap.add_argument("--ollama-no-journal", dest="no_journal", action="store_true")
     # --engine cerebras knobs. A separate dest from --ollama-model so the two can never quietly
@@ -1424,6 +1574,9 @@ def parse_engine_args(argv):
     # --engine cerebras IS --engine ollama with the api flavor and the role->model map swapped: same
     # rebind, same runner, same governance. That is the whole difference, and it lives here.
     a.flavor = "openai" if a.engine == "cerebras" else "ollama"
+    # #438(d): 40 tool steps on the cerebras/GLM 4.7 path, 12 on every other engine — the flavor is
+    # what decides, and it is settled on the line above.
+    a.max_steps = max_steps_for(a.flavor, a.max_steps)
     if a.engine == "cerebras":
         a.model = a.openai_model            # None => PROXY_ROLE_MODELS picks per role (worker->GLM 4.7)
         if a.openai_base:
@@ -1928,6 +2081,182 @@ def selftest():
             except Unexpected as e:
                 ck("an alias the proxy does not serve is refused before any turn",
                    "is not served" in str(e), str(e))
+
+            # ── ticket #438: the tightened cerebras/GLM 4.7 worker path ──
+            # The directive wraps its rules to a readable width, so every check below compares
+            # WHITESPACE-FLATTENED text: that way the assertion is the ticket's sentence exactly as
+            # the ticket wrote it, and re-wrapping the prose can never quietly weaken a rule.
+            print("-- #438(a,b,c): the worker directive carries the ticket's three rules verbatim")
+
+            def flat(s):
+                return " ".join(s.split())
+
+            wp438 = ("You are coder-t438r1, the coder — the worker of a build pair on ticket #438.\n\n"
+                     "TICKET: forge rewrite of audio_tagger\n"
+                     "===ORIGINAL SOURCE===\nprint('original')\n===END SOURCE===\n\n"
+                     "Deliverable: write it to forge2/audio_tagger/tagger.py (create or overwrite "
+                     "that file; touch nothing else).\n"
+                     "GOVERNANCE: ticket #438 authorizes you — work on nothing else. You are "
+                     "registered as coder-t438r1 and every action is on the record.")
+            tight = cerebras_worker_prompt(wp438, deliverable_of(wp438))
+            ck("(a) embedded-source-first, in the ticket's own words",
+               "The ORIGINAL source you must rewrite is EMBEDDED in your ticket between "
+               "===ORIGINAL SOURCE=== and ===END SOURCE===. Base your rewrite on THOSE bytes. Do NOT "
+               "search the filesystem for the original — it is not there (this is a fresh forge2 "
+               "tree)." in flat(tight))
+            ck("(b) exactly the given deliverable path, in the ticket's own words",
+               "Write your COMPLETE deliverable to EXACTLY the given deliverable path, verbatim. Do "
+               "not add package nesting, do not rename, do not create sibling files." in flat(tight))
+            ck("(c) no cross-module exploration, in the ticket's own words",
+               "Do NOT read, grep, or glob any module other than your own deliverable. You do not "
+               "need to explore the repo." in flat(tight))
+            ck("(e) the Bash contract is restated in the directive too: a STRING, never a list",
+               "Bash's `command` is a single STRING, never a list" in flat(tight))
+            ck("the FLAT deliverable path is quoted into the directive character for character",
+               "Your deliverable path, character for character, is: forge2/audio_tagger/tagger.py"
+               in flat(tight), "the path is not quoted into the directive verbatim")
+            ck("the ticket is PREPENDED to, not rewritten: its own text survives below, byte for byte",
+               tight.endswith(wp438) and tight != wp438)
+            ck("prepending does not disturb the birth-prompt parse (role/ticket/agent/deliverable)",
+               (role_of(tight), ticket_of(tight), agent_of(tight), deliverable_of(tight))
+               == ("worker", 438, "coder-t438r1", "forge2/audio_tagger/tagger.py"),
+               str((role_of(tight), ticket_of(tight), agent_of(tight), deliverable_of(tight))))
+            noded = cerebras_worker_prompt("You are w-1, the coder — the worker of a build pair on "
+                                           "ticket #438.")
+            ck("a prompt naming no deliverable still gets rules (a)/(b)/(c), just no quoted path",
+               "===END SOURCE===" in noded and "do not create sibling files." in flat(noded)
+               and "character for character" not in noded)
+
+            print("-- #438(d): 40 steps on the cerebras path, 12 everywhere else, override wins")
+            ck("max_steps_for: openai=40, ollama=12, and an explicit value always wins (even 0)",
+               (max_steps_for("openai"), max_steps_for("ollama"), max_steps_for("openai", 5),
+                max_steps_for("ollama", 99), max_steps_for("openai", 0))
+               == (40, 12, 5, 99, 0),
+               str((max_steps_for("openai"), max_steps_for("ollama"), max_steps_for("openai", 5))))
+            ck("the constants say what the ticket says", (CEREBRAS_MAX_STEPS, DEFAULT_MAX_STEPS) == (40, 12))
+
+            print("-- #438(e): the Bash contract is reinforced on the openai channel and ONLY there")
+            bash_openai = tool_description("Bash", "openai")
+            ck("the openai Bash description: `command` is a single STRING, NEVER a list",
+               "single STRING" in bash_openai and "NEVER a list" in bash_openai, bash_openai)
+            ck("...and names the argv[0] rule the allowlist actually enforces",
+               "argv[0] must be one of the allowlisted programs" in bash_openai, bash_openai)
+            ck("the ollama flavor's Bash description is byte-for-byte unchanged",
+               tool_description("Bash", "ollama") == _BY_NAME["Bash"]["description"])
+            ck("no OTHER tool's description changes on either flavor",
+               all(tool_description(n, f) == _BY_NAME[n]["description"]
+                   for n in _BY_NAME if n != "Bash" for f in ("ollama", "openai")))
+            ck("the openai system prompt carries the contract; the ollama one does not",
+               "NEVER a list" in system_prompt(ws, "openai")
+               and "NEVER a list" not in system_prompt(ws, "ollama"))
+            ck("--channel tools carries it too (the OpenAI function-tool shape)",
+               "NEVER a list" in [t["function"]["description"] for t in tools_payload(ws, "openai")
+                                  if t["function"]["name"] == "Bash"][0])
+            try:
+                ws.call("Bash", {"command": ["python3", "-c", "print(1)"]})
+                ck("a Bash `command` sent as a LIST is refused, not run", False, "it ran")
+            except Refused as e:
+                ck("a Bash `command` sent as a LIST is refused with a message the model can act on",
+                   "expected a string" in str(e), str(e))
+            try:
+                ws.check_bash("python3 -c 'unbalanced")
+                ck("broken shell quoting is refused with a message, not a traceback", False, "it parsed")
+            except Refused as e:
+                ck("broken shell quoting is refused with a message, not a traceback",
+                   "could not parse the command" in str(e), str(e))
+
+            print("-- #438: end to end — what the cerebras WORKER is actually SENT, and the flat file")
+            del sent[:]
+            scripted[:] = [
+                reply('{"thought": "rewrite the embedded source", "tool": "Write", "args": '
+                      '{"file_path": "forge2/audio_tagger/tagger.py", "content": "print(1)\\n"}}'),
+                reply('{"thought": "done", "tool": "finish", "args": {}}'),
+                reply('{"done": true, "ref": "forge2/audio_tagger/tagger.py", "note": "rewrote it"}'),
+            ]
+            run_agent(wp438, "Read,Write,Bash(python3:*)", cwd=base, flavor="openai", retries=1,
+                      timeout=60)
+            first = [b for p, b in sent if p == "/v1/chat/completions"][0]
+            ck("the cerebras worker's user message IS the directive followed by the ticket",
+               first["messages"][1]["content"] == tight, first["messages"][1]["content"][:70])
+            ck("...and its system prompt carries the reinforced Bash contract",
+               "NEVER a list" in first["messages"][0]["content"])
+            ck("...and the FLAT deliverable really exists at the path the ticket named",
+               os.path.isfile(os.path.join(base, "forge2", "audio_tagger", "tagger.py")))
+            ck("...with no spurious double-nesting beside it (forge2/<repo>/<repo>/mod.py)",
+               not os.path.exists(os.path.join(base, "forge2", "audio_tagger", "audio_tagger")))
+
+            # The directive is the WORKER's. The adversary is gpt-oss judging an artifact — it has no
+            # deliverable to write and every rule above would be a lie to it.
+            del sent[:]
+            ap438 = ("You are tester-t438r1, the tester — the adversary of a build pair on ticket "
+                     "#438.\nThe worker produced forge2/audio_tagger/tagger.py. You did NOT see the "
+                     "worker's reasoning.")
+            scripted[:] = [reply('{"thought": "read it", "tool": "finish", "args": {}}'),
+                           reply('{"verdict": "pass", "findings": []}')]
+            run_agent(ap438, "Read,Grep,Glob", cwd=base, flavor="openai", retries=1, timeout=60)
+            adv = [b for p, b in sent if p == "/v1/chat/completions"][0]
+            ck("the cerebras ADVERSARY is sent its birth prompt UNCHANGED — the directive is the "
+               "worker's alone", adv["messages"][1]["content"] == ap438,
+               adv["messages"][1]["content"][:70])
+            ck("...and it really ran on gpt-oss, a different family from the GLM worker (#173 §5.4)",
+               adv["model"] == PROXY_ROLE_MODELS["adversary"], str(adv["model"]))
+
+            print("-- #438(d): the cerebras worker really gets 40 tool steps, not 12")
+            # The 40 and the 41 below are LITERALS on purpose. Scripting the run off
+            # CEREBRAS_MAX_STEPS would make this check agree with the constant whatever the constant
+            # said — it would pass just as happily at 12, which is the exact regression #438 exists
+            # to prevent. A budget check that cannot fail is not a check.
+            del sent[:]
+            scripted[:] = [reply('{"thought": "step", "tool": "Read", "args": '
+                                 '{"file_path": "docs/seed.md"}}')] * 40 + \
+                          [reply('{"done": true, "ref": "docs/seed.md", "note": "n"}')]
+            why = ""
+            try:
+                run_agent("You are coder-t438r1, the coder — the worker of a build pair on ticket "
+                          "#438.\nDeliverable: write it to docs/seed.md (create or overwrite that "
+                          "file; touch nothing else).", "Read", cwd=base, flavor="openai",
+                          retries=0, timeout=120)
+            except Unexpected as e:
+                # A budget SHORTER than 40 ends the loop early, so the envelope demand lands on a
+                # scripted STEP reply and constrained() rejects it. That is this check FAILING, and
+                # it has to be reported as one — a selftest that dies here would take the other
+                # checks with it and file a bug report on its way out.
+                why = " — the run died: %s" % str(e)[:90]
+            turns = len([s for s in sent if s[0] == "/v1/chat/completions"])
+            ck("a worker that never finishes takes 40 steps + 1 envelope turn — the 12-step default "
+               "would have stopped at 13", turns == 41 and not why, "%d turns%s" % (turns, why))
+            ck("...consuming every scripted reply (so the count is the budget, not the script)",
+               scripted == [], str(len(scripted)))
+
+            print("-- #438: the OLLAMA flavor is untouched — same prompt, no directive, plain Bash")
+            osent = []
+            oscript = [{"message": {"content": '{"thought": "done", "tool": "finish", "args": {}}'}},
+                       {"message": {"content": '{"done": true, "ref": "forge2/audio_tagger/tagger.py",'
+                                               ' "note": "n"}'}}]
+
+            def ollama_stub(path, body=None, timeout=600):
+                osent.append((path, body))
+                return oscript.pop(0)
+
+            real_ollama = globals()["_ollama"]
+            # Seed the two caches so the stub is only ever asked for /api/chat (installed_models and
+            # context_cap answer from cache), exactly as they do against a live Ollama on turn 2.
+            _TAGS_CACHE[ROLE_MODELS["worker"]] = []
+            _CTX_CACHE[ROLE_MODELS["worker"]] = 32768
+            globals()["_ollama"] = ollama_stub
+            try:
+                run_agent(wp438, "Read,Write,Bash(python3:*)", cwd=base, flavor="ollama", retries=1,
+                          timeout=60)
+            finally:
+                globals()["_ollama"] = real_ollama
+                _TAGS_CACHE.pop(ROLE_MODELS["worker"], None)
+                _CTX_CACHE.pop(ROLE_MODELS["worker"], None)
+            ochat = [b for p, b in osent if p == "/api/chat"]
+            ck("the ollama-flavor worker is sent pair_loop's birth prompt UNCHANGED (no directive)",
+               bool(ochat) and ochat[0]["messages"][1]["content"] == wp438,
+               (ochat[0]["messages"][1]["content"][:70] if ochat else "no /api/chat call"))
+            ck("...and the plain Bash description, without the openai contract",
+               bool(ochat) and "NEVER a list" not in ochat[0]["messages"][0]["content"])
         finally:
             globals()["_openai_post"] = real_post
             globals()["OPENAI_BASE"] = real_base
@@ -1962,6 +2291,20 @@ def selftest():
             globals()["OPENAI_BASE"] = base_before
             ck("--engine cerebras with no --openai-model lets the role pick (worker -> GLM 4.7)",
                parse_engine_args(["--engine", "cerebras", "--ticket", "9"])[0].model is None)
+
+            # #438(d): the step budget is an ENGINE-MODE default, so it is decided in this parser.
+            ck("--engine cerebras defaults --ollama-max-steps to 40 (GLM 4.7 needs room to orient)",
+               parse_engine_args(["--engine", "cerebras", "--ticket", "9"])[0].max_steps == 40,
+               str(parse_engine_args(["--engine", "cerebras", "--ticket", "9"])[0].max_steps))
+            ck("...while --engine ollama and --engine claude keep the 12-step default",
+               parse_engine_args(["--engine", "ollama", "--ticket", "9"])[0].max_steps == 12
+               and parse_engine_args(["--engine", "claude", "--ticket", "9"])[0].max_steps == 12,
+               str((parse_engine_args(["--engine", "ollama", "--ticket", "9"])[0].max_steps,
+                    parse_engine_args(["--engine", "claude", "--ticket", "9"])[0].max_steps)))
+            sa, srest = parse_engine_args(["--engine", "cerebras", "--ollama-max-steps", "7",
+                                           "--ticket", "9"])
+            ck("an explicit --ollama-max-steps still wins on the cerebras engine, and is not leaked",
+               sa.max_steps == 7 and srest == ["--ticket", "9"], str((sa.max_steps, srest)))
         except Exception as e:  # noqa: BLE001
             ck("the --engine cerebras checks ran", False, "%s: %s" % (type(e).__name__, e))
 
@@ -2051,8 +2394,10 @@ def main():
                          "native tools API, refused for a model without the 'tools' capability")
     ap.add_argument("--num-ctx", type=int, help="override num_ctx (default: sized to the payload, "
                                                 "floor 8192, capped at the model's real context)")
-    ap.add_argument("--max-steps", type=int, default=12,
-                    help="max tool steps before the envelope is demanded (default: %(default)s)")
+    ap.add_argument("--max-steps", type=int, default=None,
+                    help="max tool steps before the envelope is demanded (default: %d, or %d on the "
+                         "cerebras/GLM 4.7 path — --api-flavor openai — which is given room to "
+                         "orient, ticket #438)" % (DEFAULT_MAX_STEPS, CEREBRAS_MAX_STEPS))
     ap.add_argument("--retries", type=int, default=2,
                     help="schema-violation retries per call, per research #175 §5.2 (default: %(default)s)")
     ap.add_argument("--timeout", type=int, default=900, help="seconds for the whole run (default: %(default)s)")
@@ -2071,6 +2416,9 @@ def main():
     # --engine cerebras implies the openai flavor whichever mode it is spelled in.
     if a.engine == "cerebras":
         a.flavor = "openai"
+    # #438(d): the step budget follows the flavor, so --api-flavor openai (agent mode's spelling of
+    # the GLM 4.7 path) gets the same 40 as --engine cerebras. Resolved after the flavor is settled.
+    a.max_steps = max_steps_for(a.flavor, a.max_steps)
 
     if a.selftest:
         return selftest()
