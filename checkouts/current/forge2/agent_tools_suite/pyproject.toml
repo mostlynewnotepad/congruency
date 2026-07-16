@@ -24,8 +24,11 @@ dependencies = []
 forge2-ats-http = "agent_tools_suite.ats_http:main"
 forge2-ats-service = "agent_tools_suite.ats_service:main"
 forge2-audit-guard = "agent_tools_suite.audit_guard:main"
+forge2-coupler = "agent_tools_suite.coupler:main"
 forge2-crank-approve = "agent_tools_suite.crank_approve:main"
+forge2-crank-discipline = "agent_tools_suite.crank_discipline:main"
 forge2-crank-job = "agent_tools_suite.crank_job:main"
+forge2-test-crank-discipline = "agent_tools_suite.test_crank_discipline:main"
 
 [tool.setuptools]
 packages = ["agent_tools_suite"]
