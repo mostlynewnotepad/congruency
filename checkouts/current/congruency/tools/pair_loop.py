@@ -9,15 +9,24 @@ One iteration of the adversarial network, harnessed:
     2. OPEN      create branch `ticket/<id>` off the base branch and check it out in a dedicated
                  git WORKTREE (a second working directory driven by the same .git, so the base
                  tree is never touched). The pair runs with its cwd IN that worktree.
-    3. PAIR      register a FRESH worker + adversary for this ticket/round (agent.register, full
-                 birth prompts) and authorize both on the ticket (ticket.assign). Fresh spawns ARE
-                 the memory clear: a new agent has no context; the OLD agents' trails stay on the
-                 record forever (the journal is append-only — nothing is erased).
+    3. PAIR      register each agent and authorize it on the ticket (agent.register + ticket.assign)
+                 LAZILY — immediately before that agent runs, never before (see Gov). A re-asked
+                 worker exists only because its predecessor was rejected, so neither its id nor its
+                 birth prompt is knowable any earlier. Then, and only then, the ticket goes ACTIVE:
+                 the db REFUSES ACTIVE on a ticket with no agent assigned, so the assign must come
+                 first (policy 9). Fresh spawns ARE the memory clear: a new agent has no context; the
+                 OLD agents' trails stay on the record forever (the journal is append-only).
     4. WORK      spawn the worker (`claude -p`, tools limited to reading + writing the deliverable)
                  in the worktree; it reports {"done":true,"ref":...} on its last line. The HARNESS
                  then COMMITS the work onto `ticket/<id>` (the worker holds no git pen) — the single
                  --deliverable file by default, or its WHOLE PACKAGE when the deliverable is a forge
                  module (see policy 8, COMMIT SCOPE).
+                 A worker that reports NOTHING READABLE — no JSON on its last line, done=false, a
+                 timeout, a non-zero exit — has FAILED ITS ROUND, and that is all: nothing is
+                 committed (it reported no deliverable) and no adversary is spawned (there is no
+                 claim to judge). The worktree PERSISTS with whatever it did write, and the next
+                 round's fresh worker inherits both that and a finding saying what went wrong. The
+                 pair does not crash over a silent agent (policy 9).
     5. VALIDATE  spawn the adversary in the same worktree, BLIND to the worker's reasoning (it sees
                  the ticket + the artifact, never the worker's transcript); it reports
                  {"verdict":"pass"|"fail","findings":[...]} on its last line.
@@ -93,6 +102,23 @@ THE SETTLED BRANCH-PER-TICKET DEFAULTS (RFC #220's open spec questions, answered
       `<repo>.egg-info` is TRACKED on the base, any later `pip install -e .` in the base tree rewrites
       it, the base tree is drifted, and policy 3's #213 guard REFUSES every subsequent merge. They are
       skipped and NAMED on the journal, never dropped silently.
+  (9) THE PAIR'S GOVERNANCE ORDER (#439, redoing #279 without the regression it shipped) — two rules
+      that only look like housekeeping until they are broken:
+      LAZY REGISTRATION. An agent is registered and authorized at ITS OWN spawn (Gov.enlist), with
+      the exact prompt it is spawned on. Registering the pair up front cannot work for a RE-ASKED
+      worker: its id and birth prompt do not exist until its predecessor is rejected, so an eager
+      harness could only ever record agents that do not exist with prompts they will not be born on.
+      ASSIGN BEFORE ACTIVE. `tg_tickets_active_needs_agent` (migrations/0029_ticket_authorization.sql)
+      ABORTS any UPDATE putting a ticket ACTIVE while no agent is assigned to it — SQLite raises,
+      PDO reports SQLSTATE 23000, rest.php returns a 500. So ACTIVE must follow at least one
+      ticket.assign. Ticket #279 made registration lazy but left the ACTIVE flip ahead of every
+      assign, and every new dispatch died at "pair (round 1)" while already-ACTIVE tickets went on
+      working — the pipeline's core function was dead and looked survivable. Gov.activate() now
+      REFUSES to run before an enlist(), so the order cannot be re-broken silently, and --selftest
+      drives it against the REAL trigger read out of the migration (see _StGov). ACTIVE is set once,
+      on round 1; later rounds are already ACTIVE and send nothing.
+      NO-VERDICT IS A ROUND OUTCOME, NOT A CRASH. See step 4 above and NoVerdict: a spawn that never
+      answers fails its round; only the rounds running out ends the loop (exit 1).
 
 PARALLEL PAIRS: N tickets => N branches => N worktrees, with zero tree contention (that is the
 whole point of worktrees). `--dispatch N --parallel K` runs up to K pairs at once, each a child
@@ -110,14 +136,20 @@ Usage (every form needs CONGRUENCY_API_KEY, from the env or .secrets/ats.env, EX
     python3 pair_loop.py --ticket 251 --deliverable docs/X.md      # run the pair on an existing ticket
     python3 pair_loop.py --file documentation --title "..." --body "..." --deliverable docs/X.md
     python3 pair_loop.py --dispatch 3 --parallel 2                 # route the queue, 2 pairs at once
-    python3 pair_loop.py --selftest                                # prove the git layer; no db, no agents
+    python3 pair_loop.py --selftest                                # prove the git + governance layers
     python3 pair_loop.py --selftest --install-check                 # ...and pip-install the merged package
     ... [--rounds 2] [--timeout 480] [--base main] [--keep-worktree] [--package-commit auto|on|off]
 
 --selftest builds a THROWAWAY git repo in a temp dir, runs the whole branch/worktree/commit/merge/
 reap flow through it (including two pairs in parallel, a deliberate merge conflict, and a forge
-PACKAGE deliverable per policy 8), then deletes it. It never touches this repo or the db and spawns
-no agents; and unless you add --install-check below, it never touches the network either.
+PACKAGE deliverable per policy 8), then deletes it. It also proves policy 9's governance ORDER
+against the REAL constraint: a second throwaway db is built by EXECUTING this repo's own
+migrations/0029_ticket_authorization.sql, so the rule the checks meet is the actual shipping trigger
+rather than a Python imitation of it (an imitation is what let #279 pass 129/129 while breaking every
+dispatch). It spawns no agents, needs no api key and no server, and WRITES nothing: this repo and the
+live db are only ever READ — the migrations for their DDL, and the db (when this host has one)
+read-only via immutable=1, which creates no -wal/-shm sidecars (#153). Unless you add --install-check
+below, it never touches the network either.
 
 --install-check (only with --selftest) adds ONE further check, the last one to run: it builds a
 throwaway venv and runs a real `pip install -e .` against the forge package the selftest merged onto
@@ -128,7 +160,8 @@ reports SKIP, never FAIL: an unreachable index says nothing about the package.
 
 Exit codes:
     0  settled — the branch merged into the base and the ticket is DONE (--selftest: all checks passed)
-    1  rounds exhausted — the adversary never passed; branch + worktree kept, ticket stays open
+    1  rounds exhausted — no round ever passed: the adversary rejected the work, or the worker never
+       answered (policy 9); branch + worktree kept, ticket stays open
        (--selftest: at least one check FAILED)
     2  unexpected — a Variant-A bug report was filed to the registry's bug_reports sink
     3  halted — an active stop ticket aims at this ticket or an ancestor; nothing was done
@@ -143,6 +176,7 @@ import fcntl
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -199,6 +233,18 @@ def bug_report(fn, exc, repro, cause):
 
 class Unexpected(RuntimeError):
     pass
+
+
+class NoVerdict(Unexpected):
+    """A spawn that produced no usable answer: it timed out, exited non-zero, or printed no readable
+    JSON object on its last line (and, for a worker, `done` that is not true).
+
+    A SUBCLASS of Unexpected on purpose. Every call site that does NOT handle it keeps the old
+    behavior exactly — bug report + exit 2 through main()'s handler — so nothing but the one path
+    that opts in changes. The WORKER's spawn is that path: a worker who says nothing readable has
+    FAILED ITS ROUND, which the loop absorbs (a fresh worker runs the next round); it has not
+    crashed the pair. See main()'s round loop and --selftest's "-- no-verdict" checks.
+    """
 
 
 # ── REST (all writes go through the governed surface) ─────────────────────────────────────────────
@@ -720,25 +766,53 @@ FOCUS = {
 FOCUS["bug"] = FOCUS["build"]
 
 
-def spawn_claude(prompt, allowed_tools, timeout, cwd=None):
-    """One fresh-context agent run, IN the ticket's worktree. Fresh spawn = clean memory; the db
-    keeps the durable trail."""
-    try:
-        r = subprocess.run(["claude", "-p", prompt, "--allowedTools", allowed_tools],
-                           cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # a spawn overrunning its budget is a ROUND OUTCOME, not a harness crash — journal + bug-report
-        raise Unexpected("agent spawn exceeded its %ss budget (raise --timeout for heavier tickets)" % timeout)
-    if r.returncode != 0:
-        raise Unexpected("claude exited %s: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
-    for line in reversed((r.stdout or "").strip().splitlines()):
+def verdict_of(stdout):
+    """An agent's answer: the LAST line of its output that parses as a JSON object.
+
+    Raises NoVerdict when there is none — an agent that printed nothing readable has not answered,
+    and there is no answer to invent for it. Split out of spawn_claude so --selftest can drive the
+    real parser directly, with no subprocess and no agent.
+    """
+    for line in reversed((stdout or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
                 return json.loads(line)
             except ValueError:
                 continue
-    raise Unexpected("no JSON verdict on the agent's last line; tail: %r" % (r.stdout or "")[-200:])
+    raise NoVerdict("no JSON verdict on the agent's last line; tail: %r" % ((stdout or "")[-200:],))
+
+
+def worker_done(res):
+    """The worker's own report, validated: it must say done=true.
+
+    A worker that reports done=false — or reports something that is not an object at all — has
+    produced nothing the harness may commit or ask an adversary to judge. That is a FAILED ROUND
+    (NoVerdict), which the loop absorbs; it is not a harness fault, so it never crashes the pair.
+    """
+    if not isinstance(res, dict) or not res.get("done"):
+        raise NoVerdict("worker did not report done=true: %.200r" % (res,))
+    return res
+
+
+def spawn_claude(prompt, allowed_tools, timeout, cwd=None):
+    """One fresh-context agent run, IN the ticket's worktree. Fresh spawn = clean memory; the db
+    keeps the durable trail.
+
+    Every way a spawn can fail to ANSWER — it overran its budget, it exited non-zero, it printed no
+    readable JSON — raises NoVerdict. That is a subclass of Unexpected, so any caller that does not
+    handle it is unaffected (bug report + exit 2, exactly as before); the worker's call site handles
+    it and fails the round instead (#439).
+    """
+    try:
+        r = subprocess.run(["claude", "-p", prompt, "--allowedTools", allowed_tools],
+                           cwd=cwd or ROOT, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # a spawn overrunning its budget is a ROUND OUTCOME, not a harness crash — and now it is one
+        raise NoVerdict("agent spawn exceeded its %ss budget (raise --timeout for heavier tickets)" % timeout)
+    if r.returncode != 0:
+        raise NoVerdict("claude exited %s: %s" % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
+    return verdict_of(r.stdout)
 
 
 DISPATCH_RULES = """
@@ -835,6 +909,98 @@ def do_dispatch(a):
     return 0
 
 
+# ── governance: the pair's db writes, and the ORDER the db enforces on them (#439) ────────────────
+GOV_ACTIVE_RULE = "a ticket authorizes an agent: assign one (ticket.assign) before it can go ACTIVE"
+
+
+class Gov:
+    """The pair's two governance acts — enlisting an agent, and flipping the ticket ACTIVE — in one
+    place, because their ORDER is a rule the database enforces and a harness cannot merely remember.
+
+    THE RULE. `tg_tickets_active_needs_agent` (migrations/0029_ticket_authorization.sql) aborts any
+    UPDATE that sets a ticket ACTIVE while no row in `ticket_agents` names it:
+
+        "a ticket authorizes an agent: assign one (ticket.assign) before it can go ACTIVE"
+
+    The abort is not advisory. SQLite raises SQLITE_CONSTRAINT_TRIGGER, PDO reports SQLSTATE 23000,
+    and rest.php turns that into a 500 — so an out-of-order harness does not degrade, it dies, and it
+    dies on EVERY new dispatch at "pair (round 1)". Only tickets already ACTIVE from an earlier run
+    survive, which is what made the breakage look survivable while the pipeline's core was dead.
+
+    THAT IS TICKET #279'S REGRESSION, and it is the reason this class exists. #279 was right that
+    registration must be LAZY (see enlist) and wrong about one line: it moved every ticket.assign to
+    spawn time but left `process_status -> ACTIVE` where it had always been, ahead of them all. Its
+    selftest passed 129/129 because nothing in it ever met the live rule. So here the order is not a
+    convention to be re-broken by the next edit — it is structure:
+
+      * enlist()   registers an agent AND authorizes it on the ticket, together, always.
+      * activate() REFUSES to run until enlist() has (see the guard below), and runs once.
+
+    A caller therefore cannot express #279's order without tripping the guard, and --selftest drives
+    THIS code against the REAL trigger, loaded from the real migration (see _st_gov()).
+    """
+
+    def __init__(self, tid, api=None):
+        self.tid = int(tid)
+        self.api = api or rest        # the seam: --selftest binds a throwaway db carrying the real rule
+        self.assigned = []            # (agent_id, role) in authorization order — activate()'s precondition
+        self.activated = False
+
+    def enlist(self, agent, role, prompt):
+        """Register ONE agent and authorize it on the ticket, LAZILY — immediately before it runs.
+
+        Lazy is not an optimization, it is the only order that can work for a RE-ASKED agent: a
+        round-2 worker exists *because* round 1's was rejected, so neither its id nor its birth
+        prompt is knowable before that rejection. Registering the pair up front could only ever
+        record agents that do not exist yet, with prompts they will not be born with.
+
+        `prompt` is the exact string the agent is about to be spawned on — rendered once by the
+        caller and passed to both, so the registered birth prompt and the real one cannot drift.
+
+        register-then-assign, in that order: tg_ticket_agents_registered (0029) refuses to authorize
+        an agent the registry has never heard of.
+        """
+        self.api("agent.register", {"agent_id": agent, "parent": "pair_loop", "prompt": prompt,
+                                    "tools": json.dumps(["claude -p"])})
+        self.api("ticket.assign", {"ticket_id": self.tid, "agent_id": agent, "role": role})
+        self.assigned.append((agent, role))
+        return agent
+
+    def activate(self):
+        """Flip the ticket ACTIVE — AFTER an enlist(), and only once. Returns True if this call set
+        it, False if it was already set (rounds 2+ — ACTIVE is a round-1 act).
+
+        The guard is a tripwire, not decoration. If a later edit re-introduces #279's order, this
+        raises HERE, named and explained, instead of shipping a 500 that kills all dispatch.
+        """
+        if self.activated:
+            return False
+        if not self.assigned:
+            raise Unexpected(
+                "refusing process_status->ACTIVE on #%d before any ticket.assign — the db would "
+                "abort it (SQLSTATE 23000: %s) and take down the dispatch. enlist() an agent first. "
+                "This is ticket #279's regression, guarded at its source." % (self.tid, GOV_ACTIVE_RULE))
+        self.api("process_status", {"id": self.tid, "status": "ACTIVE"})
+        self.activated = True
+        return True
+
+
+def open_round(gov, worker, role, prompt, branch):
+    """Open one round: bring the WORKER into existence, and only then take the ticket ACTIVE.
+
+    Those two lines are the whole of #439, which is why they are a function instead of four lines
+    inlined in main(): --selftest drives THIS code, so the order it proves is the order main() really
+    runs. Inlined in a closure, the call site could be reordered back into #279 with every check
+    still green — and a green selftest over a dead pipeline is precisely the failure being redone
+    here. Order-dependent code that no test can reach is how the last attempt shipped.
+
+    Returns the step's summary line. ACTIVE is a round-1 act: from round 2 on, activate() no-ops.
+    """
+    gov.enlist(worker, role, prompt)                 # lazy: this agent's id + prompt exist only now
+    return {"worker": worker, "branch": branch,
+            "ACTIVE": "set (after %s's assign)" % worker if gov.activate() else "already set"}
+
+
 def forge_agent(tid):
     """Register `forge-t<id>`: the ticket's git steward, which holds the git pen and signs the
     branch/commit/merge/reap events on the journal.
@@ -899,19 +1065,29 @@ def harvest_settled(tid):
     harvest(tid, history, passed, final_note)
 
 
-def step(name, fn, *a, **kw):
+def step(name, fn, *a, tolerate=(), **kw):
+    """Run one named stage of the loop, timed and printed.
+
+    `tolerate` names exception types that are a defined OUTCOME this caller handles, not a harness
+    fault. They are printed and re-raised (the caller decides what they mean) but NOT bug-reported:
+    a Variant-A bug report asserts "this should never happen", and a caller that handles the case has
+    already said that it can. Everything else keeps the old behavior exactly — report, print, re-raise.
+    """
     t0 = time.time()
     try:
         out = fn(*a, **kw)
         print("== %s ==\n   ok (%d ms) %s" % (name, (time.time() - t0) * 1000, out if out is not None else ""))
         return out
+    except tolerate as e:  # noqa: BLE001  — a round outcome the caller absorbs; not a bug
+        print("== %s ==\n   no result: %s" % (name, e))
+        raise
     except Exception as e:  # noqa: BLE001
         bug_report(name, e, "python3 pair_loop.py (step: %s)" % name, e)
         print("== %s ==\n   FAILED: %s" % (name, e))
         raise
 
 
-# ── --selftest: prove the git layer end-to-end in a THROWAWAY repo (no db, no agents, no network) ──
+# ── --selftest: prove the git layer end-to-end in a THROWAWAY repo (no agents, no server, no network) ─
 def _st_git(repo, *a):
     return subprocess.run(["git", *a], cwd=repo, capture_output=True, text=True)
 
@@ -1027,14 +1203,272 @@ def install_check(base_dir, pkg_dir):
     return "PASS", "pip install -e . clean; `from add import add; add(2,3)` -> 5; entry point created"
 
 
+# ── --selftest: the governance ORDER, against the REAL constraint (#439) ──────────────────────────
+# The rule that killed #279 lives in SQL, so a selftest that re-implements it in Python proves
+# nothing: a hand-written imitation passes exactly when its author believed it should, whether or not
+# the real trigger agrees. #279's own selftest passed 129/129 for precisely that reason — it never met
+# the rule it was breaking. So the throwaway db below is built by EXECUTING this repo's own
+# migrations: the constraint the checks meet is the actual tg_tickets_active_needs_agent DDL, not a
+# copy of it, and the checks drive the real Gov code against it. Still no server, no api key and no
+# network — the selftest only READS migrations/*.sql (and the live db, read-only, if it is present).
+GOV_MIGRATIONS = ("0002_ticket_approval.sql",       # tickets
+                  "0001_agents.sql",                # agents — the registry ticket.assign requires
+                  "0029_ticket_authorization.sql",  # ticket_agents + THE GOVERNANCE TRIGGERS + kinds
+                  "0031_harvest_routes.sql",        # ticket.lesson — harvest() closes every run
+                  "0033_assign_idempotent.sql")     # ticket.assign as it is really routed today
+
+# Those four only INSERT into api_routes; on the live db some earlier migration already created it.
+# This is that same CREATE, verbatim from migrations/0023_bug_catalog.sql:13 (0020/0024/0026/0027 all
+# carry the identical line), so the throwaway db starts where they expect to land.
+GOV_API_ROUTES_DDL = ("CREATE TABLE IF NOT EXISTS api_routes "
+                      "(name TEXT PRIMARY KEY, method TEXT, sql TEXT, auth TEXT, params TEXT, meta TEXT);")
+
+# `process_status` is the ONE route the pair calls that NO migration defines: it predates them and
+# exists only as a row in the live db's api_routes. It is pinned here as read from that row — and the
+# "pinned process_status SQL still matches the live db" check re-reads the live row and FAILS on
+# drift, so this constant cannot quietly become a fiction the ordering checks then prove things about.
+GOV_PROCESS_STATUS_SQL = "UPDATE tickets SET status=:status, updated=strftime('%s','now') WHERE id=:id"
+
+LIVE_DB_REL = os.path.join("checkouts", "current", "state", "congruency.sqlite")
+
+
+def _st_sql_eq(a, b):
+    """SQL equality up to whitespace runs — the one thing sqlite reformats freely when it stores DDL."""
+    return " ".join((a or "").split()) == " ".join((b or "").split())
+
+
+def _st_live_db_path():
+    """Where the live governance db actually is, from wherever this happens to be running.
+
+    In the MAIN checkout it is simply ROOT/checkouts/current/state/congruency.sqlite. In a pair
+    WORKTREE there is no such file at all: the db is untracked, so `git worktree add` never
+    materialises it — and a selftest that only looked here would SKIP its live checks in exactly the
+    place the pair loop runs. A worktree's `.git` is a FILE, not a directory, holding
+    `gitdir: <main>/.git/worktrees/<name>`, so the main checkout is three directories up from that
+    pointer and its db is the live one this branch was cut from.
+
+    None when neither has it (a fresh clone, a CI box): a db that is not on this host says nothing
+    about this code, so that is a SKIP and never a FAIL.
+    """
+    here = os.path.join(ROOT, LIVE_DB_REL)
+    if os.path.isfile(here):
+        return here
+    dotgit = os.path.join(ROOT, ".git")
+    if os.path.isfile(dotgit):                       # a worktree: a pointer file, not a directory
+        try:
+            line = open(dotgit).read().strip()
+        except OSError:
+            return None
+        if line.startswith("gitdir:"):
+            gitdir = os.path.abspath(line.split(":", 1)[1].strip())
+            main = os.path.dirname(os.path.dirname(os.path.dirname(gitdir)))   # .../.git/worktrees/<n>
+            cand = os.path.join(main, LIVE_DB_REL)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _st_live_gov():
+    """The LIVE governance db, opened READ-ONLY: (connection, path), or (None, why-not).
+
+    immutable=1, never mode=ro: the live db is in WAL journal mode, where even a read-only open
+    creates `-shm`/`-wal` sidecars beside it (ticket #153's finding — the reason ticket_status.py
+    opens it this way). immutable=1 promises sqlite the file will not change; it reads the same
+    committed bytes and creates NOTHING. Nothing here writes, and nothing here is written to.
+    """
+    path = _st_live_db_path()
+    if not path:
+        return None, ("no live db on this host (%s is untracked, so a worktree has none of its own "
+                      "and this one's main checkout has not got it either)" % LIVE_DB_REL)
+    try:
+        con = sqlite3.connect("file:%s?immutable=1" % path, uri=True)
+        con.execute("SELECT 1 FROM api_routes LIMIT 1").fetchone()
+        return con, path
+    except sqlite3.Error as e:
+        return None, "the live db at %s is unreadable: %s" % (path, e)
+
+
+class _StGov:
+    """A `rest`-shaped callable over a throwaway db carrying the REAL governance rules.
+
+    What is stubbed here is the ROUTER and nothing else. boot/rest.php's congruency_rest_route()
+    looks a name up in api_routes and executes that row's SQL with the caller's params bound; so does
+    __call__, following the same three rules it does — bind only DECLARED params the SQL actually
+    mentions, coerce each by its declared type, bind NULL for any the caller omitted
+    (boot/rest.php:96-107) — and answering `rows` for a SELECT and `affected`/`rowid` otherwise
+    (boot/rest.php:110-116). The SQL and the triggers both come from the repo's own migrations, so
+    what the code under test meets is the real constraint rather than an opinion about it.
+
+    A trigger's RAISE(ABORT) arrives here as sqlite3.IntegrityError. On the live stack that same
+    abort becomes PDO's SQLSTATE 23000, which rest.php returns as an HTTP 500 with the trigger's
+    message (boot/rest.php:272-275) and rest() raises out of. Either way the call RAISES at exactly
+    the point the harness makes it — and the ORDER is what is under test here, not the exception's
+    type, so this re-raises the Unexpected that rest() raises for a failed route.
+    """
+
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.executescript(GOV_API_ROUTES_DDL)
+        for m in GOV_MIGRATIONS:
+            self.db.executescript(open(os.path.join(ROOT, "migrations", m)).read())
+        self.db.execute("INSERT OR REPLACE INTO api_routes (name, method, sql, auth, params, meta) "
+                        "VALUES ('process_status', 'POST', ?, 'token', ?, ?)",
+                        (GOV_PROCESS_STATUS_SQL, '{"status":"str","id":"int"}',
+                         "set a ticket's status (pinned from the live db; no migration defines it)"))
+        self.calls = []          # [(route, params)] in call order — what the ORDERING checks read
+
+    def __call__(self, route, obj=None, method=None):
+        obj = obj or {}
+        self.calls.append((route, dict(obj)))
+        row = self.db.execute("SELECT sql, params FROM api_routes WHERE name = ?", (route,)).fetchone()
+        if not row:
+            raise Unexpected("route %s failed: unknown route" % route)
+        sql, decl = row[0], json.loads(row[1] or "{}")
+        binds = {}
+        for pname, ptype in decl.items():
+            if (":" + pname) not in sql:         # rest.php:98 — only bind what the SQL mentions
+                continue
+            val = obj.get(pname)
+            if val is not None:                  # rest.php:100-105 — coerce by declared type
+                t = str(ptype).lower()
+                val = int(val) if t == "int" else float(val) if t in ("float", "real") else str(val)
+            binds[pname] = val                   # rest.php:99 — an omitted param binds NULL
+        try:
+            cur = self.db.execute(sql, binds)
+        except sqlite3.IntegrityError as e:      # a governance trigger fired — the live 500
+            raise Unexpected("route %s failed: %s" % (route, e))
+        if sql.lstrip().lower().startswith("select"):        # rest.php:110
+            cols = [d[0] for d in cur.description]
+            return {"route": route, "rows": [dict(zip(cols, r)) for r in cur.fetchall()]}
+        return {"route": route, "affected": cur.rowcount, "rowid": cur.lastrowid}
+
+    def routes(self):
+        return [r for r, _ in self.calls]
+
+    def ticket(self, tid, kind="build"):
+        self.db.execute("INSERT INTO tickets (id, ts, updated, component, title, severity, status, body, kind) "
+                        "VALUES (?, 0, 0, 'selftest', 'selftest ticket', 'normal', 'REQUESTED', 'body', ?)",
+                        (int(tid), kind))
+        return int(tid)
+
+    def status(self, tid):
+        r = self.db.execute("SELECT status FROM tickets WHERE id = ?", (int(tid),)).fetchone()
+        return r[0] if r else None
+
+    def registered(self):
+        return [r[0] for r in self.db.execute("SELECT agent_id FROM agents ORDER BY agent_id")]
+
+    def prompt_of(self, agent):
+        r = self.db.execute("SELECT prompt FROM agents WHERE agent_id = ?", (agent,)).fetchone()
+        return r[0] if r else None
+
+    def crew(self, tid):
+        return [(r[0], r[1]) for r in self.db.execute(
+            "SELECT agent_id, role FROM ticket_agents WHERE ticket_id = ? ORDER BY agent_id", (int(tid),))]
+
+    def trigger_sql(self, name):
+        r = self.db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?", (name,)).fetchone()
+        return r[0] if r else None
+
+
+class _StLoopGov(_StGov):
+    """_StGov plus the ONE route the round loop reads that no loaded migration defines.
+
+    Everything else main() calls — kind.roster, ticket.progress, work.record, ticket.lesson,
+    agent.register, ticket.assign, process_status — runs its REAL SQL against the real tables. Only
+    `ticket.stops` is answered here: its route (0030) is a recursive walk over ticket_edges, the
+    BRAKE rather than anything #439 touches, and pulling that whole subtree in would add scaffolding
+    without adding proof. It answers "no active stops", which is the case the loop under test runs in.
+    """
+
+    def __call__(self, route, obj=None, method=None):
+        if route == "ticket.stops":
+            self.calls.append((route, dict(obj or {})))
+            return {"rows": [{"active_stops": 0}]}
+        return _StGov.__call__(self, route, obj, method)
+
+
+def _st_loop_run(base_dir, tag, scripted, rounds=2):
+    """Drive the REAL main() through one whole pair run, scripting only what each agent SAYS.
+
+    This is what proves the round loop rather than its parts: `except NoVerdict: continue` is the
+    heart of #439's no-verdict fix and lives inside main(), so nothing short of running main() ever
+    executes it. Everything governed stays real — a real throwaway git repo, and an _StLoopGov whose
+    routes and triggers come from the migrations. Exactly two things are replaced, both of them
+    things --selftest must never really do: spawning `claude`, and reaching the network for the
+    ticket row. Module globals are restored in a finally, so nothing leaks into a later check.
+
+    `scripted` is what each successive spawn returns, in order; an Exception instance is RAISED
+    instead (that is how a silent agent is expressed). Returns (exit_code, gov, prompts, repo).
+    """
+    repo = _st_repo(tempfile.mkdtemp(dir=base_dir))
+    gov = _StLoopGov(os.path.join(base_dir, "loop-%s.sqlite" % tag))
+    tid = 439
+    gov.ticket(tid)
+    spawns, prompts = list(scripted), []
+
+    def fake_spawn(prompt, tools, timeout, cwd=None):
+        prompts.append(prompt)
+        nxt = spawns.pop(0)
+        if isinstance(nxt, Exception):
+            # A silent worker may still have WRITTEN something. Leaving it behind is what makes
+            # "the worktree persists with whatever was written" a checkable claim, not an assertion.
+            if cwd:
+                open(os.path.join(cwd, "docs", "half-written.txt"), "a").write("partial work\n")
+            raise nxt
+        if isinstance(nxt, dict) and nxt.get("done") and cwd:      # a real worker writes its file
+            open(os.path.join(cwd, "docs", "out.md"), "w").write("delivered\n")
+        return nxt
+
+    class _TicketRow:                      # what main()'s one direct urlopen() reads
+        def read(self):
+            return json.dumps({"row": {"title": "loop selftest", "body": "b", "kind": "build"}}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    g = globals()
+    saved = {k: g[k] for k in ("rest", "rows", "spawn_claude", "forge_for", "API_KEY")}
+    real_urlopen, argv = urllib.request.urlopen, sys.argv
+    try:
+        g["rest"] = gov
+        g["rows"] = lambda route, params: gov(route, params, "GET").get("rows", [])
+        g["spawn_claude"] = fake_spawn
+        g["forge_for"] = lambda root=None: Forge(repo)
+        g["API_KEY"] = "selftest-key"
+        urllib.request.urlopen = lambda url, timeout=None: _TicketRow()
+        sys.argv = ["pair_loop.py", "--ticket", str(tid), "--deliverable", "docs/out.md",
+                    "--rounds", str(rounds), "--base", Forge(repo).current_branch()]
+        return main(), gov, prompts, repo
+    finally:
+        g.update(saved)
+        urllib.request.urlopen = real_urlopen
+        sys.argv = argv
+
+
 def selftest(install_check_too=False):
     """Drive the whole branch-per-ticket flow against a temp repo and CHECK each acceptance claim.
     Prints one PASS/FAIL line per check; returns 0 only if every check passed.
 
-    A SKIP is not a check: it is printed and counted separately and never fails the run (only
-    --install-check can produce one — see install_check()).
+    A SKIP is not a check: it is printed and counted separately and never fails the run
+    (--install-check and the live-db cross-checks are the only sources — see install_check() and
+    _st_live_gov()).
     """
     checks, skips = [], []
+
+    # Theme 3 / #153: PROVE "this repo is not touched" rather than asserting it. The one thing this
+    # run could plausibly write into the repo is a Variant-A bug report, so bug_report()'s sink is
+    # snapshotted here — BEFORE the first line that could file one, since a baseline taken later
+    # would silently count this run's own writes as pre-existing — and re-checked at the end.
+    sink = os.path.join(ROOT, REGISTRY.get("bug_reports", "logs/bug_reports.jsonl"))
+
+    def sink_state():
+        return (os.path.isfile(sink), os.path.getsize(sink) if os.path.isfile(sink) else 0)
+
+    sink_before = sink_state()
 
     def ck(name, cond, detail=""):
         checks.append((name, bool(cond), detail))
@@ -1043,6 +1477,37 @@ def selftest(install_check_too=False):
     def skip(name, detail):
         skips.append((name, detail))
         print("   SKIP %s  — %s" % (name, detail))
+
+    # A check must REPORT, never explode. Calling a governance surface bare would abort the whole
+    # run on a regression — exit 2, a traceback and a filed bug report — instead of printing the FAIL
+    # that names it, and every check after it would go unrun. These two turn "did it raise?" into
+    # data the ck()s above can judge.
+    def attempt(fn, *aa):
+        """A call expected to SUCCEED -> (error_text_or_empty, result)."""
+        try:
+            return "", fn(*aa)
+        except Exception as e:  # noqa: BLE001
+            return "%s: %s" % (type(e).__name__, e), None
+
+    def refused(fn, *aa):
+        """A call expected to be REFUSED -> the refusal text, or "" if it wrongly succeeded."""
+        try:
+            fn(*aa)
+            return ""
+        except Exception as e:  # noqa: BLE001
+            return str(e)
+
+    def before(routes, first, second):
+        """Did BOTH routes get called, `first` before `second`? An ORDERING check that REPORTS.
+
+        A missing route is a FAILED ordering, never an exception — and that distinction is the
+        whole point. Under #279's order `ticket.assign` is never sent, so a bare
+        routes.index("ticket.assign") raises ValueError and ABORTS the run at exactly the moment
+        it should be printing the FAIL that names the regression: no tally, and every later check
+        (the whole no-verdict block included) goes unrun. Same rule as attempt()/refused() above —
+        a check turns "did it raise?" into data; it never explodes.
+        """
+        return first in routes and second in routes and routes.index(first) < routes.index(second)
 
     base_dir = tempfile.mkdtemp(prefix="pair_loop-selftest-")
     try:
@@ -1375,6 +1840,225 @@ def selftest(install_check_too=False):
            c411b["package"] == "tools" and "tools/sibling.py" in c411b["files"], str(c411b))
         f.reap_worktree(411)
 
+        # ── #439: the governance ORDER (assign -> ACTIVE), against the REAL 0029 constraint ──────
+        # This is the block #279 did not have. Every check below runs the SHIPPING Gov code against
+        # the actual tg_tickets_active_needs_agent trigger, executed into a throwaway db straight
+        # from migrations/0029_ticket_authorization.sql. Re-introduce #279's order and these FAIL.
+        print("-- #439: assign -> ACTIVE, driven against the REAL trigger from migrations/0029")
+        missing = [m for m in GOV_MIGRATIONS if not os.path.isfile(os.path.join(ROOT, "migrations", m))]
+        ck("this repo's governance migrations are readable (they ARE the rules under test)",
+           not missing, "missing: %s" % missing)
+        if not missing:
+            g = _StGov(os.path.join(base_dir, "gov-teeth.sqlite"))
+            ck("the throwaway db carries the REAL rule, loaded from migrations/0029",
+               bool(g.trigger_sql("tg_tickets_active_needs_agent")))
+
+            # FIRST: prove the ORACLE has teeth. If the db did not really refuse #279's order, every
+            # green ordering check below would be meaningless — which is exactly how #279 went 129/129.
+            g.ticket(439)
+            bare = refused(g, "process_status", {"id": 439, "status": "ACTIVE"})
+            ck("the real rule REFUSES ACTIVE before any assign — #279's exact order, and the db's 500",
+               GOV_ACTIVE_RULE in bare,
+               bare or "the db ACCEPTED it: this oracle has no teeth and proves nothing")
+            ck("...and the ticket really did not move (still REQUESTED)",
+               g.status(439) == "REQUESTED", str(g.status(439)))
+
+            # NOW the shipping code, against that same armed rule: a real round 1 must reach ACTIVE.
+            # open_round() is the very function main() calls, so this proves the ORDER MAIN RUNS —
+            # not an arrangement of Gov calls written to agree with it.
+            gv = _StGov(os.path.join(base_dir, "gov-round.sqlite"))
+            gv.ticket(439)
+            gov = Gov(439, api=gv)
+            err, opened = attempt(open_round, gov, "coder-t439r1", "coder", "the worker's birth prompt",
+                                  "ticket/439")
+            ck("HARD REQ 1 — a real open_round() REACHES ACTIVE against the live rule (no 500)",
+               not err and gv.status(439) == "ACTIVE" and "set (after" in (opened or {}).get("ACTIVE", ""),
+               err or "status=%s opened=%s" % (gv.status(439), opened))
+            ck("...in the order the db demands: ticket.assign BEFORE process_status",
+               before(gv.routes(), "ticket.assign", "process_status"), str(gv.routes()))
+            ck("...and agent.register before ticket.assign (tg_ticket_agents_registered refuses otherwise)",
+               before(gv.routes(), "agent.register", "ticket.assign"), str(gv.routes()))
+            # attempt(), not a bare gov.activate(): under #279's order this very call raises the
+            # tripwire, and a bare call would abort the run instead of reporting the FAIL.
+            aerr2, again = attempt(gov.activate)
+            ck("ACTIVE is a round-1 act: a second activate() is a no-op, not a second write",
+               not aerr2 and again is False and gv.routes().count("process_status") == 1,
+               aerr2 or str(gv.routes()))
+
+            # HARD REQ 2 — lazy: an agent exists only at ITS OWN spawn, with the prompt it is born on.
+            ck("HARD REQ 2 — lazy: opening round 1 registers ONLY the worker; the adversary does not "
+               "exist yet", gv.registered() == ["coder-t439r1"], str(gv.registered()))
+            aerr, _ = attempt(gov.enlist, "tester-t439r1", "tester", "the adversary's birth prompt")
+            ck("...the adversary registers at its own spawn",
+               not aerr and "tester-t439r1" in gv.registered(), aerr or str(gv.registered()))
+            r2err, r2 = attempt(open_round, gov, "coder-t439r2", "coder",
+                                "ROUND 2 prompt: carries round 1's findings", "ticket/439")
+            ck("...a RE-ASKED worker registers at ITS spawn, with the prompt it is actually born on "
+               "(unknowable before its predecessor was rejected)",
+               not r2err and gv.prompt_of("coder-t439r2") == "ROUND 2 prompt: carries round 1's findings",
+               r2err or str(gv.prompt_of("coder-t439r2")))
+            ck("...and round 2 sends no second process_status (the ticket is already ACTIVE)",
+               (r2 or {}).get("ACTIVE") == "already set" and gv.routes().count("process_status") == 1,
+               str(gv.routes()))
+
+            # The tripwire: the code refuses to EXPRESS #279's order, before the db ever sees it.
+            gt = _StGov(os.path.join(base_dir, "gov-trip.sqlite"))
+            gt.ticket(439)
+            tripped = refused(Gov(439, api=gt).activate)
+            ck("Gov refuses #279's order AT THE SOURCE: activate() before any enlist() raises",
+               "before any ticket.assign" in tripped, tripped or "activate() ran with nothing assigned!")
+            ck("...and never reached the db (no process_status was ever sent)",
+               "process_status" not in gt.routes(), str(gt.routes()))
+
+            # The lazy pair must still satisfy the db's OTHER backstop, or settling would break.
+            derr, _ = attempt(gv, "process_status", {"id": 439, "status": "DONE"})
+            ck("the pair's own assigns still reach DONE (two distinct agents, two distinct roles)",
+               not derr and gv.status(439) == "DONE", derr or "crew=%s" % gv.crew(439))
+            gs = _StGov(os.path.join(base_dir, "gov-solo.sqlite"))
+            gs.ticket(439)
+            attempt(Gov(439, api=gs).enlist, "coder-t439r1", "coder", "p")
+            solo = refused(gs, "process_status", {"id": 439, "status": "DONE"})
+            ck("...and the pair-completion backstop is still armed: one agent alone cannot reach DONE",
+               "two DISTINCT agents" in solo, solo or "a lone worker settled the ticket!")
+
+            # The live surface, read-only: proof that the rule driven above IS the shipping rule, and
+            # that the one pinned route has not drifted. SKIPped where the (untracked) db is absent.
+            live, where = _st_live_gov()
+            if live is None:
+                skip("the pinned process_status SQL still matches the live db", where)
+                skip("the trigger driven above is byte-identical to the live db's", where)
+            else:
+                print("        live governance db (read-only, immutable=1): %s" % where)
+                lrow = live.execute("SELECT sql FROM api_routes WHERE name = 'process_status'").fetchone()
+                ck("the pinned process_status SQL still matches the live db's api_routes row",
+                   bool(lrow) and _st_sql_eq(lrow[0], GOV_PROCESS_STATUS_SQL),
+                   "live=%r pinned=%r" % (lrow[0] if lrow else None, GOV_PROCESS_STATUS_SQL))
+                ltrig = live.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
+                                     ("tg_tickets_active_needs_agent",)).fetchone()
+                ck("the constraint these checks drive IS the live one (0029's trigger, byte for byte)",
+                   bool(ltrig) and _st_sql_eq(ltrig[0], g.trigger_sql("tg_tickets_active_needs_agent")),
+                   "live=%r" % (ltrig[0] if ltrig else None))
+
+        # ── #439: a worker that says nothing readable FAILS THE ROUND; it never crashes the pair ──
+        print("-- #439: no-verdict is a round outcome, not a harness crash")
+        ck("verdict_of reads the agent's answer off the last JSON line",
+           verdict_of('chatter\n{"done": true, "ref": "x"}') == {"done": True, "ref": "x"})
+        ck("verdict_of skips an unparseable brace line and keeps looking upward",
+           verdict_of('{"done": true, "ref": "x"}\n{oops') == {"done": True, "ref": "x"})
+        # NoVerdict specifically, not merely "it raised": the loop catches NoVerdict and nothing else,
+        # so a bare Unexpected here would sail past that handler and crash the pair all over again.
+        def raised(fn, arg):
+            try:
+                fn(arg)
+                return "RETURNED (no exception at all)"
+            except NoVerdict:
+                return "NoVerdict"
+            except Exception as e:  # noqa: BLE001
+                return "%s — NOT a NoVerdict, so the round loop would not catch it" % type(e).__name__
+
+        for out, why in (("", "empty output"), ("I give up.\n", "prose, no JSON"),
+                         ("{not json}\n", "an unparseable brace line"), ("[1, 2]\n", "a JSON array, not an object")):
+            got = raised(verdict_of, out)
+            ck("nothing readable (%s) -> NoVerdict" % why, got == "NoVerdict", got)
+        for res, why in (({"done": False}, "done=false"), ({}, "no done key"),
+                         ({"done": None}, "done=null"), ("nope", "not an object at all")):
+            got = raised(worker_done, res)
+            ck("worker_done refuses %s -> NoVerdict (the round fails)" % why, got == "NoVerdict", got)
+        ck("worker_done passes a real report through untouched",
+           worker_done({"done": True, "ref": "x"}) == {"done": True, "ref": "x"})
+        ck("NoVerdict IS an Unexpected — every call site that does not handle it keeps exit 2",
+           issubclass(NoVerdict, Unexpected))
+
+        # ── #439: the ROUND LOOP itself, through the REAL main() ─────────────────────────────────
+        # The checks above prove the parts; these prove the loop. `except NoVerdict: continue` is the
+        # whole no-verdict fix and it lives inside main(), so only running main() executes it.
+        if not missing:
+            print("-- #439: main()'s round loop absorbs a silent worker (end to end)")
+            # attempt(): a crash out of main() is the very regression under test, so it must be
+            # REPORTED as a FAIL naming this check — not allowed to abort the run and skip the rest.
+            lerr, lres = attempt(_st_loop_run, base_dir, "silent-then-ok", [
+                NoVerdict("no JSON verdict on the agent's last line; tail: 'I am stuck'"),
+                {"done": True, "ref": "docs/out.md", "note": "round 2 delivered"},
+                {"verdict": "pass", "findings": []}])
+            ck("a SILENT round-1 worker does not crash the pair — round 2 settles the ticket (exit 0)",
+               not lerr and lres and lres[0] == 0, lerr or "exit=%s" % (lres[0] if lres else "?"))
+            if lres:
+                code, lg, prompts, lrepo = lres
+                lroutes = [r for r, _ in lg.calls]
+                lnotes = [o.get("note") or "" for r, o in lg.calls if r == "ticket.progress"]
+                ck("...and it really settled: the ticket reached DONE",
+                   lg.status(439) == "DONE", str(lg.status(439)))
+                ck("...the silent round is named on the append-only journal",
+                   any("produced no usable result" in n for n in lnotes), str(lnotes[:1]))
+                ck("...recording that NOTHING was committed for it (no deliverable was reported)",
+                   any("nothing committed" in n for n in lnotes), str(lnotes[:1]))
+                ck("...and no commit was in fact made for it (only round 2's work is on the branch)",
+                   len(Forge(lrepo).git("log", "--oneline", "ticket/439").strip().splitlines()) == 2,
+                   Forge(lrepo).git("log", "--oneline", "ticket/439").strip())
+                ck("...round 2's FRESH worker is told what its predecessor did wrong",
+                   len(prompts) > 1 and "produced NO usable result" in prompts[1], "")
+                ck("...round 1's ADVERSARY was never registered: there was nothing to judge (lazy)",
+                   "tester-t439r1" not in lg.registered(), str(lg.registered()))
+                ck("...ACTIVE was set once and only then DONE, never before an assign",
+                   [o.get("status") for r, o in lg.calls if r == "process_status"] == ["ACTIVE", "DONE"]
+                   and before(lroutes, "ticket.assign", "process_status"), str(lroutes[:6]))
+
+            e2, r2res = attempt(_st_loop_run, base_dir, "all-silent", [
+                NoVerdict("no JSON verdict on the agent's last line; tail: ''"),
+                NoVerdict("agent spawn exceeded its 480s budget (raise --timeout for heavier tickets)")])
+            ck("EVERY round silent -> rounds exhausted (exit 1), still never a crash",
+               not e2 and r2res and r2res[0] == 1, e2 or "exit=%s" % (r2res[0] if r2res else "?"))
+            if r2res:
+                _c2, lg2, _p2, lrepo2 = r2res
+                ck("...the ticket never reached DONE", lg2.status(439) == "ACTIVE", str(lg2.status(439)))
+                ck("...no work UID was minted for work that never landed",
+                   "work.record" not in [r for r, _ in lg2.calls])
+                wt2 = Forge(lrepo2).worktree_of(439)
+                ck("...the worktree PERSISTS, with whatever the workers did write still in it",
+                   os.path.isfile(os.path.join(wt2, "docs", "half-written.txt")), wt2)
+                ck("...and a FRESH worker really ran each round (a new agent id, registered lazily)",
+                   "coder-t439r2" in lg2.registered(), str(lg2.registered()))
+
+            e3, r3res = attempt(_st_loop_run, base_dir, "done-false", [
+                {"done": False, "note": "I could not finish"},
+                {"done": True, "ref": "docs/out.md", "note": "second try"},
+                {"verdict": "pass", "findings": []}])
+            ck("a worker reporting done=false fails its round the same graceful way",
+               not e3 and r3res and r3res[0] == 0 and r3res[1].status(439) == "DONE",
+               e3 or str(r3res and (r3res[0], r3res[1].status(439))))
+
+        # step() must not file a Variant-A bug report for an outcome its caller handles. Checking that
+        # must not file one EITHER, so bug_report is swapped for a recorder while these two run.
+        filed, real_bug_report = [], bug_report
+        globals()["bug_report"] = lambda fn, *aa, **kk: filed.append(fn)
+        try:
+            def silent():
+                raise NoVerdict("nothing readable")
+
+            def broken():
+                raise RuntimeError("a real harness fault")
+            # These two step names are deliberately self-explaining: step() prints "no result:"/
+            # "FAILED:" for them, and an unlabelled "FAILED" in a passing selftest's output reads
+            # like a real defect to anyone scanning it.
+            try:
+                step("selftest: a DELIBERATELY silent worker (expected)", silent, tolerate=NoVerdict)
+                got = "RETURNED"
+            except NoVerdict:
+                got = "re-raised"
+            ck("step(tolerate=NoVerdict) re-raises the outcome for its caller to absorb",
+               got == "re-raised", got)
+            ck("...and files NO bug report (a handled round outcome is not a Variant-A bug)",
+               filed == [], str(filed))
+            try:
+                step("selftest: a DELIBERATE harness fault (expected)", broken, tolerate=NoVerdict)
+            except RuntimeError:
+                pass
+            ck("...while an unhandled fault still files one (step's old behavior, kept)",
+               filed == ["selftest: a DELIBERATE harness fault (expected)"], str(filed))
+        finally:
+            globals()["bug_report"] = real_bug_report
+        ck("the real bug_report is restored after that swap", bug_report is real_bug_report)
+
         # ── the acceptance criterion itself: `pip install -e .` from the MERGED tree (opt-in) ──
         # LAST on purpose: it is the only step that touches the network, and pip writes an .egg-info
         # into the base tree it installs from — which the checks above must not see.
@@ -1393,6 +2077,9 @@ def selftest(install_check_too=False):
             ck("the install left the base tree free of TRACKED drift (#213 still mergeable)",
                f.tracked_dirty() == [], str(f.tracked_dirty()))
 
+        ck("--selftest filed no bug report into this repo (the sink is unchanged, #153 in isolation)",
+           sink_state() == sink_before, "%s: %s -> %s" % (sink, sink_before, sink_state()))
+
         bad = [n for n, ok, _ in checks if not ok]
         print("\n== selftest == %d/%d checks passed%s%s"
               % (len(checks) - len(bad), len(checks),
@@ -1403,7 +2090,9 @@ def selftest(install_check_too=False):
         shutil.rmtree(base_dir, ignore_errors=True)
         # The claim has to track what actually ran: --install-check pip-installs, which reaches the
         # network, so the default's "the network was never touched" would be a lie on that path.
-        print("== selftest == throwaway repo removed (this repo and the db were never touched; %s)"
+        print("== selftest == throwaway repo removed (nothing here was WRITTEN: the #439 checks only "
+              "READ migrations/*.sql for the real rules and the live db via immutable=1, which "
+              "creates no -wal/-shm sidecars, #153; %s)"
               % ("the network was used by --install-check's pip install, and nothing else"
                  if install_check_too else "the network was never touched"))
 
@@ -1435,8 +2124,10 @@ def main():
                          "package (its own directory, if the path names no forge package). off: always "
                          "commit only the deliverable file." % PACKAGE_MARKER)
     ap.add_argument("--selftest", action="store_true",
-                    help="prove the branch/worktree/commit/merge/reap flow in a THROWAWAY temp repo, then exit "
-                         "(no db, no agents, no network; this repo is not touched)")
+                    help="prove the branch/worktree/commit/merge/reap flow in a THROWAWAY temp repo, plus "
+                         "policy 9's assign->ACTIVE governance order against the REAL trigger executed "
+                         "from migrations/0029, then exit (no api key, no server, no agents, no network; "
+                         "this repo and the live db are READ, never written)")
     ap.add_argument("--install-check", action="store_true",
                     help="with --selftest only: also run a real `pip install -e .` on the forge package the "
                          "selftest merged, in a throwaway venv — #409's acceptance criterion. USES THE "
@@ -1448,7 +2139,7 @@ def main():
                     help="the audited playbook artifact: injected into worker prompts when present; the --compile-playbook deliverable")
     a = ap.parse_args()
 
-    # ── selftest: needs no key, no server, no db ──────────────────────────────
+    # ── selftest: needs no key and no server (it only READS the repo's migrations + the live db) ──
     if a.selftest:
         return selftest(install_check_too=a.install_check)
     if a.install_check:
@@ -1532,6 +2223,7 @@ def main():
     print("== scope == %s" % ("PACKAGE %s/ — the whole package is committed each round (#409)" % pkg
                               if pkg else "single file %s (unchanged)" % a.deliverable))
 
+    gov = Gov(tid)
     findings, history = [], []
     for rnd in range(1, a.rounds + 1):
         worker = "%s-t%dr%d" % (w_role, tid, rnd)
@@ -1542,23 +2234,44 @@ def main():
                    worker_scope=worker_scope(a.deliverable, pkg), auditor_scope=auditor_scope(a.deliverable, pkg),
                    worker_focus=focus["worker_focus"], audit_focus=focus["audit_focus"])
 
-        # fresh pair, registered + authorized (fresh spawn = cleared memory; trails persist)
-        def pair():
-            for agent, role, tmpl in ((worker, w_role, WORKER_PROMPT), (auditor, a_role, AUDITOR_PROMPT)):
-                fx = "\nPrior adversary findings to address:\n- " + "\n- ".join(findings) + "\n" if (findings and role == w_role) else ""
-                rest("agent.register", {"agent_id": agent, "parent": "pair_loop",
-                                        "prompt": tmpl % {**ctx, "agent": agent, "role": role, "findings": fx},
-                                        "tools": json.dumps(["claude -p"])})
-                rest("ticket.assign", {"ticket_id": tid, "agent_id": agent, "role": role})
-            rest("process_status", {"id": tid, "status": "ACTIVE"})
-            return {"worker": worker, "auditor": auditor, "branch": wt["branch"]}
-        step("pair (round %d)" % rnd, pair)
-
+        # The worker's birth prompt, rendered ONCE: Gov.enlist registers this exact string and the
+        # spawn below runs on it, so the recorded birth and the real one are the same object.
         fx = "\nPrior adversary findings to address:\n- " + "\n- ".join(findings) + "\n" if findings else ""
         wp = WORKER_PROMPT % {**ctx, "agent": worker, "role": w_role, "findings": fx}
-        wres = step("work: %s" % worker, spawn_claude, wp, focus["worker_tools"], a.timeout, wt["path"])
-        if not wres.get("done"):
-            raise Unexpected("worker did not report done: %s" % wres)
+
+        # Open the round: a FRESH worker enlisted at ITS spawn, and only THEN the ticket ACTIVE
+        # (policy 9). open_round() owns that order and --selftest drives it; the adversary is
+        # enlisted further down, at its own spawn, for the same reason.
+        step("pair (round %d)" % rnd, open_round, gov, worker, w_role, wp, wt["branch"])
+
+        try:
+            wres = worker_done(step("work: %s" % worker, spawn_claude, wp, focus["worker_tools"],
+                                    a.timeout, wt["path"], tolerate=NoVerdict))
+        except NoVerdict as e:
+            # The worker said nothing the harness can act on. That FAILS THE ROUND and nothing more:
+            # there is no reported deliverable to commit and nothing an adversary could judge, so the
+            # round ends here. The worktree PERSISTS with whatever the worker did write, and the next
+            # round's FRESH worker inherits it plus a finding telling it what went wrong. Only when
+            # the rounds run out does the loop give up (exit 1) — the pair never crashes over this.
+            # What happens NEXT depends on whether a round is left, so say the true one: claiming a
+            # respawn that the loop is about to skip would write a falsehood onto an append-only
+            # journal that no one can ever correct.
+            nxt = ("a fresh worker runs the next round" if rnd < a.rounds
+                   else "no rounds remain, so the loop gives up and the ticket stays open")
+            rest("ticket.progress", {"ticket_id": tid, "agent_id": fid, "steps_remaining": 3,
+                                     "note": "round %d: worker %s produced no usable result (%s). Round "
+                                             "FAILED; nothing committed (no deliverable was reported). "
+                                             "Worktree %s persists with whatever was written; %s."
+                                             % (rnd, worker, e, wt["branch"], nxt)})
+            findings = ["Your predecessor produced NO usable result: %s. It was born with the same "
+                        "prompt as you. Anything it wrote is still in the worktree — read the "
+                        "deliverable, finish it, and make ABSOLUTELY SURE your final output ends "
+                        "with the required one-line JSON object as the VERY LAST line, with nothing "
+                        "printed after it." % e]
+            history.append({"round": rnd, "findings": findings})
+            print("== round %d failed == worker %s produced no usable result (%s); %s"
+                  % (rnd, worker, e, nxt))
+            continue
         rest("ticket.progress", {"ticket_id": tid, "agent_id": worker,
                                  "note": "round %d: produced %s — %s" % (rnd, wres.get("ref"), wres.get("note", "")),
                                  "steps_remaining": 2})
@@ -1572,7 +2285,12 @@ def main():
         rest("ticket.progress", {"ticket_id": tid, "agent_id": fid,
                                  "note": commit_note(rnd, a.deliverable, cm)})
 
+        # The adversary, enlisted at ITS spawn (lazy, like the worker) and never before the work it
+        # judges exists. Its assign is also what lets the ticket reach DONE below: the db demands two
+        # distinct agents in two distinct roles (tg_tickets_pair_completion), which is satisfied here,
+        # by the pair actually running — not by anything registered up front on speculation.
         aprompt = AUDITOR_PROMPT % {**ctx, "agent": auditor, "role": a_role}
+        step("adversary (round %d)" % rnd, gov.enlist, auditor, a_role, aprompt)
         vres = step("validate: %s" % auditor, spawn_claude, aprompt, focus["auditor_tools"], a.timeout, wt["path"])
         rest("ticket.progress", {"ticket_id": tid, "agent_id": auditor,
                                  "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
