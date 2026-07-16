@@ -57,7 +57,14 @@ classification that come back. Two consequences worth stating plainly, because b
     `canonical` is the home this tool proves containment against. This tool PROPOSES; it never
     infers direction from topology. LINEAR and FORK-CAME-HOME are the same git shape and differ
     only in intent, which is not in the DAG. --home adds EXTRA home repos for the gate (a grab-bag
-    fork's packages can belong to several different homes); it never renames a canonical.
+    fork's packages can belong to several different homes); it never renames a canonical. A home
+    may live in ANOTHER lineage — that is the case the flag exists for — so the tip scans are keyed
+    by REPO NAME and a cross-lineage home resolves content exactly like the canonical does. Two
+    rules keep the flag from destroying the worklist it is meant to shrink: a repo named as a HOME
+    is a DESTINATION and is never itself an omit candidate (it would be gated against itself and
+    trivially "prove" it may be dropped — the same exclusion the canonical already gets, reported
+    under `not_omit_candidates`), and a --home naming a lineage or repo Part 1 does not know is a
+    usage error that STOPS the run, never a silent NOT-SAFE that blames git for a typo.
 
 OMNI IS BLACK-BOXED — THIS TOOL NEVER OPENS IT, AND THAT IS ENFORCED IN CODE.
 config/forge/archives/omni.git is NOT a git repository: it is a TOOL MADE OF GITS (an archive of
@@ -187,9 +194,19 @@ tips in one store, it looks for a member that ALREADY holds both and reports the
 UNKNOWN, with the reason, when none does — a SPLIT-STORE family is described, never fetched. The
 only file this tool ever writes is the --json path when you name one. Proven on the live forge: a
 real `--json -` run leaves all 264 bare repos byte-identical (12,695 files, sha1 of the whole tree
-unchanged) and leaves this tools/ directory byte-identical too — it writes no .pyc, because
-`sys.dont_write_bytecode` is set at import. --selftest asserts the same byte-identity over
-throwaway repos and uses no network and no live db.
+unchanged) and leaves this tools/ directory byte-identical too — RUN as a script it writes no .pyc,
+both because __main__ never gets one and because `sys.dont_write_bytecode` (set at import, before
+any sibling is read) stops the tools it reads from leaving one either. --selftest asserts the same
+byte-identity over throwaway repos and uses no network and no live db.
+
+One honest exception, because it is the tools/ directory and a reader checking these claims will
+trip it: if you IMPORT this module instead of running it (`import forge_evolution`, e.g. to drive
+gate() directly), CPython writes tools/__pycache__/forge_evolution.*.pyc when it compiles the file
+— before the first line of this module can set anything. That is CPython's import machinery, not a
+write this tool makes; no code in any Python file can prevent its OWN .pyc (only the importer can,
+via `python3 -B` / PYTHONDONTWRITEBYTECODE=1). It is gitignored bytecode (`.gitignore` lines 4-5:
+`__pycache__/`, `*.pyc`), regenerated on demand and never part of a commit. Nothing above is
+weakened: the guarantees are about the ARCHIVE and the governance db, which no import touches.
 
 exits 0 on success; 2 on a usage/environment error (a one-line message, never a traceback);
 1 if --selftest has a failing check.
@@ -665,7 +682,17 @@ def homes_for(lin, extra):
     return homes
 
 
-def gate(lin, remotes, scans, extra_homes=None):
+def named_home_repos(extra):
+    """Every repo named by ANY --home, across all lineages: the operator's destinations.
+
+    Global on purpose. A home named for lineage A is a DESTINATION other forks' content must
+    resolve into, so it is not an omit candidate anywhere — including inside its OWN lineage's
+    gate, where it would otherwise be gated against itself and trivially resolve. See gate().
+    """
+    return {r for repos in (extra or {}).values() for r in repos}
+
+
+def gate(lin, remotes, scans, extra_homes=None, home_repos=None):
     """The CONTAINMENT PROOF for every non-canonical member of this lineage.
 
     THE RULE (#452 §3), mechanical and not a judgement: a fork is SAFE TO OMIT if and only if EVERY
@@ -684,12 +711,21 @@ def gate(lin, remotes, scans, extra_homes=None):
     worklist with its reason. Unknown content is never proof, at either scale: an unreadable BLOB is
     one worklist entry, while an unreadable TIP (sc is None) is NOT SAFE with the reason and an
     empty worklist — a git that never answered is an environment failure, not a list of work.
+
+    A HOME IS NEVER AN OMIT CANDIDATE. The canonical is skipped because it IS the home; every repo
+    named by --home is skipped for the same reason, and recorded in `not_omit_candidates` rather
+    than dropped silently. Gating a home against itself would trivially resolve every file and
+    print "SAFE TO OMIT (proven)" for the very repo the operator designated a DESTINATION — a
+    verdict that contradicts itself and, acted on, would lose exactly the content the gate exists
+    to protect. `scans` is keyed by REPO NAME (not by lineage), so a home in a DIFFERENT lineage —
+    which is the only case --home exists for — is found and actually proves containment.
     """
     canon = lin.get("canonical") or lin.get("candidate")
     homes = homes_for(lin, extra_homes)
+    home_repos = set(home_repos or []) | set(homes)
     home_ids, home_missing = {}, []
     for h in homes:
-        sc = scans.get((lin["id"], h))
+        sc = scans.get(h)
         if sc is None:
             home_missing.append(h)
             continue
@@ -706,11 +742,21 @@ def gate(lin, remotes, scans, extra_homes=None):
                 continue
             home_ids.setdefault(rec["id"], []).append("%s:%s" % (h, path))
 
-    forks = []
+    forks, not_candidates = [], []
     for m in lin["members"]:
         if m["repo"] == canon:
             continue
-        sc = scans.get((lin["id"], m["repo"]))
+        if m["repo"] in home_repos:
+            # A DESTINATION, not a candidate. Reported, never silently dropped, so a reader can
+            # see why this member has no verdict instead of finding it missing from the list.
+            not_candidates.append({
+                "repo": m["repo"], "tip": m["tip"],
+                "why": "named as a HOME by --home, so it is a DESTINATION other forks' content "
+                       "must resolve INTO — not a repo this gate may propose dropping. Gating it "
+                       "against itself would resolve every file trivially and print a proof that "
+                       "contradicts its own role."})
+            continue
+        sc = scans.get(m["repo"])
         rec = {"repo": m["repo"], "tip": m["tip"], "homes": list(homes)}
         if sc is None:
             rec.update({"verdict": NOT_SAFE, "files_at_tip": 0, "unresolved": [],
@@ -719,10 +765,16 @@ def gate(lin, remotes, scans, extra_homes=None):
             forks.append(rec)
             continue
         if home_missing:
+            # Reached ONLY when a home repo Part 1 knows could not be scanned at all (its tip did
+            # not enumerate, or its directory is gone from the forge — both are recorded in the
+            # report's `unreadable`). A home that merely lives in a DIFFERENT lineage does NOT come
+            # here: scans is keyed by repo name, so it is found and proves containment normally. A
+            # home naming a repo Part 1 never heard of cannot come here either — evolve() rejects
+            # that as a usage error before any gate runs, rather than blaming a git that never ran.
             rec.update({"verdict": NOT_SAFE, "files_at_tip": len(sc), "unresolved": [],
-                        "reason": "the home tip(s) %s would not enumerate, so nothing can be "
-                                  "proven contained — and unproven is never safe"
-                                  % ", ".join(home_missing)})
+                        "reason": "the home repo(s) %s could not be scanned at all (see the "
+                                  "report's 'unreadable'), so nothing can be proven contained — "
+                                  "and unproven is never safe" % ", ".join(home_missing)})
             forks.append(rec)
             continue
         unresolved, unreadable_here = [], 0
@@ -773,7 +825,8 @@ def gate(lin, remotes, scans, extra_homes=None):
                 % (len(sc), m["repo"], " or ".join(homes), m["repo"]))
         forks.append(rec)
     forks.sort(key=lambda f: (f["verdict"] == SAFE, f["repo"]))
-    return {"homes": homes, "forks": forks}
+    not_candidates.sort(key=lambda r: r["repo"])
+    return {"homes": homes, "forks": forks, "not_omit_candidates": not_candidates}
 
 
 def risk_of(lin, remotes):
@@ -833,7 +886,7 @@ def orphans(doc_lineages, scans):
     for lin in doc_lineages:
         canon = lin.get("canonical") or lin.get("candidate")
         for m in lin["members"]:
-            sc = scans.get((lin["id"], m["repo"]))
+            sc = scans.get(m["repo"])          # keyed by repo name; see evolve()
             if sc is None:
                 continue
             for path, rec in sc.items():
@@ -991,6 +1044,30 @@ def check_family(doc):
     return doc
 
 
+def check_homes(family, extra):
+    """Every --home must name a lineage and repos Part 1 actually knows. One clear line if not.
+
+    This is refused UP FRONT, before any gate runs, because the alternative is worse than an error:
+    a repo name Part 1 never heard of has no scan, so the gate would report every fork in the
+    lineage NOT SAFE "because the home would not enumerate" — blaming a git failure that never
+    happened and emptying the merge-home worklist that §3 makes the deliverable. A typo must not be
+    able to silently delete the work list; it must stop the run.
+    """
+    known = {m["repo"] for lin in family["lineages"] for m in lin["members"]}
+    ids = {lin["id"] for lin in family["lineages"]}
+    for lid, repos in (extra or {}).items():
+        if lid not in ids:
+            raise ForgeError("--home names lineage %r, which is not a lineage in this forge — "
+                             "the id is Part 1's lineage id (the root sha), as printed by "
+                             "forge_family_tree.py" % lid)
+        for r in repos:
+            if r not in known:
+                raise ForgeError("--home names %r as a home for lineage %s, but no such repo is in "
+                                 "the forge — a home must be a real repo whose tip this tool can "
+                                 "prove content against (did you mean a name ending in .git?)"
+                                 % (r, lid))
+
+
 # ── build ─────────────────────────────────────────────────────────────────────────────────────
 
 def evolve(family, only=None, extra_homes=None):
@@ -1003,6 +1080,15 @@ def evolve(family, only=None, extra_homes=None):
 
     `only` filters the lineages AFTER the orphan set is computed over the whole forge, because a
     blob's canonical coverage is global: filtering first would invent orphans that are not orphans.
+
+    THE SCANS ARE KEYED BY REPO NAME, NOT BY LINEAGE, and that is load-bearing for --home. A repo's
+    tip is a property of the REPO (Part 1 gives each repo exactly one tip; a repo in two lineages
+    with two different tips is a contradiction and is refused below), while a HOME may live in a
+    DIFFERENT lineage than the fork resolving into it — which is the only case --home exists for
+    (#452 §5: a grab-bag fork's packages belong to several homes). Keying by (lineage, repo) instead
+    would file every scan under the scanning lineage, so a cross-lineage home would never be found:
+    the gate would call it unscannable, blame a git failure that never happened, and empty the very
+    merge-home worklist §3 makes the deliverable.
     """
     if not have_git():
         raise ForgeError("git is not on PATH — this tool needs git")
@@ -1011,9 +1097,22 @@ def evolve(family, only=None, extra_homes=None):
         raise ForgeError("the forge is not at %s (named by the Part-1 document) — pass --remotes"
                          % remotes)
     lineages, cache, scans = family["lineages"], {}, {}
+    check_homes(family, extra_homes)
+    home_repos = named_home_repos(extra_homes)
     unreadable, unreadable_blobs = [], []
+    tip_of = {}
     for lin in lineages:
         for m in lin["members"]:
+            # One repo, one tip. Two lineages claiming the same repo at different tips would make a
+            # repo-keyed scan ambiguous, so it is refused loudly rather than resolved by luck.
+            if tip_of.setdefault(m["repo"], m["tip"]) != m["tip"]:
+                raise ForgeError("this document gives %s two different tips (%s and %s) — is it "
+                                 "from a different version of forge_family_tree.py?"
+                                 % (m["repo"], tip_of[m["repo"]][:10], m["tip"][:10]))
+    for lin in lineages:
+        for m in lin["members"]:
+            if m["repo"] in scans:
+                continue                     # already scanned under another lineage: same tip
             gd = os.path.join(remotes, m["repo"])
             if not os.path.isdir(gd):
                 unreadable.append({"repo": m["repo"], "reason": "no such repo under %s" % remotes})
@@ -1023,7 +1122,7 @@ def evolve(family, only=None, extra_homes=None):
                 unreadable.append({"repo": m["repo"],
                                    "reason": "tip %s would not enumerate" % m["tip"][:10]})
                 continue
-            scans[(lin["id"], m["repo"])] = sc
+            scans[m["repo"]] = sc
             # PER-BLOB gaps are recorded too, not only whole-tip ones: a file ls-tree lists whose
             # blob will not come out of the store is unknown content at a tip, and unknown content
             # must be visible. It is already counted as work by the gate and kept in the orphan
@@ -1048,7 +1147,7 @@ def evolve(family, only=None, extra_homes=None):
             "canonical": lin.get("canonical"), "member_count": lin.get("member_count"),
             "risk": risk, "risk_why": why,
             "timeline": timeline(lin, remotes),
-            "gate": gate(lin, remotes, scans, extra_homes),
+            "gate": gate(lin, remotes, scans, extra_homes, home_repos),
         })
     if only:
         keep = [r for r in rows if only in (r["id"], r["name"], r["name"] + ".git")
@@ -1178,8 +1277,13 @@ def render_gate(row, verbose=False, cap=12):
     """The containment proof per fork, and the worklist when there is one."""
     g = row["gate"]
     L = ["  RETIREMENT GATE — containment against %s" % " + ".join(g["homes"] or ["(no home)"])]
+    for nc in g.get("not_omit_candidates") or []:
+        L.append("   %-56s NOT AN OMIT CANDIDATE (a HOME)" % nc["repo"])
+        L.append("        %s" % _wrap(nc["why"], 74, "        "))
     if not g["forks"]:
-        L.append("   (this lineage has no non-canonical member: nothing to retire)")
+        L.append("   (this lineage has no non-canonical member left to retire: nothing to gate)"
+                 if g.get("not_omit_candidates")
+                 else "   (this lineage has no non-canonical member: nothing to retire)")
         return L
     for f in g["forks"]:
         L.append("   %-56s %s" % (f["repo"], f["verdict"]))
@@ -1827,20 +1931,91 @@ def selftest():
 
         # ---- --home adds a second destination for a grab-bag fork ------------------------------
         # one_fork's only_here.py lives in no home; point --home at a repo that holds it and the
-        # gate must resolve it there. This is #452 §5's "packages belonging to SEVERAL homes".
+        # gate must RESOLVE it there. This is #452 §5's "packages belonging to SEVERAL homes", and
+        # it is the ONLY thing --home exists for: the extra home is in ANOTHER lineage than the
+        # fork. Asserting merely that the home is NAMED in f3["homes"] proves nothing — that passes
+        # while the gate silently fails to find the home, reports a git failure that never happened
+        # and empties the worklist. So these checks assert the PROOF: the file resolves, the
+        # worklist shrinks to empty, the verdict flips to SAFE, and no false reason is given.
         w2 = work("secondhome")
         commit(w2, "only_here.py", "def only():\n    return 'never came home'\n",
                "second home: holds the fork's file", when="2026-06-01T00:00:00 +0000")
+        # the fork's fixture.json (added above) must come home too, or the fork stays NOT SAFE for
+        # a REAL reason and this check could not tell a working --home from a broken one.
+        commit(w2, "fixture.json", '{"not": "code"}', "second home: and the fork's data file",
+               when="2026-06-01T00:01:00 +0000")
         publish(w2, "second_home.git")
         homes = {B_lid: ["second_home.git"]}
-        # second_home.git is its own lineage, so its scan is keyed by ITS id, not B's: the gate
-        # looks the home up under the lineage being gated. Prove the flag is honoured end to end.
+        base_fork = next((f for r in doc2["lineages"] if r["name"] == "one_home"
+                          for f in r["gate"]["forks"] if f["repo"] == "one_fork.git"), None)
         doc3 = evolve(check_family(run_part1(tool, remotes=remotes, overrides=overrides)),
                       extra_homes=homes)
         f3 = next((f for r in doc3["lineages"] if r["name"] == "one_home"
                    for f in r["gate"]["forks"] if f["repo"] == "one_fork.git"), None)
         ck("--home: the extra home is named in the proof",
            f3 and "second_home.git" in f3["homes"], f3 and str(f3.get("homes")))
+        ck("--home: a home in a DIFFERENT lineage is FOUND — no false 'would not enumerate'",
+           f3 and not f3.get("reason"), f3 and str(f3.get("reason")))
+        ck("--home: the fork's un-merged files RESOLVE at the cross-lineage home (the worklist "
+           "shrinks to empty — it must not merely vanish)",
+           f3 and f3["unresolved"] == [] and f3.get("resolved") == f3.get("files_at_tip")
+           and f3.get("files_at_tip"),
+           f3 and "unresolved=%s resolved=%s of %s"
+           % ([u["path"] for u in f3["unresolved"]], f3.get("resolved"), f3.get("files_at_tip")))
+        ck("--home: with its content proven home, the fork flips to SAFE TO OMIT",
+           f3 and f3["verdict"] == SAFE, f3 and f3["verdict"])
+        ck("--home: and the baseline it flipped FROM was a real 2-file worklist (so the flip is "
+           "the home resolving content, not the worklist being emptied)",
+           base_fork and base_fork["verdict"] == NOT_SAFE
+           and sorted(u["path"] for u in base_fork["unresolved"])
+           == ["fixture.json", "only_here.py"],
+           base_fork and str([u["path"] for u in base_fork["unresolved"]]))
+        ck("--home: totals.worklist_files drops by exactly the 2 files that came home",
+           doc3["totals"]["worklist_files"] == doc2["totals"]["worklist_files"] - 2,
+           "%s vs %s" % (doc3["totals"]["worklist_files"], doc2["totals"]["worklist_files"]))
+
+        # ---- a HOME is never an OMIT CANDIDATE -------------------------------------------------
+        # Naming a member as its own lineage's home must NOT gate it against itself: every file
+        # would resolve trivially and the tool would print "SAFE TO OMIT (proven)" for a repo it
+        # simultaneously designates a DESTINATION — and dropping it would lose exactly the content
+        # the gate exists to protect. It is excluded like the canonical, and REPORTED, not dropped.
+        # doc4_base is the SAME forge with no --home, so the only difference between the two runs
+        # is the flag itself: any change in the SAFE count is caused by it and nothing else.
+        doc4_base = evolve(check_family(run_part1(tool, remotes=remotes, overrides=overrides)))
+        doc4 = evolve(check_family(run_part1(tool, remotes=remotes, overrides=overrides)),
+                      extra_homes={B_lid: ["one_fork.git"]})
+        g4 = next(r["gate"] for r in doc4["lineages"] if r["name"] == "one_home")
+        b4 = next((f for r in doc4_base["lineages"] if r["name"] == "one_home"
+                   for f in r["gate"]["forks"] if f["repo"] == "one_fork.git"), None)
+        ck("HOME IS NOT A CANDIDATE: (baseline) un-named, one_fork.git IS gated and is NOT SAFE",
+           b4 and b4["verdict"] == NOT_SAFE, b4 and b4["verdict"])
+        ck("HOME IS NOT A CANDIDATE: a member named as its own home gets NO omit verdict "
+           "(no vacuous self-proof)",
+           not any(f["repo"] == "one_fork.git" for f in g4["forks"]),
+           str([(f["repo"], f["verdict"]) for f in g4["forks"]]))
+        ck("HOME IS NOT A CANDIDATE: it is REPORTED as a destination, not silently dropped",
+           any(n["repo"] == "one_fork.git" and "DESTINATION" in n["why"]
+               for n in g4["not_omit_candidates"]),
+           str(g4.get("not_omit_candidates")))
+        ck("HOME IS NOT A CANDIDATE: naming it a home invents NO new SAFE verdict anywhere "
+           "(the totals do not grow)",
+           doc4["totals"]["forks_safe_to_omit"] == doc4_base["totals"]["forks_safe_to_omit"],
+           "%s vs baseline %s" % (doc4["totals"]["forks_safe_to_omit"],
+                                  doc4_base["totals"]["forks_safe_to_omit"]))
+
+        # ---- a --home that names something Part 1 never heard of STOPS the run ------------------
+        # It must never degrade into "NOT SAFE because the home would not enumerate": that blames
+        # git for a typo and deletes the worklist. One clear line, before any gate runs.
+        for bad, what in ((["%s=no_such_repo.git" % B_lid], "an unknown repo"),
+                          (["deadbeef00=one_home.git"], "an unknown lineage id")):
+            try:
+                evolve(check_family(run_part1(tool, remotes=remotes, overrides=overrides)),
+                       extra_homes=parse_homes(bad))
+                ck("--home: %s is refused up front, not blamed on git" % what, False,
+                   "it ran anyway")
+            except ForgeError as e:
+                ck("--home: %s is refused up front, not blamed on git" % what,
+                   "not a lineage" in str(e) or "no such repo is in the forge" in str(e), str(e))
 
         # ---- UNREADABLE BLOB: unknown content is WORK, never "proven contained" -----------------
         # A fork holding an un-merged file must not become SAFE TO OMIT merely because that file's
@@ -1980,17 +2155,19 @@ def selftest():
 
         # a whole-tip read failure was already NOT SAFE; prove the two paths agree rather than
         # assuming the per-blob fix did not regress it.
+        # `scans` is keyed by REPO NAME (see evolve): the home h.git is present here, the fork
+        # f.git is absent, so this is a whole-tip read failure at the FORK.
         ck("UNREADABLE: a whole-tip failure is still NOT SAFE too ('unknown is never safe')",
            gate({"id": "x", "name": "x", "canonical": "h.git",
                  "members": [{"repo": "h.git", "tip": "0" * 40},
                              {"repo": "f.git", "tip": "1" * 40}]},
-                remotes_c, {("x", "h.git"): {}})["forks"][0]["verdict"] == NOT_SAFE)
+                remotes_c, {"h.git": {}})["forks"][0]["verdict"] == NOT_SAFE)
         # A 0-file tip may ONLY come from a genuinely empty tree now, so it must not borrow the
         # language of a proof over real files — that sentence was a symptom of the round-1 defect.
         empty = gate({"id": "e", "name": "e", "canonical": "h.git",
                       "members": [{"repo": "h.git", "tip": "0" * 40},
                                   {"repo": "f.git", "tip": "1" * 40}]},
-                     remotes_c, {("e", "h.git"): {}, ("e", "f.git"): {}})["forks"][0]
+                     remotes_c, {"h.git": {}, "f.git": {}})["forks"][0]
         ck("EMPTY TIP: a genuinely empty tree is SAFE but says it is EMPTY, never 'every one of "
            "the 0 file(s) resolves ... PROVEN contained'",
            empty["verdict"] == SAFE and "NO files at all" in empty["worklist_note"]
@@ -2154,7 +2331,10 @@ def main(argv=None):
     ap.add_argument("--override-file", metavar="PATH", help="forwarded to Part 1 unchanged")
     ap.add_argument("--home", action="append", metavar="ID=REPO.git[,REPO.git]",
                     help="ADD home repos for the containment gate of lineage ID (a grab-bag fork's "
-                         "packages can belong to several homes). This never renames a canonical")
+                         "packages can belong to several homes). REPO.git may live in ANOTHER "
+                         "lineage — that is what this flag is for. It never renames a canonical, "
+                         "a repo named here is a DESTINATION and so is never itself proposed for "
+                         "omission, and a name Part 1 does not know stops the run")
     ap.add_argument("--timeline", action="store_true", help="the evolution timeline only")
     ap.add_argument("--gate", action="store_true", help="the containment retirement gate only")
     ap.add_argument("--orphans", action="store_true", help="the orphan blob report only")
