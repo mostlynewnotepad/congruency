@@ -21,6 +21,8 @@ One iteration of the adversarial network, harnessed:
                  then COMMITS the work onto `ticket/<id>` (the worker holds no git pen) — the single
                  --deliverable file by default, or its WHOLE PACKAGE when the deliverable is a forge
                  module (see policy 8, COMMIT SCOPE).
+                 Every file that commit lands is then STAMPED into the artifact registry through the
+                 governed artifact.record route, at the moment of the mint (policy 10).
                  A worker that reports NOTHING READABLE — no JSON on its last line, done=false, a
                  timeout, a non-zero exit — has FAILED ITS ROUND, and that is all: nothing is
                  committed (it reported no deliverable) and no adversary is spawned (there is no
@@ -119,6 +121,71 @@ THE SETTLED BRANCH-PER-TICKET DEFAULTS (RFC #220's open spec questions, answered
       on round 1; later rounds are already ACTIVE and send nothing.
       NO-VERDICT IS A ROUND OUTCOME, NOT A CRASH. See step 4 above and NoVerdict: a spawn that never
       answers fails its round; only the rounds running out ends the loop (exit 1).
+ (10) THE MINT HOOK (#457) — every file a commit LANDS is stamped into the artifact registry at the
+      moment it is minted, through the EXISTING governed route `artifact.record`
+      (migrations/0014_ticket_artifacts.sql). A registry populated by SCANNING is stale the moment the
+      scan finishes; a registry populated at the mint is not. Five deliverables merged before this
+      landed (#438, #440, #445, #448, #439) and ticket_artifacts held 0 rows: nothing was forgotten by
+      a person, nothing was ever written down. At commit time the harness ALREADY knows the ticket id,
+      the path and the commit, and git already content-addresses the bytes, so the stamp costs one
+      `rev-parse` per file and needs no new store, table or route:
+          forge_sha = `git rev-parse <commit>:<path>` — the git BLOB sha of that exact file.
+                      FOR CODE, GIT IS THE STORE. (large-blobs/artifacts exist only because VM images
+                      do not fit in git.)
+          name      = the file's repo-relative PATH — stable, resolvable, what a human greps.
+          version   = the short commit sha the file landed in (sha[:10], the spelling the journal and
+                      commit_note already use, so one ticket reads one way everywhere).
+          kind      = ARTIFACT_KIND ('forge-source') — a STABLE ARTIFACT class, documented there.
+                      NEVER the ticket's kind: build/test/documentation is the WORK's kind, not the
+                      ARTIFACT's. VM images register as 'forge-vm' in this same column.
+      EVERY file in the commit's SCOPE is stamped, never just the --deliverable: a forge package
+      commits several (policy 8), and a registry naming one of them lies about the rest.
+      Three rules the stamp obeys, each driven in --selftest against the REAL 0014 route:
+        NEVER FATAL. A failed artifact.record must not fail the commit or the round. The stamp is
+          instrumentation, and instrumentation that can break the pipeline is worse than none (the
+          discipline TreeView's telemetry already follows). Forge.stamp_artifacts() raises NOTHING,
+          ever: every failure is caught, NAMED on the returned record, and journaled by commit_note.
+        IDEMPOTENT. The key is (ticket_id, forge_sha) — re-committing the same bytes mints no second
+          row, so a round-2 commit of an unchanged file is not a new artifact. 0014's artifact.record
+          is a bare INSERT with no unique index behind it, so the dedupe is a READ of the ticket's
+          rows through the governed `artifact.list` route before any write — not a db constraint, and
+          not a hand-written db touch.
+        NO SQL PEN. artifact.record + artifact.list, and nothing else. The harness never writes SQL.
+
+THE DIRECTORY-SERVICE GATE (#457) — MEASURED, AND NOT MET BY THIS FILE ALONE. READ THIS BEFORE
+BELIEVING A STAMPED ROW IS FINDABLE:
+
+  #457 asks that `resolver.py <forge_sha>` resolve a stamped row "via the forge-artifacts probe",
+  on the premise that "the lookup path EXISTS". IT DOES NOT REACH THIS REGISTRY, for two INDEPENDENT
+  reasons, both measured against tools/resolver.py as it is now and both pinned by --selftest so they
+  cannot rot into a comfortable fiction:
+
+    (a) WRONG STORE. resolver.py's `forge-artifacts` probe reads the FORGE ledger — forge.db's
+        `artifacts` table, content-addressed by sha256 (resolver.py: "SELECT filename FROM artifacts
+        WHERE lower(sha256) = ?"). `artifact.record` writes CONGRUENCY's `ticket_artifacts` table.
+        They are two unrelated stores that share the word "artifact": resolver.py does not contain
+        the string `ticket_artifacts` anywhere. No hash this harness could record makes a
+        ticket_artifacts row visible to that probe, so this is not fixable by choosing a different
+        sha — the STORE is the blocker.
+    (b) WRONG KIND, so the probe never even runs. forge_sha is a git blob sha1 = 40 hex, and
+        resolver.detect_kind() routes 40 hex to `git-blob`, whose fan-out is
+        [omni-blob, store-occ, memgraph-node, git-object-db] — `forge-artifacts` is not in it. That
+        probe only fires for a 64-hex `sha256`. The ticket's own transcript shows this: it read
+        "probes: content-sha256, forge-artifacts, git-object-db" from a SHA256 query, then specified
+        forge_sha as a git blob sha, which never reaches that fan-out.
+
+  So the gate needs a change to tools/resolver.py, which is NOT this ticket's deliverable ("touch
+  nothing else"). What this file CAN and does guarantee is the half that is its own: the row exists,
+  at mint time, with a forge_sha that is a true content address of the landed bytes in the store the
+  ticket names — `git cat-file -t <forge_sha>` is `blob` and `git rev-parse <commit>:<path>` returns
+  it (both proven in --selftest). The tether is fixed; the resolver still cannot see it.
+
+  THE MINIMAL RESOLVER CHANGE THAT CLOSES THE GATE (for the follow-up ticket, NOT done here):
+    1. probes_for("git-blob") gains "ticket-artifacts"  (forge_sha is a git-blob identifier).
+    2. resolve_to_shas() gains that probe against the congruency db `ccon`, which it already opens:
+         SELECT name FROM ticket_artifacts WHERE lower(forge_sha) = ?
+       -> the row's `name` IS the repo-relative path, so the match names the path with no join.
+    Nothing else moves: `ccon` and its `table_exists()` guard are already there for ticket_works.
 
 PARALLEL PAIRS: N tickets => N branches => N worktrees, with zero tree contention (that is the
 whole point of worktrees). `--dispatch N --parallel K` runs up to K pairs at once, each a child
@@ -136,7 +203,7 @@ Usage (every form needs CONGRUENCY_API_KEY, from the env or .secrets/ats.env, EX
     python3 pair_loop.py --ticket 251 --deliverable docs/X.md      # run the pair on an existing ticket
     python3 pair_loop.py --file documentation --title "..." --body "..." --deliverable docs/X.md
     python3 pair_loop.py --dispatch 3 --parallel 2                 # route the queue, 2 pairs at once
-    python3 pair_loop.py --selftest                                # prove the git + governance layers
+    python3 pair_loop.py --selftest                                # prove git + governance + the stamp
     python3 pair_loop.py --selftest --install-check                 # ...and pip-install the merged package
     ... [--rounds 2] [--timeout 480] [--base main] [--keep-worktree] [--package-commit auto|on|off]
 
@@ -146,10 +213,17 @@ PACKAGE deliverable per policy 8), then deletes it. It also proves policy 9's go
 against the REAL constraint: a second throwaway db is built by EXECUTING this repo's own
 migrations/0029_ticket_authorization.sql, so the rule the checks meet is the actual shipping trigger
 rather than a Python imitation of it (an imitation is what let #279 pass 129/129 while breaking every
-dispatch). It spawns no agents, needs no api key and no server, and WRITES nothing: this repo and the
-live db are only ever READ — the migrations for their DDL, and the db (when this host has one)
-read-only via immutable=1, which creates no -wal/-shm sidecars (#153). Unless you add --install-check
-below, it never touches the network either.
+dispatch). The MINT HOOK (policy 10) is driven the same way: the throwaway db also executes
+migrations/0014_ticket_artifacts.sql, so the artifact.record/.list the stamp calls are the real routes
+and the rows are read back out of the real table — never from what the hook says it did. Every
+forge_sha a check asserts is compared against git's OWN answer in the throwaway repo (`git rev-parse
+<commit>:<path>`, cross-checked by `git hash-object`), so no check can agree with a bug just because
+the same code produced both sides. It spawns no agents, needs no api key and no server, and WRITES
+nothing: this repo and the live db are only ever READ — the migrations for their DDL, tools/resolver.py
+as TEXT for #457's gate pins (reading, never importing: an import would write a .pyc into this repo),
+and the db (when this host has one) read-only via immutable=1, which creates no -wal/-shm sidecars
+(#153). No live registry is ever written: every artifact.record here lands in a temp-dir db that is
+deleted with the run. Unless you add --install-check below, it never touches the network either.
 
 --install-check (only with --selftest) adds ONE further check, the last one to run: it builds a
 throwaway venv and runs a real `pip install -e .` against the forge package the selftest merged onto
@@ -279,6 +353,22 @@ PACKAGE_EXCLUDE_ENDS = (".egg-info", ".dist-info", ".egg")     # directory OR fi
 PACKAGE_EXCLUDE_FILES = (".pyc", ".pyo", ".pyd")
 
 
+# ── the mint hook: what a stamped row says it IS (#457, policy 10) ────────────────────────────────
+# The ARTIFACT's class, and a stable one: every file a pair lands is source held in git, whatever the
+# WORK that produced it was. It is deliberately NOT the ticket's kind — 'build', 'bug' and
+# 'documentation' describe the job, not the thing, and a registry keyed on the job cannot answer
+# "what IS this?". The column is shared with the forge's other classes ('forge-vm' for a VM image,
+# 'run-output' for crank evidence — 0014's own example), so the value must name the class and not
+# the producer. Change it and every row minted before the change reads as a different class: this
+# constant is a contract with the registry's readers, not a label.
+ARTIFACT_KIND = "forge-source"
+
+# The routes the mint hook uses — BOTH already exist (migrations/0014_ticket_artifacts.sql). #457 adds
+# no store, no table and no route: it fills the one that was already there and always empty.
+ARTIFACT_RECORD_ROUTE = "artifact.record"     # POST, token: INSERT one row
+ARTIFACT_LIST_ROUTE = "artifact.list"         # GET, public: this ticket's rows — the idempotency read
+
+
 def _parts(path):
     """A repo-relative path as its components, normalized ('./a//b' -> ['a', 'b']). git always
     speaks '/', os.path.normpath speaks os.sep; this reconciles them once, here."""
@@ -343,14 +433,22 @@ class Forge:
     Shared-.git mutations (worktree add/remove/prune, merge) are serialized across PROCESSES by an
     flock, so parallel pairs never race. Never nest lock() inside lock(): flock on a second open
     file description of the same file blocks the same process (self-deadlock).
+
+    `api` is the mint hook's seam (#457, policy 10): the governed-route caller commit_deliverable
+    stamps through. It is the SAME shape as Gov.api and for the same reason — --selftest binds a
+    throwaway db carrying the REAL 0014 routes, so what the checks drive is the shipping code against
+    the shipping SQL. None means "do not stamp", which is what a bare Forge(repo) is: the git layer
+    on its own, with no governance surface to reach, exactly as every git check here has always
+    constructed it. forge_for() binds the real `rest` for production.
     """
 
-    def __init__(self, root, worktrees=None, package_marker=PACKAGE_MARKER):
+    def __init__(self, root, worktrees=None, package_marker=PACKAGE_MARKER, api=None):
         self.root = os.path.abspath(root)
         wt = worktrees or os.path.join(".git", "pair-worktrees")
         self.worktrees = wt if os.path.isabs(wt) else os.path.join(self.root, wt)
         self.lockfile = os.path.join(self.root, ".git", "pair-loop.lock")
         self.package_marker = package_marker    # policy 8's gate; see package_root_of()
+        self.api = api                          # policy 10's seam; None = no stamping (git only)
 
     # ── plumbing ─────────────────────────────────────────────────────────────
     def _run(self, args, cwd=None):
@@ -444,6 +542,32 @@ class Forge:
         """
         return [p for p in self.git("diff", "--cached", "--name-only", "-z", cwd=cwd).split("\0") if p]
 
+    # ── the mint hook's content address (#457, policy 10) ────────────────────
+    def blob_sha(self, commit, path, cwd=None):
+        """The git BLOB sha of `path` AS IT EXISTS IN `commit` — `git rev-parse <commit>:<path>`.
+
+        This is `forge_sha`, and it is free: git content-addressed the bytes when it wrote them, so
+        the value is already in the object db and no hashing happens here. It is the sha of the bytes
+        THAT COMMIT holds, not of the file on disk — a later round can move the worktree's copy
+        without moving what this row says landed.
+
+        None (never a raise) when the path is not a blob in that commit. That is a real case, not a
+        fault: staged() reports DELETED files too (a package rewrite may retire a module, policy 8),
+        and a deleted path has no blob in the commit that deletes it. A deletion is not an artifact,
+        so the caller skips it and NAMES it rather than stamping a row for bytes that do not exist.
+
+        git_ok, not git: a missing path is an OUTCOME here, and this runs under the never-fatal stamp
+        (policy 10), which may not raise. --verify --quiet so a miss is a clean exit 1 with no stderr.
+        The sha is shape-checked before it is returned: `<commit>:<dir>` resolves to a TREE and a
+        gitlink to a COMMIT, and a row claiming either is a blob would be a lie the registry keeps.
+        """
+        ok, out = self.git_ok("rev-parse", "--verify", "--quiet", "%s:%s" % (commit, path), cwd=cwd)
+        sha = (out or "").strip()
+        if not ok or not sha:
+            return None
+        ok, kind = self.git_ok("cat-file", "-t", sha, cwd=cwd)
+        return sha if ok and kind.strip() == "blob" else None
+
     # ── commit scope (#409, policy 8) ────────────────────────────────────────
     def package_root(self, deliverable, package="auto"):
         """This commit's scope: the deliverable's package root, or None for the single-file default.
@@ -520,11 +644,15 @@ class Forge:
         one path has many spellings (`./docs/x.md` and `docs/x.md` are the same file; git prints the
         second). So: raw paths from -z, os.path.normpath applied to BOTH sides, via under().
 
-        Returns {committed, sha, branch, package, files, skipped, strays}:
+        Returns {committed, sha, branch, package, files, skipped, strays, artifacts}:
           package  the package root this commit's scope was, or None for a single-file commit
           files    the fileset ACTUALLY committed (git's own answer — Forge.staged())
           skipped  build artifacts under the package root, deliberately not committed
           strays   dirty paths outside the scope entirely
+          artifacts what the MINT HOOK stamped for this commit (#457, policy 10) —
+                   {recorded, skipped, errors, stamped}, from stamp_artifacts(). Present on EVERY
+                   return, including the one that commits nothing. Never a raise: a registry that is
+                   down costs the round its stamp, never its work.
         """
         wt = self.worktree_of(tid)
         if not os.path.isfile(os.path.join(wt, deliverable)):
@@ -553,8 +681,13 @@ class Forge:
         strays = [p for _, p in self.porcelain(cwd=wt) if not under(os.path.normpath(p), scope)]
         files = self.staged(cwd=wt)
         if not files:
-            return {"committed": False, "sha": self.head(wt), "branch": self.branch_of(tid),
-                    "package": pkg, "files": [], "skipped": skipped, "strays": strays}
+            # Nothing landed, so there is nothing to stamp — but the key is still here, with the same
+            # shape, because every caller reads cm["artifacts"] and a dict that sometimes lacks a key
+            # is a KeyError waiting for the one path that made no commit (the empty-branch case).
+            nothing = {"committed": False, "sha": self.head(wt), "branch": self.branch_of(tid),
+                       "package": pkg, "files": [], "skipped": skipped, "strays": strays}
+            nothing["artifacts"] = self.stamp_artifacts(tid, nothing)
+            return nothing
         if pkg:
             # The commit log names the fileset, so `git show` alone answers "did the package land
             # whole?" — the question #401 could only be answered by discovering the absence.
@@ -564,8 +697,87 @@ class Forge:
                 message += ("\nBuild artifacts skipped (regenerated by any install): %s"
                             % ", ".join(skipped))
         self.git("commit", "--quiet", "-m", message, cwd=wt)
-        return {"committed": True, "sha": self.head(wt), "branch": self.branch_of(tid),
-                "package": pkg, "files": files, "skipped": skipped, "strays": strays}
+        cm = {"committed": True, "sha": self.head(wt), "branch": self.branch_of(tid),
+              "package": pkg, "files": files, "skipped": skipped, "strays": strays}
+        # THE MINT HOOK (#457, policy 10): the commit succeeded, so every file it landed is stamped
+        # into the artifact registry NOW, while the ticket id, the paths and the commit are all in
+        # hand. Last, and after the commit: a stamp is a record OF a commit that happened, and
+        # stamp_artifacts() raises nothing, so nothing below this line can cost the round its work.
+        cm["artifacts"] = self.stamp_artifacts(tid, cm)
+        return cm
+
+    # ── the mint hook: stamp what landed, at the moment it lands (#457, policy 10) ──
+    def stamp_artifacts(self, tid, cm):
+        """Record EVERY file this commit landed into the artifact registry, via `artifact.record`.
+
+        Returns {recorded, skipped, errors, stamped} — never raises, whatever happens:
+
+          recorded  [{name, version, forge_sha, kind}] — the rows this call actually minted.
+          skipped   ["<path>: <why>"] — a file deliberately NOT stamped: already minted for this
+                    ticket (the idempotency key), or not a blob in the commit (a deletion).
+          errors    ["<what>: <why>"] — a stamp that was attempted and FAILED. Named, never raised.
+          stamped   False when the whole hook was skipped or could not run (no api seam, no commit,
+                    or the idempotency read failed); True when the ticket's rows are up to date.
+
+        WHY IT CANNOT RAISE (policy 10's NEVER FATAL). This runs inside commit_deliverable, whose
+        raise ends the round — so an exception here would let a registry outage destroy real, merged
+        work. The stamp is instrumentation; instrumentation that can break the pipeline is worse than
+        none. Every failure mode is therefore caught and returned as DATA for commit_note() to put on
+        the append-only journal, where a human can see the gap. Two layers, on purpose: per file (one
+        unreachable route must not cost the other files their rows) and around the whole hook (a
+        surprise from any other line is still not the round's problem).
+
+        WHY THE IDEMPOTENCY READ COMES FIRST (policy 10's IDEMPOTENT). The key is
+        (ticket_id, forge_sha) and NOTHING IN THE DB ENFORCES IT: 0014's artifact.record is a bare
+        INSERT and ticket_artifacts carries no unique index. So "record once" can only be honored by
+        reading the ticket's existing rows through `artifact.list` and not re-inserting what is there.
+        If that READ fails, this refuses to stamp AT ALL (stamped=False, the reason in `errors`)
+        rather than insert blind: a duplicate row is permanent — it lands in an append-only registry
+        and misreports one artifact as two — while a missing stamp is a gap the next commit closes.
+        In practice the read and the write are the same surface, so a failed read means the write was
+        never going to land either.
+
+        Two files with IDENTICAL BYTES share one blob sha, so the key mints ONE row for them and the
+        second is reported in `skipped`. That follows from (ticket_id, forge_sha) being the key and is
+        deliberate: the row addresses CONTENT, and there is exactly one content here (a package's
+        empty `sub/__init__.py` files are the everyday case).
+        """
+        out = {"recorded": [], "skipped": [], "errors": [], "stamped": False}
+        if self.api is None or not cm.get("committed"):
+            return out                       # the git layer alone, or nothing landed: nothing to stamp
+        try:
+            try:
+                rws = self.api(ARTIFACT_LIST_ROUTE, {"ticket_id": int(tid)}, "GET").get("rows", [])
+                seen = {(r.get("forge_sha") or "").lower() for r in rws}
+            except Exception as e:  # noqa: BLE001 — cannot prove idempotency, so do not write
+                out["errors"].append("%s (the idempotency read) failed, so NOTHING was stamped rather "
+                                     "than risk a duplicate row: %s" % (ARTIFACT_LIST_ROUTE, e))
+                return out
+            version = (cm.get("sha") or "")[:10]        # the short commit sha the file landed in
+            for path in cm.get("files", []):
+                sha = self.blob_sha(cm["sha"], path, cwd=self.worktree_of(tid))
+                if not sha:
+                    out["skipped"].append("%s: no blob in %s (a deletion is not an artifact)"
+                                          % (path, version))
+                    continue
+                if sha.lower() in seen:
+                    out["skipped"].append("%s: already stamped for #%s at forge_sha %s (same bytes, "
+                                          "not a new artifact)" % (path, tid, sha[:10]))
+                    continue
+                row = {"ticket_id": int(tid), "name": path, "version": version,
+                       "forge_sha": sha, "kind": ARTIFACT_KIND}
+                try:
+                    self.api(ARTIFACT_RECORD_ROUTE, row)
+                except Exception as e:  # noqa: BLE001 — one file's failure is not the others' problem
+                    out["errors"].append("%s for %s (forge_sha %s) failed: %s"
+                                         % (ARTIFACT_RECORD_ROUTE, path, sha[:10], e))
+                    continue
+                seen.add(sha.lower())        # a duplicate WITHIN this commit is still a duplicate
+                out["recorded"].append(row)
+            out["stamped"] = True
+        except Exception as e:  # noqa: BLE001 — the outer net: the stamp NEVER costs the round
+            out["errors"].append("the artifact stamp failed entirely (the commit stands): %s" % e)
+        return out
 
     # ── i2: merge the branch into the base (--no-ff); a conflict is an OUTCOME, not a crash ──
     def ahead_of(self, tid, base):
@@ -640,9 +852,11 @@ class Forge:
 
 
 def forge_for(root=None):
+    # api=rest binds the mint hook to the real governed surface (#457, policy 10) — the ONE place
+    # production gets a stamping Forge. A bare Forge(root) is the git layer with no registry to reach.
     cfg = REGISTRY.get("branch_per_ticket") or {}
     return Forge(root or ROOT, worktrees=cfg.get("worktrees"),
-                 package_marker=cfg.get("package_marker") or PACKAGE_MARKER)
+                 package_marker=cfg.get("package_marker") or PACKAGE_MARKER, api=rest)
 
 
 # ── the pair's birth prompts ───────────────────────────────────────────────────────────────────────
@@ -719,6 +933,11 @@ def commit_note(rnd, deliverable, cm):
     of a package that never landed installable. #401 reads exactly that way. Now a package commit
     names its root and its every file, and `strays` is back to meaning what it says: work left
     outside the commit's scope that will not survive the reap.
+
+    It also names what the MINT HOOK stamped (#457, policy 10), and — because the stamp may never
+    raise — what it FAILED to stamp. An instrumentation failure that is invisible is indistinguishable
+    from an instrumentation failure that never happened, so the errors go on the record where a human
+    reads them; the journal is the only place a swallowed exception can still be seen.
     """
     if not cm["committed"]:
         what = "no change to commit for %s" % deliverable
@@ -728,6 +947,16 @@ def commit_note(rnd, deliverable, cm):
     else:
         what = "committed %s" % deliverable
     note = "round %d: %s on %s @ %s" % (rnd, what, cm["branch"], cm["sha"][:10])
+    art = cm.get("artifacts") or {}
+    if art.get("recorded"):
+        note += ("; STAMPED %d artifact(s) into the registry (%s, kind %s): %s"
+                 % (len(art["recorded"]), ARTIFACT_RECORD_ROUTE, ARTIFACT_KIND,
+                    ", ".join("%s @ %s" % (r["name"], r["forge_sha"][:10]) for r in art["recorded"][:5])))
+    if art.get("skipped"):
+        note += "; artifacts NOT re-stamped: " + ", ".join(art["skipped"][:3])
+    if art.get("errors"):
+        note += ("; the artifact stamp FAILED (the commit above still stands — the stamp is "
+                 "instrumentation and never fails a round, #457): " + "; ".join(art["errors"][:3]))
     if cm["skipped"]:
         note += ("; build artifacts under the package NOT committed (any install regenerates them; "
                  "committing them would drift the base tree, #213): " + ", ".join(cm["skipped"][:5]))
@@ -1215,7 +1444,8 @@ GOV_MIGRATIONS = ("0002_ticket_approval.sql",       # tickets
                   "0001_agents.sql",                # agents — the registry ticket.assign requires
                   "0029_ticket_authorization.sql",  # ticket_agents + THE GOVERNANCE TRIGGERS + kinds
                   "0031_harvest_routes.sql",        # ticket.lesson — harvest() closes every run
-                  "0033_assign_idempotent.sql")     # ticket.assign as it is really routed today
+                  "0033_assign_idempotent.sql",     # ticket.assign as it is really routed today
+                  "0014_ticket_artifacts.sql")      # ticket_artifacts + artifact.record/.list (#457)
 
 # Those four only INSERT into api_routes; on the live db some earlier migration already created it.
 # This is that same CREATE, verbatim from migrations/0023_bug_catalog.sql:13 (0020/0024/0026/0027 all
@@ -1370,6 +1600,17 @@ class _StGov:
         r = self.db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?", (name,)).fetchone()
         return r[0] if r else None
 
+    def artifacts(self, tid=None):
+        """ticket_artifacts as the DB really holds it — the mint hook's checks read THIS, not what
+        stamp_artifacts() said it did (#457). A hook that returns a tidy `recorded` list while writing
+        no row would pass every check that trusted its own report; only the table can refute it."""
+        sql = "SELECT ticket_id, name, version, forge_sha, kind FROM ticket_artifacts"
+        args = ()
+        if tid is not None:
+            sql, args = sql + " WHERE ticket_id = ?", (int(tid),)
+        cols = ("ticket_id", "name", "version", "forge_sha", "kind")
+        return [dict(zip(cols, r)) for r in self.db.execute(sql + " ORDER BY id", args)]
+
 
 class _StLoopGov(_StGov):
     """_StGov plus the ONE route the round loop reads that no loaded migration defines.
@@ -1437,7 +1678,10 @@ def _st_loop_run(base_dir, tag, scripted, rounds=2):
         g["rest"] = gov
         g["rows"] = lambda route, params: gov(route, params, "GET").get("rows", [])
         g["spawn_claude"] = fake_spawn
-        g["forge_for"] = lambda root=None: Forge(repo)
+        # api=gov: exactly what forge_for() binds in production (api=rest), pointed at the throwaway
+        # db instead of the live one. That is what makes the mint hook's end-to-end checks real —
+        # main() stamps through the SAME seam, against the REAL 0014 routes, and writes nothing live.
+        g["forge_for"] = lambda root=None: Forge(repo, api=gov)
         g["API_KEY"] = "selftest-key"
         urllib.request.urlopen = lambda url, timeout=None: _TicketRow()
         sys.argv = ["pair_loop.py", "--ticket", str(tid), "--deliverable", "docs/out.md",
@@ -2002,6 +2246,21 @@ def selftest(install_check_too=False):
                 ck("...ACTIVE was set once and only then DONE, never before an assign",
                    [o.get("status") for r, o in lg.calls if r == "process_status"] == ["ACTIVE", "DONE"]
                    and before(lroutes, "ticket.assign", "process_status"), str(lroutes[:6]))
+                # #457 END TO END: the mint hook through the REAL main(). The checks further down
+                # drive commit_deliverable directly; this one proves the SHIPPING round loop reaches
+                # it — that forge_for()'s api seam is really bound, and that a settled ticket leaves
+                # the registry populated rather than empty (the #438/#440/#445/#448/#439 failure).
+                lart = lg.artifacts(439)
+                ck("#457 END TO END — a ticket main() settled leaves a stamped row per landed file",
+                   len(lart) == 1 and lart[0]["name"] == "docs/out.md"
+                   and lart[0]["kind"] == ARTIFACT_KIND, str(lart))
+                ck("...with forge_sha = `git rev-parse <commit>:<path>` in the repo it landed in",
+                   bool(lart) and lart[0]["forge_sha"] == Forge(lrepo).git(
+                       "rev-parse", "%s:docs/out.md" % Forge(lrepo).git(
+                           "rev-parse", "ticket/439").strip()).strip(),
+                   str(lart))
+                ck("...minted through the governed route, not a hand-written db touch",
+                   ARTIFACT_RECORD_ROUTE in lroutes, str(lroutes))
 
             e2, r2res = attempt(_st_loop_run, base_dir, "all-silent", [
                 NoVerdict("no JSON verdict on the agent's last line; tail: ''"),
@@ -2026,6 +2285,254 @@ def selftest(install_check_too=False):
             ck("a worker reporting done=false fails its round the same graceful way",
                not e3 and r3res and r3res[0] == 0 and r3res[1].status(439) == "DONE",
                e3 or str(r3res and (r3res[0], r3res[1].status(439))))
+
+        # ── #457: THE MINT HOOK — every file a commit lands is stamped, AT COMMIT TIME ────────────
+        # Driven against the REAL artifact.record/.list executed into a throwaway db straight from
+        # migrations/0014, and against a REAL throwaway git repo — so the forge_sha these checks
+        # compare against is git's own answer, never a value this code chose for itself. The rows are
+        # read back out of the TABLE (_StGov.artifacts), not from what stamp_artifacts() reported:
+        # a hook that returns a tidy list while writing nothing would pass a check that trusted it.
+        # Nothing live is touched: the live registry is never opened, here or anywhere in --selftest.
+        if not missing:
+            print("-- #457: the mint hook — artifact.record for every file a commit lands")
+            ga = _StGov(os.path.join(base_dir, "mint.sqlite"))
+            ga.ticket(457)
+            ck("the throwaway db carries the REAL artifact routes, loaded from migrations/0014",
+               all(ga.db.execute("SELECT 1 FROM api_routes WHERE name = ?", (r,)).fetchone()
+                   for r in (ARTIFACT_RECORD_ROUTE, ARTIFACT_LIST_ROUTE)))
+            # Starts empty so that every row below is one THIS hook minted — the checks measure the
+            # hook, not the fixture. (Not a claim about the live registry: #455 has since registered
+            # its VM images there as kind 'forge-vm'. That is the same column, a different artifact
+            # CLASS, and exactly why ARTIFACT_KIND is 'forge-source' and not the ticket's kind.)
+            ck("...and its ticket_artifacts starts EMPTY, so every row below is one the hook minted",
+               ga.artifacts() == [], str(ga.artifacts()))
+
+            # THE PRODUCTION BINDING, checked directly — and the reason it must be. Every other check
+            # here builds its own Forge(repo, api=...), and _st_loop_run OVERRIDES forge_for()
+            # entirely, so NOTHING else in this file can notice if the one line that binds the hook in
+            # production loses its api= argument: live commits would stamp nothing while --selftest
+            # stayed green. That is #279's failure shape exactly (a green selftest over a dead path),
+            # so the binding is asserted on its own. Constructing a Forge touches nothing.
+            ck("PRODUCTION BINDING — forge_for() binds the mint hook to the REAL governed route "
+               "(api=rest); without this every live commit stamps nothing",
+               forge_for(repo).api is rest, str(forge_for(repo).api))
+
+            fm = Forge(repo, api=ga)
+            w457 = fm.open_worktree(457, base)
+            open(os.path.join(w457["path"], "tools", "minted.py"), "w").write("print('minted')\n")
+            e457, cm457 = attempt(fm.commit_deliverable, 457, "tools/minted.py", "ticket #457: mint")
+            ck("a stamping commit still commits (the hook did not disturb the git layer)",
+               not e457 and cm457 and cm457["committed"], e457 or str(cm457))
+
+            r457 = ga.artifacts(457)
+            ck("THE STAMP — ticket_artifacts gains one row for the file that landed",
+               len(r457) == 1 and r457[0]["name"] == "tools/minted.py", str(r457))
+            # THE acceptance equality, against git itself — and a SECOND, independent oracle:
+            # hash-object hashes the BYTES, so agreement proves the row addresses this file's content
+            # and not merely some object the commit happens to contain.
+            oracle = fm.git("rev-parse", "%s:tools/minted.py" % cm457["sha"], cwd=w457["path"]).strip()
+            bytes_oracle = fm.git("hash-object", os.path.join(w457["path"], "tools", "minted.py"),
+                                  cwd=w457["path"]).strip()
+            ck("THE STAMP — forge_sha IS `git rev-parse <commit>:<path>`, git's own answer",
+               bool(r457) and r457[0]["forge_sha"] == oracle,
+               "row=%s git=%s" % (r457[0]["forge_sha"] if r457 else None, oracle))
+            ck("...and that sha is the content address of the landed BYTES (git hash-object agrees)",
+               bool(r457) and r457[0]["forge_sha"] == bytes_oracle, bytes_oracle)
+            ck("...name is the repo-relative PATH (stable, resolvable, what a human greps)",
+               bool(r457) and r457[0]["name"] == "tools/minted.py", str(r457))
+            ck("...version is the short commit sha the file landed in",
+               bool(r457) and r457[0]["version"] == cm457["sha"][:10],
+               "%s vs %s" % (r457[0]["version"] if r457 else None, cm457["sha"][:10]))
+            ck("...kind is the stable ARTIFACT class 'forge-source', NOT the ticket's kind ('build')",
+               bool(r457) and r457[0]["kind"] == ARTIFACT_KIND == "forge-source"
+               and r457[0]["kind"] != ga.db.execute("SELECT kind FROM tickets WHERE id=457").fetchone()[0],
+               str(r457))
+            ck("...minted through the governed route — no SQL pen, no hand-written db",
+               ARTIFACT_RECORD_ROUTE in ga.routes(), str(ga.routes()[-3:]))
+            ck("THE GATE, the half this file owns: the stamped forge_sha is a REAL blob in the store "
+               "the ticket names (`git cat-file -t` -> blob)",
+               bool(r457) and fm.git("cat-file", "-t", r457[0]["forge_sha"], cwd=w457["path"]).strip() == "blob")
+
+            # blob_sha() returns a BLOB or None — never a tree. `<commit>:<dir>` resolves happily to a
+            # tree sha, and a row claiming that is a blob would be a lie the registry keeps forever.
+            # staged() never names a directory today, so only a direct call can reach this guard —
+            # which is exactly why it is checked here rather than trusted.
+            ck("blob_sha() returns a blob, never a TREE (`<commit>:<dir>` resolves, but is not a file)",
+               fm.blob_sha(cm457["sha"], "tools", cwd=w457["path"]) is None
+               and fm.blob_sha(cm457["sha"], "tools/minted.py", cwd=w457["path"]) == oracle)
+            ck("blob_sha() returns None (never raises) for a path absent from the commit",
+               fm.blob_sha(cm457["sha"], "tools/never-existed.py", cwd=w457["path"]) is None)
+
+            # The IDEMPOTENCY READ is the one failure that must stop the hook rather than let it write
+            # blind: without the ticket's existing rows there is no way to honor (ticket_id,
+            # forge_sha), and a duplicate row in an append-only registry cannot be taken back.
+            class _ListDown(_StGov):
+                def __call__(self, route, obj=None, method=None):
+                    if route == ARTIFACT_LIST_ROUTE:
+                        raise Unexpected("route %s failed: the read is down" % route)
+                    return _StGov.__call__(self, route, obj, method)
+
+            gl = _ListDown(os.path.join(base_dir, "mint-listdown.sqlite"))
+            gl.ticket(464)
+            fl = Forge(repo, api=gl)
+            wl = fl.open_worktree(464, base)
+            open(os.path.join(wl["path"], "tools", "blind.py"), "w").write("b\n")
+            el, cl = attempt(fl.commit_deliverable, 464, "tools/blind.py", "ticket #464")
+            ck("a failed idempotency READ stamps NOTHING rather than insert blind (a duplicate row "
+               "is permanent; a missing stamp is not)",
+               not el and cl and cl["committed"] and gl.artifacts(464) == []
+               and not cl["artifacts"]["stamped"]
+               and any(ARTIFACT_LIST_ROUTE in x for x in cl["artifacts"]["errors"]),
+               el or str(cl["artifacts"]) if cl else "")
+            ck("...and it never sent an artifact.record it could not prove was new",
+               ARTIFACT_RECORD_ROUTE not in gl.routes(), str(gl.routes()))
+            fl.reap_worktree(464)
+
+            # IDEMPOTENT (key: ticket_id, forge_sha) — the same commit, stamped twice.
+            again = fm.stamp_artifacts(457, cm457)
+            ck("IDEMPOTENT — re-stamping the same commit mints NO second row",
+               again["recorded"] == [] and len(ga.artifacts(457)) == 1 and bool(again["skipped"]),
+               str(again))
+            ck("...and says WHY it did not (the row is named, not silently dropped)",
+               any("already stamped" in s for s in again["skipped"]), str(again["skipped"]))
+            # ...and the real round-2 shape of it: bytes CHANGE, then come BACK. Round 3 is a genuine
+            # commit whose blob sha equals round 1's, which is exactly "re-committing the same bytes".
+            open(os.path.join(w457["path"], "tools", "minted.py"), "w").write("print('changed')\n")
+            fm.commit_deliverable(457, "tools/minted.py", "ticket #457: round 2")
+            ck("...a round that changes the bytes DOES mint a row (the key is not just 'seen once')",
+               len(ga.artifacts(457)) == 2, str(ga.artifacts(457)))
+            open(os.path.join(w457["path"], "tools", "minted.py"), "w").write("print('minted')\n")
+            c457c = fm.commit_deliverable(457, "tools/minted.py", "ticket #457: round 3 (bytes revert)")
+            ck("...but a round REVERTING to bytes already stamped mints none (a real round-2 commit, "
+               "not a no-op)", c457c["committed"] and len(ga.artifacts(457)) == 2
+               and c457c["artifacts"]["recorded"] == [], str(ga.artifacts(457)))
+            fm.reap_worktree(457)
+
+            # EVERY FILE IN SCOPE — a forge package commits several (policy 8); stamping one lies
+            # about the rest. This is the #401/#409 shape, now at the registry.
+            gp = _StGov(os.path.join(base_dir, "mint-pkg.sqlite"))
+            gp.ticket(460)
+            fp = Forge(repo, api=gp)
+            w460 = fp.open_worktree(460, base)
+            pkg460 = "checkouts/current/forge2/mint_pkg"
+            wrote460 = _st_forge_package(w460["path"], pkg460, "mint_pkg")
+            os.makedirs(os.path.join(w460["path"], pkg460, "mint_pkg.egg-info"))
+            open(os.path.join(w460["path"], pkg460, "mint_pkg.egg-info", "PKG-INFO"), "w").write("x\n")
+            c460 = fp.commit_deliverable(460, pkg460 + "/add.py", "ticket #460: package")
+            r460 = gp.artifacts(460)
+            ck("EVERY FILE IN SCOPE — a PACKAGE commit stamps one row per file, not just the module",
+               sorted(r["name"] for r in r460) == wrote460, str([r["name"] for r in r460]))
+            ck("...each with its OWN forge_sha, matching git for that exact path",
+               all(r["forge_sha"] == fp.git("rev-parse", "%s:%s" % (c460["sha"], r["name"]),
+                                            cwd=w460["path"]).strip() for r in r460), str(r460))
+            ck("...and the build artifacts that were never committed are never stamped either",
+               not any(is_build_artifact(r["name"]) for r in r460), str([r["name"] for r in r460]))
+            # a DELETION is in the commit's fileset but is not an artifact: there are no bytes.
+            os.remove(os.path.join(w460["path"], pkg460, "config.json"))
+            c460b = fp.commit_deliverable(460, pkg460 + "/add.py", "ticket #460: retire the config")
+            ck("a DELETED file is in the commit but is NOT stamped (a deletion has no blob)",
+               pkg460 + "/config.json" in c460b["files"]
+               and not any(r["name"] == pkg460 + "/config.json" for r in gp.artifacts(460)[len(r460):])
+               and any("no blob" in s for s in c460b["artifacts"]["skipped"]),
+               "files=%s skipped=%s" % (c460b["files"], c460b["artifacts"]["skipped"]))
+            fp.reap_worktree(460)
+
+            # NEVER FATAL — the whole point of rule 2: instrumentation may not break the pipeline.
+            def _down(route, obj=None, method=None):
+                raise Unexpected("route %s failed: the registry is down" % route)
+
+            fd = Forge(repo, api=_down)
+            w461 = fd.open_worktree(461, base)
+            open(os.path.join(w461["path"], "tools", "survives.py"), "w").write("survivor\n")
+            ed, cd = attempt(fd.commit_deliverable, 461, "tools/survives.py", "ticket #461")
+            ck("NEVER FATAL — a registry that refuses EVERY route does not fail the commit",
+               not ed and cd and cd["committed"], ed or str(cd))
+            ck("...the work is really on the branch (the round kept what it earned)",
+               "tools/survives.py" in fd.git("show", "--name-only", "--format=", "ticket/461"))
+            ck("...and the stamp failure is NAMED, never swallowed",
+               bool(cd) and cd["artifacts"]["errors"] and not cd["artifacts"]["stamped"],
+               str(cd["artifacts"]) if cd else "")
+            ck("...and reaches the append-only JOURNAL, where a human can see the gap",
+               "artifact stamp FAILED" in commit_note(1, "tools/survives.py", cd),
+               commit_note(1, "tools/survives.py", cd))
+            ck("...and stamp_artifacts() itself raises NOTHING, whatever the api does",
+               attempt(fd.stamp_artifacts, 461, cd)[0] == "", attempt(fd.stamp_artifacts, 461, cd)[0])
+            fd.reap_worktree(461)
+
+            # ...and the narrower fault: the LIST works, one RECORD fails. The other files keep theirs.
+            class _RecordDown(_StGov):
+                def __call__(self, route, obj=None, method=None):
+                    if route == ARTIFACT_RECORD_ROUTE and (obj or {}).get("name", "").endswith("helper.py"):
+                        raise Unexpected("route %s failed: a 500 on this one row" % route)
+                    return _StGov.__call__(self, route, obj, method)
+
+            gr = _RecordDown(os.path.join(base_dir, "mint-partial.sqlite"))
+            gr.ticket(462)
+            fr = Forge(repo, api=gr)
+            w462 = fr.open_worktree(462, base)
+            pkg462 = "checkouts/current/forge2/partial_pkg"
+            wrote462 = _st_forge_package(w462["path"], pkg462, "partial_pkg")
+            e462, c462 = attempt(fr.commit_deliverable, 462, pkg462 + "/add.py", "ticket #462")
+            got462 = sorted(r["name"] for r in gr.artifacts(462))
+            ck("ONE row's failure costs only THAT row — the rest of the package is still stamped",
+               not e462 and got462 == [p for p in wrote462 if not p.endswith("helper.py")], str(got462))
+            ck("...and the one that failed is named on the record",
+               bool(c462) and any("helper.py" in x for x in c462["artifacts"]["errors"]),
+               str(c462["artifacts"]["errors"]) if c462 else "")
+            fr.reap_worktree(462)
+
+            # The bare git layer stamps nothing: no api seam, no registry to reach. This is what every
+            # git check above constructs, which is why none of them needed a db.
+            gn = _StGov(os.path.join(base_dir, "mint-none.sqlite"))
+            gn.ticket(463)
+            fn_ = Forge(repo)
+            w463 = fn_.open_worktree(463, base)
+            open(os.path.join(w463["path"], "tools", "unstamped.py"), "w").write("u\n")
+            c463 = fn_.commit_deliverable(463, "tools/unstamped.py", "ticket #463")
+            ck("a Forge with NO api seam commits and stamps nothing (the git layer, unchanged)",
+               c463["committed"] and c463["artifacts"] == {"recorded": [], "skipped": [], "errors": [],
+                                                           "stamped": False}, str(c463["artifacts"]))
+            # ...and a commit that lands NOTHING still answers the caller with the same shape.
+            c463b = fn_.commit_deliverable(463, "tools/unstamped.py", "ticket #463 again")
+            ck("a commit that lands nothing still returns an artifacts record (no KeyError downstream)",
+               c463b["committed"] is False and c463b["artifacts"]["recorded"] == []
+               and commit_note(1, "tools/unstamped.py", c463b), str(c463b["artifacts"]))
+            fn_.reap_worktree(463)
+
+        # ── #457: THE DIRECTORY-SERVICE GATE — pinned against the REAL resolver.py ────────────────
+        # #457's third gate asks that `resolver.py <forge_sha>` find a stamped row via the
+        # forge-artifacts probe. It CANNOT today, for two reasons this file cannot fix from its own
+        # deliverable — see THE DIRECTORY-SERVICE GATE in the module docstring. These pins make that
+        # a CHECKED fact rather than a claim: read resolver.py's source (a pure read — importing it
+        # would write a .pyc into this repo and break "--selftest writes nothing") and assert the two
+        # facts. If either FAILS, resolver.py has changed and the gate may now be closable: that is
+        # the signal to re-read the docstring and finish #457, not a defect in this file.
+        print("-- #457: the directory-service gate, pinned against the real tools/resolver.py")
+        rpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolver.py")
+        if not os.path.isfile(rpath):
+            skip("#457 GATE: resolver.py's forge-artifacts probe still cannot see ticket_artifacts",
+                 "no resolver.py beside this tool (%s)" % rpath)
+            skip("#457 GATE: a git blob sha does not route to the forge-artifacts probe", rpath)
+        else:
+            rsrc = open(rpath).read()
+            ck("#457 GATE (a): resolver.py holds NO reference to `ticket_artifacts` — the table "
+               "artifact.record writes — so a stamped row is invisible to it. Its forge-artifacts "
+               "probe reads forge.db's `artifacts` (sha256) instead. FAIL here = resolver.py changed; "
+               "re-read THE DIRECTORY-SERVICE GATE in this docstring and close #457's gate.",
+               "ticket_artifacts" not in rsrc
+               and "SELECT filename FROM artifacts WHERE lower(sha256) = ?" in rsrc,
+               "resolver.py now mentions ticket_artifacts=%s" % ("ticket_artifacts" in rsrc))
+            ck("#457 GATE (b): forge_sha is a 40-hex git blob sha, which resolver routes to kind "
+               "`git-blob`, whose fan-out has no forge-artifacts probe (that probe fires only for a "
+               "64-hex sha256). FAIL here = the fan-out changed; re-check the gate.",
+               '"git-blob":  ["omni-blob", "store-occ", "memgraph-node", "git-object-db"]' in rsrc
+               and '"sha256":    ["content-sha256", "forge-artifacts", "git-object-db"]' in rsrc,
+               "probes_for() no longer reads as pinned — re-read resolver.probes_for()")
+            print("        NOTE (#457): the stamp is minted and its forge_sha is a true git blob "
+                  "address, but resolver.py cannot yet see ticket_artifacts. Closing the gate needs "
+                  "a resolver.py change (probes_for('git-blob') += 'ticket-artifacts', plus a "
+                  "SELECT name FROM ticket_artifacts WHERE lower(forge_sha)=? probe on the congruency "
+                  "db it already opens) — NOT this ticket's deliverable. See the module docstring.")
 
         # step() must not file a Variant-A bug report for an outcome its caller handles. Checking that
         # must not file one EITHER, so bug_report is swapped for a recorder while these two run.
@@ -2126,7 +2633,8 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="prove the branch/worktree/commit/merge/reap flow in a THROWAWAY temp repo, plus "
                          "policy 9's assign->ACTIVE governance order against the REAL trigger executed "
-                         "from migrations/0029, then exit (no api key, no server, no agents, no network; "
+                         "from migrations/0029 and policy 10's artifact stamp against the REAL routes "
+                         "from migrations/0014, then exit (no api key, no server, no agents, no network; "
                          "this repo and the live db are READ, never written)")
     ap.add_argument("--install-check", action="store_true",
                     help="with --selftest only: also run a real `pip install -e .` on the forge package the "
