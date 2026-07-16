@@ -1786,7 +1786,7 @@ func (t *TreeViewTag) index(repos map[string]treeRepo, order []string) string {
 	for _, name := range order {
 		r := repos[name]
 		out += "<li>&#128193; <a href='?page=tree&repo=" + esc(phpURLEncode(name)) + "'>" + esc(name) + "</a> " +
-			"<span style='color:#888;font-size:.85em'>@ " + esc(phpSubstr(r.headCommit, 0, 12)) + "</span></li>\n"
+			"<span style='color:#888;font-size:.85em' title='registry head_commit (resolved on open)'>@ " + esc(phpSubstr(r.headCommit, 0, 12)) + "</span></li>\n"
 	}
 	return out + "</ul>\n"
 }
