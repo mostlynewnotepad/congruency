@@ -11,9 +11,15 @@ FANS OUT to every backing index that can answer it, and MERGES the answers into 
     {repo, path, line-range, identifier-kind, associated tickets, score}
 with no two matches overlapping on the same {repo, path}.
 
+Not everything this corpus holds is source, so the collection has a SECOND kind of match: a registered
+forge ARTIFACT — a VM image, a wheel, a seed — which has a path but no repo and no line-range. See AN
+ARTIFACT HIT IS A MATCH below for its exact shape and for why it does not borrow the source one.
+
     python3 tools/resolver.py '_emit_in_subprocess.py'          # by file-name
     python3 tools/resolver.py 000eaf4b49499a7674824c7710da623d9c475bbc     # by git blob hash
-    python3 tools/resolver.py <64-hex>                          # by content sha256
+    python3 tools/resolver.py <64-hex>                          # by content sha256: source, OR a
+                                                                #   registered forge artifact (a VM
+                                                                #   image, a wheel, a seed)
     python3 tools/resolver.py '_emit_in_subprocess'             # by name (symbol)
     python3 tools/resolver.py --like '_emit_in_subprocess.py'   # by similarity to that source
     python3 tools/resolver.py 'retry a subprocess call'         # by similarity to free text
@@ -49,6 +55,108 @@ including `scratchpad.js` and `logs/coordinator.err`. That is not a mis-match: t
 byte-identical, all of them empty. Such a match is rendered with the line-range `(empty)` and the
 symbol `(empty file)`, precisely so it reads as what it is. A zero-byte blob is the one identity in
 a content-addressed corpus that says nothing about the source, and it is labelled rather than hidden.
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+AN ARTIFACT HIT IS A MATCH (ticket #461), AND IT DOES NOT PRETEND TO BE SOURCE.
+
+The blob identity above is how SOURCE is resolved. A forge ARTIFACT is resolved differently and is
+the one thing in this collection that is not source: it is content-addressed by sha256 in the forge
+ledger's `artifacts` table, it is not an omni blob, and it has no callable inside it to point at. A
+586MB VM image has a path; it has no repo, and there is no line 1 of it.
+
+Until #461 that made it a second-class answer: the forge-artifacts probe printed the artifact's path
+as a side-note and the summary, counting only blobs, said "no match" — both in the same output. A
+resolver that prints the answer and then denies finding it is worse than one that finds nothing,
+because it teaches the reader to distrust the summary. So an artifact is a MATCH now, and the shape
+was widened rather than faked. An ARTIFACT match is:
+
+    {identifier_kind : the REGISTERED kind — 'forge-vm', 'forge-source', 'xz', ... — when every
+                       registration of that sha agrees on one; else the generic 'artifact'. Read from
+                       the FORGE ledger only, so it does not change when the state db is absent.
+     level           : 'artifact'  (source matches are 'chunk' or 'file')
+     path            : the PRIMARY registered location
+     locations       : EVERY registered location of that sha, primary first
+     sha256          : the content address — the identity the whole match hangs off
+     score           : 1.0, exactly as the other probes score an exact content hit
+     via             : the probe(s) that reached it
+     tickets         : the MINTING ticket(s), from ticket_artifacts (see ASSOCIATED TICKETS)
+     artifact        : {registrations, names, versions, kinds, size} — the ledger's own record}
+
+    ABSENT: `repo`, `line_start`, `line_end`, `symbol`, `namespace`, `blob_sha`. Not null, not zero,
+    not "" — NOT PRESENT. A VM has no repo and no lines, and every one of those fields already MEANS
+    something specific in a source match (a null `line_end` means "named by the index, absent from
+    the object store", which the renderer prints as `1-?`). Borrowing one would not be a placeholder,
+    it would be a false statement about a VM image. The rule is simply: a field with no value is not
+    emitted. READ THE COLLECTION BY BRANCHING ON `level` — never by assuming every match has lines.
+
+    A CONSUMER WRITTEN BEFORE #461 WILL NOT KNOW THAT, and one exists: tools/source_dedup.py (#194)
+    reads `m["repo"], m["path"], m["line_start"], m["line_end"], m["blob_sha"]` off every match
+    unconditionally (source_dedup.py:454-455). Handed an ARTIFACT's sha256 it now exits 2 with
+    "unexpected error: 'repo'"; before #461 it printed "0 unit(s)" for the same query. Both measured,
+    both wrong answers to "what source duplicates this VM image?", and the fix belongs in that file
+    — this one is scoped to the resolver. Filling those fields with nulls to keep it quiet would be
+    worse, not better: source_dedup.py:659-667 renders a null `line_end` as the line-range `1-?`, so
+    the engine would report a 586MB VM image as source spanning line 1 to unknown. A loud stop beats
+    a quiet fiction. Its SOURCE work is untouched, and that is measured rather than hoped: the
+    collection this file returns for a source identifier is byte-identical to the pre-#461 one (see
+    WHAT DID NOT CHANGE), and that collection is source_dedup's only input.
+
+    THE FULL PRICE OF THAT STOP, so it is not discovered later as a surprise: source_dedup catches
+    every unexpected error and APPENDS a report to `logs/bug_reports.jsonl` under its registry root
+    (source_dedup.py's `except Exception` handler, the sink registry.json's `bug_reports` names), so
+    it exits 2 with "(a bug report was filed to logs/bug_reports.jsonl)" and that file grows by one
+    line per artifact-sha query put through it. THAT WRITE IS source_dedup's, NOT THIS FILE'S: the
+    resolver resolves the same sha256 with no write and no file at all (WHAT IT WRITES below states
+    this file's own single exception, and it is the identical registry contract, not this one), and
+    the log is git-ignored so it enters no commit either way. It is recorded here because a reader
+    who runs the crash above will see that sentence and deserves to know which tool wrote the line
+    and where, rather than suspecting this one.
+
+WHEN AN ARTIFACT MATCH CAN APPEAR AT ALL — the whole list, so no reader has to guess. Only two probes
+read the ledger, and a match appears only if one of them HITS:
+  * `forge-artifacts` (the sha256 kind): the identifier IS the artifact's content address. This is
+    the case #461 was filed for.
+  * `string-index` (the uuid and node kinds): the identifier equals a registered `name`, `version`,
+    `filename` or sha256, looked up as an opaque string. In the live corpus this is reachable only by
+    forcing the kind (`--kind node noble-arm64-base`), because a bare artifact name is shaped like
+    free text and detects as `text` — a similarity query, which never yields an artifact match.
+Any other identifier — a symbol, a file-name, a path, a ticket, a git blob hash, free text — cannot
+produce one, because no probe it dispatches to reads the ledger.
+
+ONE SHA, MANY LOCATIONS, ONE ARTIFACT. The ledger is content-addressed, so the same bytes registered
+twice are ONE artifact with SEVERAL locations — the reasoning ArtifactRegistry.php:43-48 gives for
+the ticket-side table, and the way #455 already registers a VM (`meta.locations`). N registrations at
+N locations therefore collapse to ONE match carrying N locations, never N matches. That collapse
+mirrors what de_overlap() does for source — one match per REGION there, one match per CONTENT ADDRESS
+here — and it spans BOTH sources of a location: the `filename` column and `meta.locations`.
+
+WHAT DID NOT CHANGE, DELIBERATELY. #461 is additive: it makes an artifact representable and leaves
+SOURCE resolution alone. Artifacts are appended AFTER the source collection is complete and are never
+fed through expand/de_overlap/attach_tickets, which read {repo, path, line-range, blob sha}, so no
+source match — and no source match's ORDER — can move. Stated exactly, because "nothing changed" is a
+claim worth being precise about:
+
+  * A SOURCE identifier of ANY kind returns the byte-identical collection it returned before #461.
+    Measured against the pre-#461 file over every kind (name, file-name, path, uuid, node, git-hash,
+    ticket-ref, work-uid, sha256-of-source, --like, --kind, --repo, --min-score, and the degenerate
+    empty blob), with the state db both present and absent: identical in all of them.
+  * A SIMILARITY query (--like, or free text) never yields an artifact match, whatever the
+    identifier: it asks what is LIKE the identifier, and a registered artifact is not a similarity
+    answer — it is the thing itself, reached by content address, with no vector to rank.
+  * The ONE behaviour that does change, besides the sha256 kind #461 is about: a uuid- or node-kind
+    query whose string happens to equal a registered artifact's name/version/filename now returns
+    that artifact as a match, where before it was printed as a side-note beside "no match". Same fix,
+    same reason — see WHEN AN ARTIFACT MATCH CAN APPEAR. No naturally-detected uuid or node id in the
+    live corpus does this; reaching it takes an explicit --kind override.
+
+There is no `artifacts` side-channel any more, in prose or in --json: that channel WAS the bug. What
+the probe finds is in the collection, or the probe found nothing. `--acceptance` proves it live.
+
+THE ONE ARTIFACT THIS PROBE CANNOT REACH, named so it is not mistaken for a bug: a `ticket_artifacts`
+row whose `forge_sha` is 40 hex rather than 64 (row 21 today, #459's 'forge-source'). 40 hex is a git
+blob sha, so it is detected as `git-blob` and dispatches to the blob probes, which do not include
+forge-artifacts (see THE IDENTIFIER KINDS). That is a property of the recorded identifier, not of
+this normalization, and #461 requires the git-hash mode to behave exactly as it did before.
 
 ────────────────────────────────────────────────────────────────────────────────────────────────
 THE IDENTIFIER KINDS, AND THE INDEX EACH ONE DISPATCHES TO.
@@ -100,14 +208,22 @@ THE BACKING INDEXES (every one is opened READ-ONLY; NOTHING here is ever rebuilt
     (invocators/tags/dev/MemGraph.php:39-41): MEM_GRAPH_DB, else
     $HOME/code/installed/jazz-project/config/forge/mem_graph.db.
   * THE FORGE LEDGER — `forge.db`, whose `artifacts` table is a content-address index keyed by
-    `sha256` (its own column), with name/version/kind/filename. Resolved as ForgeView.php:32-34 does:
+    `sha256` (its own column), and this is its schema as it exists today:
+        artifacts (id, ts, name, version, sha256, kind, size, filename, source_repo, source_commit,
+                   meta)                            -- one row per REGISTRATION, NOT per artifact
+    `filename` is the location that registration recorded; `meta` is free-form JSON whose
+    `locations` list (written by #455's tools/vm_registry.py) names the OTHER locations of the same
+    content address. Both feed an artifact match's `locations`. Resolved as ForgeView.php:32-34 does:
     FORGE_DB, else $HOME/code/installed/jazz-project/config/forge/forge.db.
   * THE CONGRUENCY STATE DB — `ticket_works (uid, ts, ticket_id, kind, ref, note)`
-    (migrations/0029_ticket_authorization.sql:86-93), the source of ASSOCIATED TICKETS. Default
+    (migrations/0029_ticket_authorization.sql:86-93), the source of ASSOCIATED TICKETS, and
+    `ticket_artifacts (id, ts, ticket_id, name, version, forge_sha, kind)`
+    (migrations/0014_ticket_artifacts.sql:7-15), the source of an artifact's MINTING TICKET. Default
     <repo>/checkouts/current/state/congruency.sqlite (the path ticket_status.py:46 and
     tag_selfcheck.py:88 both use); CONGRUENCY_SQLITE or --congruency-db override. This file is
     git-ignored (.gitignore:11) and so is ABSENT from a pair worktree: when it is missing, every
-    match's `tickets` is simply empty and `--indexes` says the index is absent. Nothing else about a
+    match's `tickets` is simply empty — an artifact's minting ticket included, which a note on the
+    resolution says in words — and `--indexes` says the index is absent. Nothing else about a
     resolution changes, and the tool never creates it.
 
 THE CONTENT-SHA256 INDEX — built IN MEMORY, per run, and only when it is needed. No index in this
@@ -129,11 +245,12 @@ git-blob/sha256 identifier — never for a name, path or similarity query.
 
 THE UUID/STRING INDEX. An OPAQUE identifier — a uuid, or any bare token that is not a hash, a path
 or a python name — is looked up AS A STRING across the three places this corpus stores opaque ids:
-mem-graph `node.id` and `node.label`, forge `artifacts` (name/version/filename/meta), and
-`ticket_works.ref`. Stated plainly because the artifact must not over-promise: the live corpus holds
-NO uuid-shaped identifier today, so a uuid query correctly resolves to an EMPTY collection. The kind
-is detected, the index is queried, and "no match" is the honest answer — not a crash and not a
-pretence.
+mem-graph `node.id` and `node.label`, forge `artifacts` (matched on `name`, `version`, `filename` or
+`sha256` — the columns the query actually binds), and `ticket_works.ref`. A forge hit here is an
+ARTIFACT and becomes an artifact match, exactly as it does on the sha256 path (#461). Stated plainly
+because the artifact must not over-promise: the live corpus holds NO uuid-shaped identifier today, so
+a uuid query correctly resolves to an EMPTY collection. The kind is detected, the index is queried,
+and "no match" is the honest answer — not a crash and not a pretence.
 
 THE SIMILARITY (#190). Two independent similarity indexes are fanned out to and merged:
   1. THE #189 VECTORS — `chunks.vector`, a JSON float array, L2-normalized, so cosine similarity is
@@ -151,9 +268,9 @@ THE SIMILARITY (#190). Two independent similarity indexes are fanned out to and 
 `--min-score` filters both (default 0.0 for an exact-identifier query, 0.5 for a similarity query).
 
 THE SCORE. 1.0 for an EXACT identity resolution (the identifier IS that blob's hash / that path /
-that symbol / that node id). For a similarity resolution it is the cosine (dot product of unit
-vectors, or the mem-graph edge weight). So a score below 1.0 means "this is like what you asked
-for", and 1.0 means "this IS what you asked for".
+that symbol / that node id / that artifact's content address). For a similarity resolution it is the
+cosine (dot product of unit vectors, or the mem-graph edge weight). So a score below 1.0 means "this
+is like what you asked for", and 1.0 means "this IS what you asked for".
 
 THE LINE-RANGE. From the #189 store: `chunks.line_start`/`line_end` is a callable's REAL span in the
 original blob (its `def` line to its last line — code_sim_indexer.py:54-61), so a match points at
@@ -170,14 +287,25 @@ region of the same file can be reached twice. After the merge, within each {repo
   2. MERGE — any two remaining matches whose [line_start, line_end] intervals OVERLAP collapse into
      ONE match spanning min(start)..max(end), taking the MAX score and the UNION of their `via`
      provenance. Distinct callables in one file do not overlap and so stay distinct.
-The guarantee this yields, and which --acceptance checks: NO TWO matches in the returned collection
-share a {repo, path} and overlap in lines.
+The guarantee this yields, and which --acceptance checks: NO TWO source matches in the returned
+collection share a {repo, path} and overlap in lines. The ARTIFACT matches carry the same guarantee
+in their own terms — no two share a sha256, because one content address IS one artifact — and they
+have no {repo, path, line-range} to overlap on, so they are collapsed by artifact_matches() rather
+than passed through this function.
 
-ASSOCIATED TICKETS. For each match, the tickets whose `ticket_works.ref` names it, by either of the
-two conventions actually in the table: `omni-blob:<sha>` — the ref index_watch.py:214 writes for an
-indexed blob — matched against the match's blob sha; or a repo-relative PATH, matched when ref ==
+ASSOCIATED TICKETS. For a SOURCE match, the tickets whose `ticket_works.ref` names it, by either of
+the two conventions actually in the table: `omni-blob:<sha>` — the ref index_watch.py:214 writes for
+an indexed blob — matched against the match's blob sha; or a repo-relative PATH, matched when ref ==
 path, or one is a '/'-delimited suffix of the other. Basename-only matching is deliberately NOT
 done: it would attach every ticket that ever touched an `__init__.py` to all 180 of them.
+
+For an ARTIFACT match the ticket is the MINTING one, and it comes from a different table in a
+different FILE: `ticket_artifacts.forge_sha` in the congruency state db, joined on the sha256 content
+address (the join minting_tickets() below performs). The forge ledger's `artifacts` and congruency's
+`ticket_artifacts` are two registries that meet on nothing but that address — tools/vm_registry.py:
+96-109 documents the split, and before #461 resolver.py did not read the ticket-side table at all.
+Each entry is {ticket, artifact_id, kind}, where a source match's is {ticket, uid, kind}: both name
+the ticket, and each names the row it came from in its own table's terms.
 
 WHAT IT WRITES: NOTHING. Every database is opened through the sqlite URI flag `immutable=1`, never
 `mode=ro` — the state db is WAL-journalled, and `mode=ro` on a WAL db spins up `congruency.sqlite-shm`
@@ -208,9 +336,11 @@ Pure-python stdlib, one file. Registry-gated per note-for-claude: it walks UP to
 refuses to run without it.
 """
 import argparse
+import contextlib
 import glob
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -522,10 +652,11 @@ def resolve_to_shas(q, kind, src, opts, artifacts=None):
     """{sha: [score, {via}]} — step 1: the identifier, through every index that knows its kind.
 
     `via` names the index that reached it, so the collection can say HOW each match was found.
-    `artifacts` is an OUT list: a forge artifact is content-addressed by sha256 but is not an omni
-    blob, so it has no {repo, path, line-range} and is reported on its own channel rather than
-    faked into a match. Passed in explicitly rather than stashed on `opts`, so two resolutions
-    sharing an options dict cannot accumulate each other's findings.
+    `artifacts` is an OUT list of raw forge-ledger REGISTRATION rows (forge_artifact_rows below): a
+    forge artifact is content-addressed by sha256 but is not an omni blob, so it never becomes a
+    `sha` here. It is normalized into its own kind of match by artifact_matches() — see AN ARTIFACT
+    HIT IS A MATCH in the module docstring. Passed in explicitly rather than stashed on `opts`, so
+    two resolutions sharing an options dict cannot accumulate each other's findings.
     """
     artifacts = [] if artifacts is None else artifacts
     hits, probes = {}, probes_for(kind)
@@ -548,9 +679,8 @@ def resolve_to_shas(q, kind, src, opts, artifacts=None):
         sha = sha256_index(ocon, src["omni_git"], opts.get("all_blobs")).get(s.lower())
         if sha:
             _add(hits, sha, 1.0, "content-sha256")
-    if "forge-artifacts" in probes and fcon is not None and table_exists(fcon, "artifacts"):
-        for (fn,) in fcon.execute("SELECT filename FROM artifacts WHERE lower(sha256) = ?", (s.lower(),)):
-            artifacts.append(fn)
+    if "forge-artifacts" in probes:
+        artifacts.extend(forge_artifact_rows(fcon, "lower(sha256) = ?", (s.lower(),), "forge-artifacts"))
 
     # ── the mem-graph node id / the uuid-or-string index ─────────────────────────────────────────
     if "memgraph-node" in probes and gcon is not None:
@@ -572,11 +702,9 @@ def resolve_to_shas(q, kind, src, opts, artifacts=None):
                 elif nid.startswith("file:"):
                     for sha in _shas_for_path(ocon, nid.split(":", 2)[2]):
                         _add(hits, sha, 1.0, "string-index:mem-graph")
-        if fcon is not None and table_exists(fcon, "artifacts"):
-            for (fn,) in fcon.execute(
-                    "SELECT filename FROM artifacts WHERE name = ? OR version = ? OR filename = ? "
-                    "OR lower(sha256) = ? LIMIT 50", (s, s, s, s.lower())):
-                artifacts.append(fn)
+        artifacts.extend(forge_artifact_rows(
+            fcon, "name = ? OR version = ? OR filename = ? OR lower(sha256) = ? LIMIT 50",
+            (s, s, s, s.lower()), "string-index:forge-artifacts"))
         if ccon is not None and table_exists(ccon, "ticket_works"):
             for ref, tid in ccon.execute("SELECT ref, ticket_id FROM ticket_works WHERE ref = ? LIMIT 50", (s,)):
                 for sha in _shas_for_ref(ocon, ref):
@@ -882,6 +1010,141 @@ def attach_tickets(ccon, matches):
     return matches
 
 
+# ── the forge artifacts: an artifact hit IS a match (ticket #461) ────────────────────────────────
+# The forge ledger's `artifacts` columns this reads. `id` orders the registrations; `sha256` is the
+# identity everything else hangs off (the schema is quoted in THE FORGE LEDGER above).
+ARTIFACT_COLS = ("id", "name", "version", "sha256", "kind", "size", "filename", "meta")
+
+
+def forge_artifact_rows(fcon, where, args, via):
+    """The forge ledger's `artifacts` REGISTRATION rows matching `where`, each tagged with the probe
+    that reached it.
+
+    One ROW is one REGISTRATION, not one artifact: the ledger is content-addressed, so the same
+    bytes registered twice are ONE artifact with SEVERAL locations — the reasoning
+    ArtifactRegistry.php:43-48 spells out for the ticket-side table. artifact_matches() does that
+    collapse; this only reads. An absent ledger, or a ledger with no `artifacts` table, is no rows —
+    a fact to report, never a file to bring into being.
+    """
+    if fcon is None or not table_exists(fcon, "artifacts"):
+        return []
+    sql = "SELECT %s FROM artifacts WHERE %s" % (", ".join(ARTIFACT_COLS), where)
+    return [dict(zip(ARTIFACT_COLS, r), via=via) for r in fcon.execute(sql, args)]
+
+
+def _meta_locations(meta):
+    """The `locations` list #455's tools/vm_registry.py records in an artifact's `meta` JSON — the
+    OTHER places one content address is registered at, beyond its `filename`. (Live example: the
+    meta of `noble-arm64-base` carries both config/vm/noble-arm64-base.img and
+    config/forge/large-blobs/<sha>.) `meta` is a free-form JSON extras column, so anything that is
+    not a list of non-empty strings under `locations` yields NO locations: a malformed extra field
+    must never turn a real registration into a crash, and must never invent a location either.
+    """
+    if not meta:
+        return []
+    try:
+        d = json.loads(meta)
+    except (TypeError, ValueError):
+        return []
+    locs = d.get("locations") if isinstance(d, dict) else None
+    if not isinstance(locs, list):
+        return []
+    return [x for x in locs if isinstance(x, str) and x]
+
+
+def minting_tickets(ccon, sha):
+    """The ticket(s) that MINTED this content address: `ticket_artifacts (id, ts, ticket_id, name,
+    version, forge_sha, kind)` in the CONGRUENCY state db (migrations/0014_ticket_artifacts.sql:7-15
+    — the table the `artifact.record` route writes, :18-26).
+
+    THIS IS A JOIN ACROSS TWO DATABASE FILES, and that is the only way to get the minting ticket.
+    The forge ledger's `artifacts` (config/forge/forge.db) and congruency's `ticket_artifacts` are
+    different tables in different files — tools/vm_registry.py:96-109 documents the split in full.
+    They meet on nothing but the sha256 content address, which is exactly what this joins on.
+
+    An ABSENT state db yields NO tickets — the normal case in a pair worktree, where the db is
+    git-ignored (.gitignore:11) and so is simply not there. That is the same answer a SOURCE match
+    gets in the same worktree (attach_tickets), it is reported by the `tickets index:` line and by a
+    note on the resolution, and it is never faked.
+    """
+    if ccon is None or not table_exists(ccon, "ticket_artifacts") or not sha:
+        return []
+    out = []
+    for aid, tid, kind in ccon.execute(
+            "SELECT id, ticket_id, kind FROM ticket_artifacts WHERE lower(forge_sha) = ? ORDER BY id",
+            (sha,)):
+        if tid is None:
+            continue
+        t = {"ticket": tid, "artifact_id": aid}
+        if kind:
+            t["kind"] = kind
+        out.append(t)
+    return out
+
+
+def artifact_matches(rows, ccon):
+    """ONE match per registered ARTIFACT — the #461 normalization, and the whole point of this file.
+
+    Before #461 a forge-artifacts hit was printed as a side-note while the summary said "no match",
+    so the resolver announced an answer and denied it in the same breath. It is a match now. It is
+    NOT given a source's shape to get there: a VM image has no repo and no line-range, so those
+    fields are ABSENT rather than zeroed. The shape is stated in AN ARTIFACT HIT IS A MATCH above.
+
+    THE COLLAPSE, and why it mirrors de_overlap(). de_overlap gives back one match per REGION of
+    source, however many indexes reached it. This gives back one match per CONTENT ADDRESS, however
+    many times the ledger registered it: N registrations of one sha at N locations are ONE artifact
+    carrying N locations, never N matches. That is what content addressing means, and it is how
+    #455 already registers a VM (its `meta.locations`).
+
+    `identifier_kind` is the REGISTERED kind (forge-vm, forge-source, xz, ...) when every
+    registration of the sha agrees on one, and the generic 'artifact' when they disagree or none
+    recorded one — both spellings the ticket names. It is read from the FORGE ledger alone, never
+    from ticket_artifacts, so it does not change when the state db is absent.
+    """
+    by_sha = {}
+    for r in rows:
+        sha = (r.get("sha256") or "").strip().lower()
+        if sha:
+            by_sha.setdefault(sha, []).append(r)
+
+    out = []
+    for sha in sorted(by_sha):
+        regs = sorted(by_sha[sha], key=lambda r: (r["id"] is None, r["id"]))
+        locations, names, versions, kinds, vias, size = [], [], [], [], set(), None
+        for r in regs:
+            for loc in [r.get("filename")] + _meta_locations(r.get("meta")):
+                if loc and loc not in locations:
+                    locations.append(loc)
+            for seq, val in ((names, r.get("name")), (versions, r.get("version")), (kinds, r.get("kind"))):
+                if val and val not in seq:
+                    seq.append(val)
+            vias.add(r["via"])
+            if size is None and isinstance(r.get("size"), int):
+                size = r["size"]
+
+        # EVERY FIELD IS EMITTED ONLY WHEN IT HAS A VALUE. There is no repo and no line-range here,
+        # so there is no `repo`, `line_start` or `line_end` key at all — a null line_end already
+        # MEANS something else in this collection ("named by the index, absent from the object
+        # store", expand() below), and reusing it for a VM would be a lie the renderer would print
+        # as `1-?`.
+        art = {"registrations": len(regs)}
+        for key, val in (("names", names), ("versions", versions), ("kinds", kinds)):
+            if val:
+                art[key] = val
+        if size is not None:
+            art["size"] = size
+
+        m = {"identifier_kind": kinds[0] if len(kinds) == 1 else "artifact",
+             "level": "artifact", "sha256": sha, "score": 1.0, "via": sorted(vias),
+             "tickets": minting_tickets(ccon, sha), "artifact": art}
+        if locations:
+            m["path"] = locations[0]          # the primary location; `locations` carries them all
+            m["locations"] = locations
+        out.append(m)
+    out.sort(key=lambda m: (m.get("path") or "", m["sha256"]))
+    return out
+
+
 # ── the resolution ───────────────────────────────────────────────────────────────────────────────
 def open_sources(a, cs):
     """Every backing index, opened READ-ONLY. An absent one is None and is reported, never created."""
@@ -901,11 +1164,13 @@ def open_sources(a, cs):
 
 
 def resolve(q, src, cs, opts):
-    """The whole flow: detect -> fan out -> merge -> expand -> de-overlap -> attach tickets."""
+    """The whole flow: detect -> fan out -> merge -> expand -> de-overlap -> attach tickets, then
+    append any ARTIFACT the fan-out reached (#461) — which travels its own path, because it has no
+    {repo, path, line-range, blob sha} for the four steps before it to work on."""
     kind = opts["kind"] if opts["kind"] and opts["kind"] != "auto" else detect_kind(q)
     if kind not in KINDS and kind != "similarity":
         raise Fault("unknown identifier kind %r — kinds are: auto, %s" % (kind, ", ".join(KINDS)))
-    notes, artifacts = [], []
+    notes, artifacts, arts = [], [], []
 
     if opts["like"]:
         # "more like this": resolve the identifier first, then rank the store by ITS stored vectors.
@@ -935,12 +1200,27 @@ def resolve(q, src, cs, opts):
     else:
         hits = resolve_to_shas(q, kind, src, opts, artifacts)
         kind_label = kind
+        # AN ARTIFACT HIT IS A MATCH (#461) — and ONLY here, on the EXACT path. The two similarity
+        # branches above deliberately leave `arts` empty: a similarity query asks what is LIKE the
+        # identifier, and a registered artifact is not a similarity answer — it is the thing itself,
+        # reached by content address, with no vector to rank. Their collections are therefore exactly
+        # what they were before #461, which is what the ticket requires.
+        arts = artifact_matches(artifacts, src["cong"])
 
     matches = de_overlap(expand(src, hits, opts))
     for m in matches:
         m["identifier_kind"] = kind_label
     matches = attach_tickets(src["cong"], matches)
+    # Artifacts are appended AFTER the source collection is complete, and are never fed through
+    # expand/de_overlap/attach_tickets: those three read {repo, path, line-range, blob sha}, which an
+    # artifact does not have. Appending leaves every source match, and their order, untouched.
+    matches = matches + arts
     matches = [m for m in matches if m["score"] >= opts["min_score"]]
+    if arts and not table_exists(src["cong"], "ticket_artifacts"):
+        notes.append("an artifact's minting ticket comes from `ticket_artifacts` in the congruency "
+                     "state db, which is not readable here (it is git-ignored, .gitignore:11, so it "
+                     "is absent from a pair worktree) — pass --congruency-db <path>, or set "
+                     "CONGRUENCY_SQLITE, to attach it")
 
     # the git object db across the bare repos: only for a blob-identity query, never for a search
     object_dbs = {}
@@ -952,9 +1232,10 @@ def resolve(q, src, cs, opts):
 
     return {"identifier": q, "identifier_kind": kind_label, "detected_kind": detect_kind(q),
             "probes": probes_for(kind) if not opts["like"] else ["similarity"],
-            "blobs_resolved": len(hits), "total_matches": len(matches),
+            "blobs_resolved": len(hits), "artifacts_resolved": len(arts),
+            "total_matches": len(matches),
             "matches": matches[:opts["limit"]], "truncated": len(matches) > opts["limit"],
-            "object_dbs": object_dbs, "artifacts": sorted(set(artifacts)),
+            "object_dbs": object_dbs,
             "notes": notes,
             "tickets_index": "present" if src["cong"] is not None else "absent (no congruency db)"}
 
@@ -966,14 +1247,18 @@ def render(res):
                                 "" if res["identifier_kind"] == res["detected_kind"]
                                 else " (detected: %s)" % res["detected_kind"]))
     print("  probes:   %s" % ", ".join(res["probes"]))
-    print("  resolved: %d blob(s) -> %d de-overlapped match(es)%s"
-          % (res["blobs_resolved"], res["total_matches"],
+    # The artifact count appears ONLY when there is one, so a source resolution's summary is the
+    # line it has always been. There is no separate "forge artifacts:" line any more: an artifact is
+    # in the collection below, counted here, and #461 exists because announcing it beside a "no
+    # match" summary taught the reader to distrust both.
+    print("  resolved: %d blob(s)%s -> %d de-overlapped match(es)%s"
+          % (res["blobs_resolved"],
+             " + %d artifact(s)" % res["artifacts_resolved"] if res["artifacts_resolved"] else "",
+             res["total_matches"],
              "; showing %d" % len(res["matches"]) if res["truncated"] else ""))
     print("  tickets index: %s" % res["tickets_index"])
     for n in res["notes"]:
         print("  note: %s" % n)
-    if res["artifacts"]:
-        print("  forge artifacts (content-addressed by sha256): %s" % ", ".join(res["artifacts"]))
     for sha, repos in (res["object_dbs"] or {}).items():
         print("  object db %s: %s" % (sha[:12], ", ".join(repos) if repos else "(in no bare repo)"))
     if not res["matches"]:
@@ -985,18 +1270,30 @@ def render(res):
     print("\n%-6s %-11s %-24s %-8s %s" % ("score", "lines", "symbol", "tickets", "repo :: path"))
     print("-" * 118)
     for m in res["matches"]:
-        if m["line_end"] == 0:
-            lines = "(empty)"                       # a zero-byte blob: no lines to point at
-        elif m["line_end"] is None:
-            lines = "1-?"                           # named by the index, absent from the object store
-        else:
-            lines = "%s-%s" % (m["line_start"], m["line_end"])
         tix = ",".join("#%s" % t["ticket"] for t in m["tickets"]) or "-"
-        sym = (("%s.%s" % (m["namespace"], m["symbol"])) if m.get("namespace") and m.get("symbol")
-               else (m.get("symbol") or ("(empty file)" if m["line_end"] == 0 else "(whole file)")))
-        repo = m["repo"] if len(m["repo"]) <= 34 else m["repo"][:33] + "…"
+        if m.get("level") == "artifact":
+            # A registered artifact: no repo, no line-range. The columns say so in words rather than
+            # borrowing a number that would read as source. Its extra locations follow on their own
+            # rows — ONE artifact, several locations, never several matches.
+            lines = "(artifact)"
+            sym = "/".join(m["artifact"].get("names", [])) or "(unnamed)"
+            repo = "(no repo)"
+            path = m.get("path") or "(no registered location)"
+        else:
+            if m["line_end"] == 0:
+                lines = "(empty)"                   # a zero-byte blob: no lines to point at
+            elif m["line_end"] is None:
+                lines = "1-?"                       # named by the index, absent from the object store
+            else:
+                lines = "%s-%s" % (m["line_start"], m["line_end"])
+            sym = (("%s.%s" % (m["namespace"], m["symbol"])) if m.get("namespace") and m.get("symbol")
+                   else (m.get("symbol") or ("(empty file)" if m["line_end"] == 0 else "(whole file)")))
+            repo = m["repo"] if len(m["repo"]) <= 34 else m["repo"][:33] + "…"
+            path = m["path"]
         print("%-6.4f %-11s %-24s %-8s %s :: %s"
-              % (m["score"], lines, sym[:24], tix, repo, m["path"]))
+              % (m["score"], lines, sym[:24], tix, repo, path))
+        for loc in (m.get("locations") or [])[1:]:
+            print("%-6s %-11s %-24s %-8s %s :: %s" % ("", "", "(also at)", "", "(no repo)", loc))
 
 
 def show_indexes(a, src):
@@ -1067,6 +1364,217 @@ def find_specimen(src, opts):
     return None
 
 
+def ledger_oracle(src):
+    """THE ACCEPTANCE'S ORACLE: what the two registries SAY, read straight, with this function's own
+    reading of the schema —
+
+        {sha256: {"locations": [...], "names": [...], "kinds": [...], "registrations": n,
+                  "tickets": [ticket_id, ...]}}
+
+    IT IS DELIBERATELY NOT artifact_matches(). An expectation produced by the code under test cannot
+    fail, and this is not hypothetical: with the expectation taken from artifact_matches(), deleting
+    the whole `meta.locations` half of a location list left --acceptance green at 31/31, because the
+    defect moved both sides of the comparison together. Read straight from the two dbs, the same
+    deletion turns it red. Every #461 check below compares the resolver's answer to THIS.
+
+    `locations` is `filename` then `meta.locations`, in registration order, de-duplicated;
+    `tickets` is ticket_artifacts joined on the sha256 content address, and is empty when that db is
+    absent (a pair worktree), which the caller SKIPS on rather than failing.
+    """
+    out = {}
+    fcon, ccon = src["forge"], src["cong"]
+    if fcon is None or not table_exists(fcon, "artifacts"):
+        return out
+    for sha, name, version, kind, filename, meta in fcon.execute(
+            "SELECT lower(sha256), name, version, kind, filename, meta FROM artifacts "
+            "WHERE sha256 IS NOT NULL AND sha256 != '' ORDER BY id"):
+        e = out.setdefault(sha, {"locations": [], "names": [], "kinds": [], "registrations": 0,
+                                 "tickets": []})
+        e["registrations"] += 1
+        cands = [filename]
+        try:
+            d = json.loads(meta) if meta else None
+        except (TypeError, ValueError):
+            d = None
+        if isinstance(d, dict) and isinstance(d.get("locations"), list):
+            cands += d["locations"]
+        for seq, vals in ((e["locations"], cands), (e["names"], [name]), (e["kinds"], [kind])):
+            for v in vals:
+                if isinstance(v, str) and v and v not in seq:
+                    seq.append(v)
+    if ccon is not None and table_exists(ccon, "ticket_artifacts"):
+        for sha, tid in ccon.execute("SELECT lower(forge_sha), ticket_id FROM ticket_artifacts "
+                                     "WHERE forge_sha IS NOT NULL AND ticket_id IS NOT NULL ORDER BY id"):
+            if sha in out and tid not in out[sha]["tickets"]:
+                out[sha]["tickets"].append(tid)
+    return out
+
+
+def find_artifact_specimens(src):
+    """The artifacts that prove #461, DISCOVERED from the live ledger (via ledger_oracle) and never
+    hard-coded, so the proof is about the ledger and not about a constant in this file. Returns
+
+        {"any":   (sha, expectation) for a registered artifact — one the ledger says has a MINTING
+                  TICKET if any does, since that is the half of the shape only ticket_artifacts
+                  can fill;
+         "multi": (sha, expectation) for a content address registered at TWO OR MORE locations — the
+                  "one sha, many locations, ONE artifact" case. A sha carrying several REGISTRATIONS
+                  is preferred over one whose locations all came from a single row's meta, because
+                  collapsing two ledger ROWS into one match is the harder half of the claim. None if
+                  the ledger holds no multi-location artifact.}
+
+    or None when the forge ledger is absent or holds no registered artifact at all.
+    """
+    oracle = ledger_oracle(src)
+    if not oracle:
+        return None
+    shas = sorted(oracle)
+    with_ticket = [s for s in shas if oracle[s]["tickets"]]
+    multi = sorted((s for s in shas if len(oracle[s]["locations"]) >= 2),
+                   key=lambda s: (-oracle[s]["registrations"], s))   # the multi-ROW case first
+    any_sha = (with_ticket or shas)[0]
+    return {"any": (any_sha, oracle[any_sha]),
+            "multi": (multi[0], oracle[multi[0]]) if multi else None}
+
+
+def find_unregistered_sha256(src, opts):
+    """A sha256 that is registered NOWHERE and is no blob's content either — derived
+    deterministically, then CHECKED against both indexes that could answer it, so "0 matches" is a
+    proof and not a coincidence. Returns None in the (impossible in practice) event that 64
+    candidates all collide.
+    """
+    known = sha256_index(src["omni"], src["omni_git"], opts.get("all_blobs")) if src["omni_git"] else {}
+    for i in range(64):
+        cand = hashlib.sha256(("resolver.py #461 unregistered probe %d" % i).encode()).hexdigest()
+        if cand in known:
+            continue
+        if forge_artifact_rows(src["forge"], "lower(sha256) = ?", (cand,), "probe"):
+            continue
+        return cand
+    return None
+
+
+def artifact_acceptance(src, cs, opts, checks, results):
+    """PROVE ticket #461 on the live ledger: an artifact hit IS a match.
+
+    Every check here is the ticket's own acceptance, run against the live forge ledger:
+      * a registered sha256 returns >= 1 match naming its location, with the identifier-kind
+        reflecting the artifact and the minting ticket present — and NOT the words "no match";
+      * --json carries that match in the collection, not only in prose;
+      * a sha registered at several locations is ONE match carrying all of them;
+      * a sha registered nowhere is still 0 matches, and still says so;
+      * the source legs are untouched — no artifact leaked into them.
+    Appends to `checks`; prints what it found. A missing piece SKIPS loudly and is never a pass.
+    """
+    print("\nTHE FORGE ARTIFACTS (ticket #461: an artifact hit must BE a match)")
+    specs = find_artifact_specimens(src)
+    if specs is None:
+        print("  SKIPPED: the forge ledger is absent or holds no registered artifact, so there is "
+              "no artifact to resolve. Every check above still ran.")
+        return
+
+    o = dict(opts, kind="auto", like=False, limit=10000, min_score=0.0)
+
+    def artifacts_for(sha):
+        """(the resolver's artifact matches for `sha`, its whole result, its RENDERED output)."""
+        r = resolve(sha, src, cs, o)
+        b = io.StringIO()
+        with contextlib.redirect_stdout(b):
+            render(r)                    # the REAL rendered output, not a paraphrase of it
+        return [x for x in r["matches"] if x.get("level") == "artifact" and x.get("sha256") == sha], \
+            r, b.getvalue()
+
+    # ── the headline: the sha that printed its own answer and then denied it ─────────────────────
+    sha_a, want = specs["any"]
+    art, res, text = artifacts_for(sha_a)
+    loc = (want["locations"] or ["(no registered location)"])[0]
+
+    print("  specimen artifact (discovered from the ledger, not hard-coded)")
+    print("    sha256:        %s" % sha_a)
+    print("    the ledger SAYS: %d registration(s), kind=%s, name=%s"
+          % (want["registrations"], ",".join(want["kinds"]) or "(none)",
+             ",".join(want["names"]) or "(none)"))
+    for x in want["locations"]:
+        print("        location: %s" % x)
+    print("    the resolver ANSWERS: %d artifact match(es), %d total match(es) in the collection"
+          % (len(art), res["total_matches"]))
+
+    checks.append(("#461 artifact: its sha256 returns >= 1 match", len(art) >= 1))
+    checks.append(("#461 artifact: EXACTLY one match for the sha (one artifact, not one per "
+                   "registration — the ledger holds %d)" % want["registrations"], len(art) == 1))
+    checks.append(("#461 artifact: it is COUNTED — total_matches >= 1", res["total_matches"] >= 1))
+    checks.append(('#461 artifact: the rendered output does NOT say "no match" (it said both, #461)',
+                   "no match" not in text))
+    checks.append(("#461 artifact: the rendered output NAMES its location %r" % loc, loc in text))
+    if not art:
+        return                            # every remaining check reads the match; do not fake them
+    m = art[0]
+
+    checks.append(("#461 artifact: identifier-kind %r is the kind the LEDGER registered (%s)"
+                   % (m["identifier_kind"], ",".join(want["kinds"]) or "none"),
+                   m["identifier_kind"] == (want["kinds"][0] if len(want["kinds"]) == 1 else "artifact")))
+    checks.append(("#461 artifact: NO faked source shape — no `repo`, no `line_start`, no `line_end`",
+                   not any(k in m for k in ("repo", "line_start", "line_end"))))
+    checks.append(("#461 artifact: score is 1.0, as the other probes score an exact content hit",
+                   m["score"] == 1.0))
+    checks.append(("#461 artifact: --json carries it in `matches`, not on a side channel",
+                   any(j.get("sha256") == sha_a and j.get("level") == "artifact"
+                       for j in json.loads(json.dumps(res))["matches"])))
+    checks.append(("#461 artifact: its locations are EXACTLY the %d the ledger records"
+                   % len(want["locations"]),
+                   sorted(m.get("locations", [])) == sorted(want["locations"])))
+
+    if table_exists(src["cong"], "ticket_artifacts"):
+        checks.append(("#461 artifact: the minting ticket_id(s) from ticket_artifacts are present "
+                       "and are EXACTLY what that table records (%s)"
+                       % (",".join("#%s" % t for t in want["tickets"]) or "none"),
+                       bool(want["tickets"]) and
+                       sorted(t["ticket"] for t in m["tickets"]) == sorted(want["tickets"])))
+    else:
+        print("    minting ticket: SKIPPED — no readable `ticket_artifacts`. The congruency state db "
+              "is git-ignored (.gitignore:11) and so is absent from a pair worktree; pass "
+              "--congruency-db <path> to run this check.")
+
+    # ── one sha, many locations, ONE artifact ────────────────────────────────────────────────────
+    if specs["multi"] is None:
+        print("    many locations: SKIPPED — no content address in this ledger is registered at two "
+              "or more locations, so the case cannot be proved here.")
+    else:
+        msha, mwant = specs["multi"]
+        mart, _mres, _mtext = artifacts_for(msha)
+        locs = mart[0].get("locations", []) if mart else []
+        print("    many locations: %s -> %d match(es) carrying %d location(s); the ledger records "
+              "%d across %d registration(s)"
+              % (msha[:12], len(mart), len(locs), len(mwant["locations"]), mwant["registrations"]))
+        for x in mwant["locations"]:
+            print("        %s%s" % ("    " if x in locs else "MISSING ", x))
+        checks.append(("#461 one sha, many locations: ONE match, not one per location", len(mart) == 1))
+        checks.append(("#461 one sha, many locations: that ONE match carries all %d the ledger "
+                       "records" % len(mwant["locations"]),
+                       sorted(locs) == sorted(mwant["locations"]) and len(locs) >= 2))
+
+    # ── a sha registered nowhere is still nothing, and still says so ─────────────────────────────
+    unreg = find_unregistered_sha256(src, opts)
+    if unreg is None:
+        print("    unregistered sha256: SKIPPED — every candidate collided with the corpus (this "
+              "cannot happen in practice; if you are reading it, say so on the ticket).")
+    else:
+        ures = resolve(unreg, src, cs, o)
+        ubuf = io.StringIO()
+        with contextlib.redirect_stdout(ubuf):
+            render(ures)
+        print("    unregistered sha256 %s... -> %d match(es)" % (unreg[:12], ures["total_matches"]))
+        checks.append(("#461 a sha256 registered NOWHERE still returns 0 matches (no false positive)",
+                       ures["total_matches"] == 0))
+        checks.append(('#461 ... and still SAYS so ("no match") — the honest empty answer survives',
+                       "no match" in ubuf.getvalue()))
+
+    # ── additive: the source path is untouched ───────────────────────────────────────────────────
+    checks.append(("#461 additive: no artifact match leaked into any of the source legs above",
+                   not any(x.get("level") == "artifact"
+                           for r, _rows in results.values() for x in r["matches"])))
+
+
 def acceptance(src, cs, opts):
     """PROVE the ticket's ACCEPTANCE on the live corpus, read-only.
 
@@ -1079,7 +1587,13 @@ def acceptance(src, cs, opts):
     A similarity query legitimately ALSO surfaces the specimen's neighbours — that is what
     similarity is for — so what is compared is the specimen's own rows, and the neighbour count is
     printed rather than hidden. The four exact identifiers are additionally checked to return the
-    specimen's rows and NOTHING else. Every check prints PASS or FAIL; exit 1 if any FAILED.
+    specimen's rows and NOTHING else.
+
+    THEN #461's claim — "an artifact hit must BE a match" — is proved on the live forge ledger by
+    artifact_acceptance() below, on a specimen discovered the same way. Every check prints PASS or
+    FAIL; exit 1 if any FAILED. A check whose input the host does not have (the litellm proxy, the
+    congruency state db, a ledger with no artifact) is SKIPPED in words, never silently, and a SKIP
+    is never counted as a pass.
     """
     spec = find_specimen(src, opts)
     if not spec:
@@ -1105,9 +1619,14 @@ def acceptance(src, cs, opts):
         print("      %s :: %s" % (repo, path))
 
     def rows_of(res):
-        """The specimen's OWN rows in a collection, as the comparable match set."""
+        """The specimen's OWN rows in a collection, as the comparable match set.
+
+        Keyed on the specimen's BLOB sha, which an artifact match does not carry — so an artifact,
+        should one ever share this collection, is filtered out before its (absent) {repo, path,
+        line-range} is ever read. The specimen is source; only source rows can be its match set.
+        """
         return sorted((m["repo"], m["path"], m["line_start"], m["line_end"])
-                      for m in res["matches"] if sha in m.get("blob_shas", [m["blob_sha"]]))
+                      for m in res["matches"] if sha in m.get("blob_shas", []))
 
     legs = [("name", symbol, dict(opts, kind="auto", like=False)),
             ("file-name", basename, dict(opts, kind="auto", like=False)),
@@ -1169,12 +1688,16 @@ def acceptance(src, cs, opts):
     widest = max((r for r, _rows in results.values()), key=lambda r: r["total_matches"])
     seen, overlap = {}, False
     for m in widest["matches"]:
+        if m.get("level") == "artifact":
+            continue        # no {repo, path, line-range} to overlap; its own invariant is checked
         key = (m["repo"], m["path"])
         for lo, hi in seen.get(key, []):
             if (m["line_start"] or 0) <= hi and (m["line_end"] or 0) >= lo:
                 overlap = True
         seen.setdefault(key, []).append((m["line_start"] or 0, m["line_end"] or 0))
     checks.append(("de-overlapped: no two matches share a {repo, path} and overlap in lines", not overlap))
+
+    artifact_acceptance(src, cs, opts, checks, results)
 
     print("\nTHE CHECKS")
     good = True
@@ -1197,7 +1720,10 @@ MCP_TOOLS = {
                        "content sha256, uuid, mem-graph node id, ticket, path, file-name, symbol "
                        "name, or free text), fan out to every backing index, and return ONE "
                        "normalized de-overlapped collection of {repo, path, line-range, "
-                       "identifier-kind, tickets, score}. Read-only.",
+                       "identifier-kind, tickets, score}. A sha256 may also resolve to a registered "
+                       "forge ARTIFACT (a VM image, a wheel, a seed); such a match has level="
+                       "'artifact', carries `locations` and `sha256`, and has NO repo and NO "
+                       "line-range — branch on `level`. Read-only.",
         "properties": {
             "identifier": {"type": "string", "description": "the identifier to resolve"},
             "kind": {"type": "string", "description": "override detection: one of auto, " + ", ".join(KINDS)},
@@ -1349,7 +1875,7 @@ def main():
     ap.add_argument("--json", action="store_true", help="print the collection as JSON")
     ap.add_argument("--indexes", action="store_true", help="print the backing indexes and exit")
     ap.add_argument("--acceptance", action="store_true",
-                    help="PROVE the ticket's acceptance against the live corpus; writes nothing")
+                    help="PROVE #193's and #461's acceptance against the live corpus; writes nothing")
     ap.add_argument("--mcp", action="store_true", help="serve the resolver as an MCP tool over stdio")
     ap.add_argument("--omni-db", default=cs.OMNI_DB, help="omni-git index (default: %s)" % cs.OMNI_DB)
     ap.add_argument("--omni-git", default=cs.OMNI_GIT, help="omni-git objects (default: %s)" % cs.OMNI_GIT)
