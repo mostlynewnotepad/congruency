@@ -24,7 +24,11 @@ package main
 //	the engine   row -> method gate -> auth gate -> bind -> execute -> shape the reply. db.go's
 //	             RunRoute in Go; congruency_rest_route() in PHP.
 //	scratch db   a private, throwaway copy of the state db under the test's temp dir. Deleted with
-//	             the temp dir when the test ends. The LIVE state db is never opened for writing.
+//	             the temp dir when the test ends. The LIVE state db is never opened without a write
+//	             barrier — enforced in the sqlite driver, see THE LIVE-DB GUARD below.
+//	barrier      a sqlite open mode that makes writes fail: `immutable=1` (read-only, ignores the
+//	             WAL) or `_pragma=query_only(1)` (reads the WAL, refuses writes). Both are
+//	             re-measured on every run before they are relied on.
 //	the spine    process_status, ticket.create, ticket.assign, edge.record — the four routes the
 //	             dispatch machinery itself runs. #279 shipped a pair_loop change that set
 //	             process_status ACTIVE *before* ticket.assign; nothing verified that write path, it
@@ -136,22 +140,40 @@ package main
 // No writes to the live state db, no agents spawned, and the only network is localhost (the live
 // rest.php the GET half already used, plus the test's own ephemeral php server on a free port).
 //
-// The live db is opened ONCE, with the `immutable=1` URI flag, purely to `VACUUM INTO` a snapshot in
-// the temp dir. immutable=1 is not a stylistic choice — MEASURED THIS SESSION: the live state db is
-// in WAL journal mode, and opening a WAL db read-only with `mode=ro` CREATES congruency.sqlite-shm
-// and congruency.sqlite-wal next to it. immutable=1 promises sqlite the file will not change, so it
-// reads the committed main-file data with no locking and creates ZERO sidecar files. (db.go's header
-// says the live db is journal_mode=delete; that reading was itself taken through an immutable handle,
-// which reports 'delete' regardless. A plain handle reports 'wal'.)
+// The live state db is in WAL journal mode — MEASURED by reading its file header's read/write-version
+// bytes, which are 2 (db.go's header says journal_mode=delete; that reading was taken through an
+// immutable handle, which reports 'delete' regardless of the truth). WAL is what makes "read it
+// without touching it" harder than it looks, and the four open modes are NOT interchangeable.
+// MEASURED THIS SESSION, each mode opened against a real copy of the live db (17MB, WAL, no other
+// connection) and given a SELECT and nothing else:
+//
+//	                     reads WAL-committed data   refuses writes   sidecars after close
+//	plain read/write     yes                        NO               cleaned up
+//	mode=ro              yes                        yes              LEFT BEHIND (#153)
+//	_pragma=query_only   yes                        yes              cleaned up
+//	immutable=1          NO — stale                 yes              never created
+//
+// (None of the four changed the main db's mtime or size on a SELECT-only workload; the deciding
+// columns are the middle two.)
+//
+// So: the write half snapshots through `immutable=1` (zero sidecars; its staleness is harmless
+// because a snapshot only needs to be SOME consistent state, and both engines then fork from that one
+// seed), and the read half — which must see exactly what the live rest.php sees — holds a
+// `query_only(1)` handle. `mode=ro` is the trap the Playbook's #153 names: it leaves -wal/-shm behind.
 //
 // Because immutable=1 ignores locking, a snapshot taken while a live writer is mid-checkpoint could
 // in principle be torn, so the snapshot is verified with PRAGMA quick_check before it is used; a
 // torn read skips the write sweep with a named reason rather than reporting a false divergence.
 //
-// The guarantee is asserted, not asserted-in-prose: assertLiveDBUntouched() captures the live db's
-// mtime+size AND the full listing of its directory before and after the run, and fails on any
-// change. The directory listing is the stronger half — it is what catches the -wal/-shm class that
-// mtime+size alone cannot see.
+// THE GUARANTEE IS PROVEN, NOT PROMISED — and the proof is not the naive one the ticket imagined.
+// "Capture the live db's mtime+size before and after and fail if either changed" cannot work: the
+// pair_loop agents write this db concurrently, so it changes while no test is running at all, and a
+// test that fails on that fails at random. The change is therefore ATTRIBUTED instead, by four
+// assertions that each fail the run — an open ledger enforced inside the sqlite driver, a re-proof
+// that the barriers really do refuse writes, a schema delta (no route does DDL, so DDL means us), and
+// a sweep of the live db for this run's own probe marker — after which mtime+size is reported with
+// the per-table row deltas that explain it. The full argument is THE LIVE-DB GUARD block, above
+// assertLiveDBUntouched.
 //
 // ── KNOWN, BY-DESIGN NON-EQUIVALENCE ─────────────────────────────────────────────────────────────
 //
@@ -173,9 +195,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -186,8 +210,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	sqlitedriver "modernc.org/sqlite"
 )
 
 const (
@@ -260,6 +287,13 @@ const (
 // trigger ABORTs an assignment of an agent that is not in `agents`, so ticket.assign cannot be
 // driven without it. It is a row in a throwaway scratch db; no agent is spawned.
 const seededAgentID = "t451-equiv-agent"
+
+// liveProbeMarker is the string every row the seed plants carries. It exists so that "this run's
+// probe data never reached the live state db" is a MEASUREMENT (sweep the live db for it; any hit
+// fails the run) rather than a promise — see the LIVE-DB GUARD block, assertion 4. It is swept for
+// in the live db by markerRows, and assertMarkerSweepBites proves the seed carries it so a clean
+// sweep cannot be a tautology.
+const liveProbeMarker = "t451-equiv"
 
 // writeRouteInput is one POST route's request. `params` carries exactly one value per param the
 // route's row DECLARES — the test asserts that key set against the row itself, so neither a new
@@ -620,13 +654,35 @@ func runGetSweep(t *testing.T) {
 			filepath.Base(dbPath), serverStateDB)
 	}
 
-	d, err := Open(dbPath)
+	// The live db is opened through db.go's own open(), but with queryOnlyDSN's barrier rather than
+	// Open()'s plain read/write DSN — a #451 change to #227's sweep. #227's read/write handle was not
+	// observed to write anything (a SELECT-only workload through one leaves mtime and size alone —
+	// measured), but it COULD: it is a writable handle on the live state db, held across 38 routes,
+	// and the ticket requires this run to be provably read-only toward that file. query_only(1) is
+	// the only mode that makes it provable without changing what #227 measures — it still reads
+	// WAL-committed data, which immutable=1 cannot (see immutableDSN), while refusing every write.
+	//
+	// GET routes only ever SELECT, so the barrier is invisible to the comparison; the query_only
+	// re-read below proves the barrier was still up when the sweep finished, since query_only is
+	// connection state that SQL on the connection could in principle clear.
+	d, err := open(queryOnlyDSN(dbPath), dbPath)
 	if err != nil {
 		t.Skipf("cannot open %s (%v)", dbPath, err)
 	}
 	defer d.Close()
+	defer func() {
+		var qo string
+		if err := d.conn.QueryRowContext(context.Background(), "PRAGMA query_only").Scan(&qo); err != nil {
+			t.Errorf("cannot re-read PRAGMA query_only on the live handle: %v", err)
+			return
+		}
+		if qo != "1" {
+			t.Errorf("SIDE EFFECT: the live db handle's query_only barrier was LOWERED during the GET "+
+				"sweep (PRAGMA query_only reads %q, want \"1\"). That handle could write %s.", qo, dbPath)
+		}
+	}()
 
-	t.Logf("DB under test: %s", dbPath)
+	t.Logf("DB under test: %s (opened query_only(1): reads the WAL like rest.php does, refuses writes)", dbPath)
 	t.Logf("golden source: %s", base)
 
 	var identical, documented, volatile []string
@@ -688,6 +744,7 @@ type liveDirState struct {
 	size    int64
 	modTime time.Time
 	dir     map[string]int64
+	stat    os.FileInfo // kept for os.SameFile: proof the file was not swapped out under us
 }
 
 func captureLiveDirState(path string) (liveDirState, error) {
@@ -707,44 +764,580 @@ func captureLiveDirState(path string) (liveDirState, error) {
 		}
 		dir[e.Name()] = info.Size()
 	}
-	return liveDirState{size: fi.Size(), modTime: fi.ModTime(), dir: dir}, nil
+	return liveDirState{size: fi.Size(), modTime: fi.ModTime(), dir: dir, stat: fi}, nil
 }
 
-// assertLiveDBUntouched fails if this test changed the live db or added/removed any file beside it.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE LIVE-DB GUARD: how "this run did not write the live state db" is PROVEN.
 //
-// It is tolerant of the live db GROWING or its neighbours changing — the pair_loop agents write to
-// it continuously and this test cannot stop them — but it is NOT tolerant of a file APPEARING or
-// DISAPPEARING that this test could have caused. The sidecars (-wal/-shm) are the reason: they are
-// the one class this test could plausibly create, and their appearance is exactly what
-// PRAGMA-less "read-only" opens leave behind (Playbook #153).
-func assertLiveDBUntouched(t *testing.T, path string, before liveDirState) {
+// The naive form of this proof — capture the live db's mtime+size before and after and fail if
+// either changed — CANNOT WORK HERE, and saying why is the whole design.
+//
+//	MEASURED: the live state db changes while no test is running at all. The pair_loop agents are
+//	concurrent writers against it (observed: 17199104 -> 17211392 -> 17223680 bytes between runs,
+//	with nothing of ours executing). A test that fails on any mtime+size change is a test that
+//	fails at random, so a bare mtime+size assertion is not an assertion — it is a coin flip.
+//
+// So the change must be ATTRIBUTED, not merely observed: the question is never "did the live db
+// change" but "did WE change it". That question is answered here by proof of construction, in five
+// assertions that each FAIL the test, plus one observation that is reported as evidence. The numbers
+// below are the section markers in the code: 1 is the hook in installLiveGuard, 2 runs in
+// runWriteSweep before the sweep starts, and 3-6 are the sections of assertLiveDBUntouched.
+//
+//  1. THE OPEN LEDGER (liveGuard, below). Every sqlite connection this PROCESS opens — through any
+//     code path, in the test or in db.go — fires a driver-level connection hook. Any open of the
+//     live db whose DSN does not carry one of the two barriers below is REFUSED (the hook returns
+//     an error, so the connection is closed and unusable) and recorded as a violation, which fails
+//     the test. The hook lives in the driver, BENEATH every helper this file has, so it cannot be
+//     dodged by editing a helper: an open is an open.
+//
+//  2. THE BARRIERS ARE PROVEN, NOT ASSUMED (assertLiveBarriersHold). Both barriers are re-measured
+//     from scratch on every run, against a throwaway WAL db, through the SAME DSN builders the live
+//     path uses: CREATE TABLE / INSERT / DELETE / VACUUM must each fail with a readonly error, and
+//     immutable=1 must create no sidecar. If a driver upgrade ever weakened one, that proof goes red
+//     HERE rather than silently voiding assertion 1.
+//
+//  3. THE DIRECTORY AND THE FILE'S IDENTITY. Any file appearing or vanishing beside the live db
+//     fails, and so does the live db's inode changing (it was replaced, not written). The sqlite
+//     sidecars are the one attributed exception — see the comment on that section for why excusing
+//     them costs nothing.
+//
+//  4. NO DDL RAN (the schema delta). The live db is snapshotted at the start and at the end of the
+//     run, and the two snapshots' sqlite_master are compared. Concurrent pair_loop writers run
+//     ROUTES — INSERT and UPDATE — and no route in api_routes performs DDL. So a table or index
+//     appearing, vanishing, or changing shape during a run is not something a concurrent writer
+//     does; it is something a broken test does. It fails.
+//
+//  5. NO PROBE DATA LEAKED (the marker sweep). Every row the seed plants carries liveProbeMarker.
+//     Those rows must exist ONLY in throwaway forks under the temp dir, so the end snapshot of the
+//     live db is scanned for the marker and any hit fails. This is the direct, content-level form
+//     of "the write sweep never wrote the live db", and it is immune to concurrent writers because
+//     the marker is this test's alone. It is guarded against vacuity: the seed is asserted to
+//     CONTAIN the marker (assertMarkerSweepBites), so a sweep that matches nothing can never be
+//     mistaken for a sweep that found nothing.
+//
+//  6. mtime+size (reported, with the row-count delta as evidence). Once 1-5 hold, the run provably
+//     performed no write, so a residual mtime+size change IS the concurrent writers — and rather
+//     than assert prose about that, the test prints WHICH tables gained or lost rows, so a reader
+//     can see the pair_loop traffic that explains it. If any of 1-5 DID fire, this section says so
+//     and refuses to attribute anything, so the report can never contradict the checks above it.
+//
+// WHAT THIS DOES NOT COVER, stated plainly: a write made to the live db WITHOUT sqlite — a raw
+// os.WriteFile over the path — would evade assertions 1 and 2, and assertions 3-5 would catch it
+// only if it changed the file's neighbours, its schema, or planted the marker. Nothing in this test
+// opens that path, but the guarantee is "no sqlite write, proven", not "no byte was written, proven".
+//
+// Every branch above is mutation-tested rather than argued: writing to the live db through a plain
+// handle, stripping either barrier from its DSN builder, disarming the guard and landing DDL,
+// leaking a marker row, and dropping a stray file beside the db each turn this test red; a sidecar
+// appearing does not.
+//
+// Applying that bar to this file's own read path found one gap and closed it. PART 1 used to open the
+// live db READ/WRITE (db.go's Open, mirroring PDO). That was not observed to corrupt anything — a
+// SELECT-only workload through a read/write handle leaves the file's mtime and size alone (measured)
+// — but it is a handle that CAN write the live db, held open across 38 routes, and the only thing
+// stopping it is that the SQL it happens to run is all SELECTs. That makes the guarantee behavioural
+// when it can be structural, and it forces the ledger in assertion 1 to carve out an exception
+// exactly where the risk is. PART 1 therefore holds a query_only(1) handle now (see queryOnlyDSN),
+// which cannot write at all, so the ledger's rule is total: EVERY open of the live db, in either
+// half, carries a barrier.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+// The two — and only two — ways this test may open the live state db. Both were MEASURED this
+// session against a real copy of the live db (see the mode table in the file header) and both are
+// re-measured on every run by assertLiveBarriersHold.
+//
+// immutableDSN is the stronger barrier: sqlite opens the file read-only and ignores locking, so it
+// creates no -wal/-shm at all. Its cost is that it reads ONLY the main file — data a writer has
+// committed to the -wal is INVISIBLE through it (measured: a table created in the WAL reads back as
+// "no such table: a"). That is fine for taking a snapshot — a snapshot only has to be SOME consistent
+// state of the db, and both engines then fork from that one seed — but it is fatal for PART 1, which
+// must see what the live rest.php sees. Hence two barriers, not one.
+func immutableDSN(path string) string { return "file:" + path + "?immutable=1" }
+
+// queryOnlyDSN is PART 1's barrier: a normal WAL-current handle with sqlite's query_only pragma set,
+// which makes every write statement fail with "attempt to write a readonly database".
+//
+// It is the WEAKER of the two and this file does not pretend otherwise: query_only is connection
+// STATE, not an open mode, so SQL executed on the connection could clear it with `PRAGMA
+// query_only=0` (measured: it can). It is nonetheless sound here, because the only SQL that ever
+// runs on this handle is the GET routes' own admin-authored `sql` from api_routes, none of which is
+// a PRAGMA — and runGetSweep re-reads `PRAGMA query_only` when it is done and fails if the barrier
+// was lowered underneath it, so the claim is checked rather than assumed.
+func queryOnlyDSN(path string) string { return "file:" + path + "?_pragma=query_only(1)" }
+
+// liveBarrierOf names the barrier a DSN carries, or "" if it carries none.
+func liveBarrierOf(dsn string) string {
+	switch {
+	case strings.Contains(dsn, "immutable=1"):
+		return "immutable=1"
+	case strings.Contains(dsn, "query_only(1)"):
+		return "query_only(1)"
+	}
+	return ""
+}
+
+// dsnPath extracts the file path from a sqlite DSN ("file:/x/y?a=b" and "/x/y" both -> "/x/y").
+func dsnPath(dsn string) string {
+	p := strings.TrimPrefix(dsn, "file:")
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	return p
+}
+
+// liveGuard is the open ledger. It is armed once per run, before anything opens a database, and
+// watches the ONE file this run must not write.
+var liveGuard struct {
+	mu         sync.Mutex
+	once       sync.Once
+	armed      bool
+	fi         os.FileInfo // the live db, for os.SameFile (robust to symlinks and relative paths)
+	path       string
+	opens      []string
+	violations []string
+}
+
+// installLiveGuard registers the driver-level connection hook. modernc.org/sqlite calls the hook
+// after EVERY connection is set up, handing it the DSN, and closes the connection if the hook
+// returns an error (both measured) — so this catches an open of the live db no matter which
+// function performed it, and refuses it rather than merely noting it.
+//
+// It is deliberately registered on the package-level driver (the one `sql.Open("sqlite", ...)`
+// uses), and only once: modernc APPENDS hooks, so registering per-subtest would stack duplicates.
+func installLiveGuard(live string) {
+	liveGuard.once.Do(func() {
+		fi, err := os.Stat(live)
+		if err != nil {
+			return // nothing to protect; the sweeps will skip on their own guards
+		}
+		liveGuard.armed = true
+		liveGuard.fi = fi
+		liveGuard.path = live
+
+		sqlitedriver.RegisterConnectionHook(func(_ sqlitedriver.ExecQuerierContext, dsn string) error {
+			p := dsnPath(dsn)
+			if p == "" {
+				return nil
+			}
+			fi, err := os.Stat(p)
+			if err != nil || !os.SameFile(fi, liveGuard.fi) {
+				return nil // a scratch fork under the temp dir: opening it read/write is the point
+			}
+			barrier := liveBarrierOf(dsn)
+
+			liveGuard.mu.Lock()
+			defer liveGuard.mu.Unlock()
+			if barrier == "" {
+				v := fmt.Sprintf("the live state db %s was opened with NO write barrier (dsn %q). "+
+					"This run must open it only via immutableDSN() or queryOnlyDSN(); a barrier-less "+
+					"handle can write it, which is exactly what this test must never do", p, dsn)
+				liveGuard.violations = append(liveGuard.violations, v)
+				return errors.New(v)
+			}
+			liveGuard.opens = append(liveGuard.opens, fmt.Sprintf("%s [%s]", dsn, barrier))
+			return nil
+		})
+	})
+}
+
+// assertLiveBarriersHold re-proves, from scratch on every run, that the two DSN builders above
+// actually stop writes with THIS driver. Without this, the open ledger would be an argument about
+// what immutable=1 and query_only are supposed to mean; with it, it is a measurement.
+//
+// The probe db is built in WAL journal mode, like the live one, so the barriers are proven on the
+// same kind of file they will be applied to.
+func assertLiveBarriersHold(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "barrier-probe.sqlite")
+
+	b, err := sql.Open("sqlite", probe)
+	if err != nil {
+		t.Fatalf("cannot build the barrier probe db: %v", err)
+	}
+	for _, stmt := range []string{"PRAGMA journal_mode=wal", "CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"} {
+		if _, err := b.Exec(stmt); err != nil {
+			b.Close()
+			t.Fatalf("cannot build the barrier probe db (%s): %v", stmt, err)
+		}
+	}
+	b.Close()
+
+	writes := []string{
+		"CREATE TABLE t451_intruder(x)", // DDL — the class assertion 3 catches after the fact
+		"INSERT INTO a VALUES (2)",
+		"UPDATE a SET x=3",
+		"DELETE FROM a",
+		"VACUUM",
+	}
+	for _, mk := range []struct {
+		name string
+		dsn  string
+	}{
+		{"immutable=1", immutableDSN(probe)},
+		{"query_only(1)", queryOnlyDSN(probe)},
+	} {
+		d, err := sql.Open("sqlite", mk.dsn)
+		if err != nil {
+			t.Fatalf("BARRIER PROOF FAILED: cannot open the probe db with %s: %v", mk.name, err)
+		}
+		var n int
+		if err := d.QueryRow("SELECT count(*) FROM a").Scan(&n); err != nil {
+			d.Close()
+			t.Fatalf("BARRIER PROOF FAILED: %s cannot even READ the probe db (%v). A barrier that "+
+				"blocks reads is not the barrier this test claims to use.", mk.name, err)
+		}
+		for _, w := range writes {
+			if _, err := d.Exec(w); err == nil {
+				d.Close()
+				t.Fatalf("BARRIER PROOF FAILED: %q SUCCEEDED through a %s handle. This test's whole "+
+					"read-only guarantee rests on that failing, so the guarantee is void and every "+
+					"'the live db was not written' claim below is unproven. Do not trust this run.",
+					w, mk.name)
+			}
+		}
+		// The sidecar property, measured while the handle is still OPEN — this is what lets
+		// assertLiveDBUntouched attribute a -wal/-shm to another process instead of failing on it.
+		openSidecars := sidecarsIn(dir, filepath.Base(probe))
+		d.Close()
+		if mk.name == "immutable=1" && len(openSidecars) > 0 {
+			t.Fatalf("BARRIER PROOF FAILED: an immutable=1 handle created %v beside the db it read. "+
+				"immutable=1 creating no sidecar is exactly why the snapshot path uses it (Playbook "+
+				"#153), and why a sidecar beside the live db can be attributed to another process.",
+				openSidecars)
+		}
+		if left := sidecarsIn(dir, filepath.Base(probe)); mk.name == "query_only(1)" && len(left) > 0 {
+			t.Fatalf("BARRIER PROOF FAILED: a query_only(1) handle LEFT %v behind after closing. The "+
+				"GET half holds such a handle on the live db, so it would be littering the live state "+
+				"directory — the mode=ro trap the Playbook's #153 names.", left)
+		}
+	}
+	t.Logf("BARRIER PROOF: immutable=1 and query_only(1) each REFUSE %v on a WAL db, immutable=1 "+
+		"creates no -wal/-shm at all, and query_only(1) leaves none behind on close (all measured this "+
+		"run, through the same DSN builders the live db is opened with). These are the only two ways "+
+		"this run may open the live state db; the connection hook refuses every other.", writes)
+}
+
+// sidecarsIn lists sqlite's auxiliary files for db that currently exist in dir.
+func sidecarsIn(dir, db string) []string {
+	var out []string
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, e := range ents {
+		if isSQLiteSidecar(e.Name(), db) {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// liveContent is the live db's content, as read from a snapshot: what assertions 3 and 4 compare.
+type liveContent struct {
+	schema map[string]string // "type|name" -> sqlite_master.sql
+	counts map[string]int64  // table -> row count (evidence for the mtime+size report)
+	marker int               // rows carrying liveProbeMarker (must be 0 in the live db, always)
+	ok     bool
+}
+
+// snapshotLiveContent reads the live db's content WITHOUT touching it: it VACUUM INTOs an
+// immutable=1 snapshot into a private temp dir, reads that, and deletes it. The temp dir is this
+// function's own (not t.TempDir) so it does not depend on cleanup ordering — the end-of-run capture
+// runs from a t.Cleanup that would otherwise race the harness's temp dir removal.
+func snapshotLiveContent(live string) (liveContent, error) {
+	var lc liveContent
+	dir, err := os.MkdirTemp("", "t451-liveguard")
+	if err != nil {
+		return lc, err
+	}
+	defer os.RemoveAll(dir)
+	snap := filepath.Join(dir, "live.sqlite")
+	if err := snapshotLiveDB(live, snap); err != nil {
+		return lc, err
+	}
+
+	d, err := sql.Open("sqlite", immutableDSN(snap))
+	if err != nil {
+		return lc, err
+	}
+	defer d.Close()
+
+	lc.schema = map[string]string{}
+	rows, err := d.Query("SELECT type, name, ifnull(sql,'') FROM sqlite_master ORDER BY type, name")
+	if err != nil {
+		return lc, err
+	}
+	for rows.Next() {
+		var typ, name, s string
+		if err := rows.Scan(&typ, &name, &s); err != nil {
+			rows.Close()
+			return lc, err
+		}
+		lc.schema[typ+"|"+name] = s
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return lc, err
+	}
+
+	shape, err := dbShape(d)
+	if err != nil {
+		return lc, err
+	}
+	lc.counts = map[string]int64{}
+	for _, ts := range shape {
+		var n int64
+		if err := d.QueryRow(`SELECT count(*) FROM "` + strings.ReplaceAll(ts.name, `"`, `""`) + `"`).Scan(&n); err != nil {
+			return lc, err
+		}
+		lc.counts[ts.name] = n
+	}
+	if lc.marker, err = markerRows(d, shape); err != nil {
+		return lc, err
+	}
+	lc.ok = true
+	return lc, nil
+}
+
+// markerRows counts the rows anywhere in d whose cells contain liveProbeMarker. Every column is
+// cast to TEXT so a marker cannot hide in a non-TEXT cell; instr() avoids LIKE's escaping traps.
+func markerRows(d *sql.DB, shape []tableShape) (int, error) {
+	total := 0
+	for _, ts := range shape {
+		conds := make([]string, 0, len(ts.cols))
+		args := make([]any, 0, len(ts.cols))
+		for _, c := range ts.cols {
+			q := `"` + strings.ReplaceAll(c, `"`, `""`) + `"`
+			conds = append(conds, "instr(CAST("+q+" AS TEXT), ?) > 0")
+			args = append(args, liveProbeMarker)
+		}
+		var n int
+		q := `SELECT count(*) FROM "` + strings.ReplaceAll(ts.name, `"`, `""`) + `" WHERE ` + strings.Join(conds, " OR ")
+		if err := d.QueryRow(q, args...).Scan(&n); err != nil {
+			return 0, fmt.Errorf("marker sweep of %s: %w", ts.name, err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// assertMarkerSweepBites is the anti-vacuity proof for assertion 4. A sweep for a string that is not
+// in the seed either would report "0 hits in the live db" forever — green, and meaningless. So the
+// seed is required to CONTAIN the marker: only then does 0 hits in the live db carry information.
+func assertMarkerSweepBites(t *testing.T, seedPath string) {
+	t.Helper()
+	d, err := sql.Open("sqlite", immutableDSN(seedPath))
+	if err != nil {
+		t.Errorf("cannot open the seed to prove the marker sweep bites: %v", err)
+		return
+	}
+	defer d.Close()
+	shape, err := dbShape(d)
+	if err != nil {
+		t.Errorf("cannot read the seed's shape to prove the marker sweep bites: %v", err)
+		return
+	}
+	n, err := markerRows(d, shape)
+	if err != nil {
+		t.Errorf("cannot sweep the seed for the marker: %v", err)
+		return
+	}
+	if n == 0 {
+		t.Errorf("THE MARKER SWEEP IS VACUOUS: the seed contains ZERO rows carrying %q, so sweeping "+
+			"the live db for it would report 'clean' no matter what leaked. Seed rows must carry the "+
+			"marker for the live-db sweep to mean anything.", liveProbeMarker)
+		return
+	}
+	t.Logf("MARKER SWEEP ARMED: the seed carries %q in %d rows, so 'the live db carries it in 0 "+
+		"rows' is a measurement rather than a tautology.", liveProbeMarker, n)
+}
+
+// assertLiveDBUntouched is the verdict: did THIS RUN write the live state db?
+//
+// It runs checks 1 and 3-6 of the LIVE-DB GUARD block above (check 2, the barrier proof, has to run
+// before the sweep, so runWriteSweep calls it there); see that block for why each is what it is.
+// Every check here except the last FAILS the test; the last is an observation that 1-5 have already
+// explained, and it refuses to explain anything if any of them fired.
+func assertLiveDBUntouched(t *testing.T, path string, before liveDirState, start liveContent) {
+	t.Helper()
+
+	// implicated collects the reasons THIS RUN is on the hook for a change. It exists so the
+	// mtime+size report at the bottom can never contradict the checks above it: a run that has just
+	// been caught creating a table must not then be told the change "was not us". (t.Failed() cannot
+	// serve here — an unrelated route mismatch would set it and mis-blame the guard.)
+	var implicated []string
+	fail := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		implicated = append(implicated, msg)
+		t.Errorf("%s", msg)
+	}
+
+	// ── 1. the open ledger ───────────────────────────────────────────────────────────────────────
+	liveGuard.mu.Lock()
+	violations := append([]string(nil), liveGuard.violations...)
+	opens := append([]string(nil), liveGuard.opens...)
+	armed := liveGuard.armed
+	liveGuard.mu.Unlock()
+
+	for _, v := range violations {
+		fail("SIDE EFFECT (the live-db guard refused an open): %s", v)
+	}
+	if !armed {
+		fail("THE LIVE-DB GUARD NEVER ARMED, so nothing watched the opens this run made and "+
+			"'the live state db was not written' is unproven. It is armed by installLiveGuard(%s).", path)
+	}
+
 	after, err := captureLiveDirState(path)
 	if err != nil {
 		t.Errorf("cannot re-stat the live db %s: %v", path, err)
 		return
 	}
+
+	// ── 3. the directory listing and the file's identity ─────────────────────────────────────────
+	//
+	// A file appearing or vanishing beside the live db fails — with ONE attributed exception, the
+	// sqlite sidecars (-wal/-shm/-journal). They are NOT ours and cannot be: the live rest.php server
+	// creates them on every request it serves (the GET half alone sends it 76), the pair_loop agents
+	// do the same, and they are removed again when the last connection closes. MEASURED across three
+	// runs of this test: they were present beside the live db before the runs and gone after, purely
+	// from other processes' traffic. Failing on them would be the same coin flip as failing on mtime.
+	//
+	// Nothing is lost by excusing them, because this run cannot create one without the ledger firing
+	// first: the only sidecar-creating way to open the live db is a barrier-less or mode=ro handle,
+	// and assertion 1 REFUSES both at the driver before a single page is read. That is a strictly
+	// earlier catch than noticing the file afterwards — it is the Playbook #153 class, prevented
+	// rather than detected. assertLiveBarriersHold re-proves the no-sidecar property every run.
+	var sidecars []string
 	for name := range after.dir {
 		if _, had := before.dir[name]; !had {
-			t.Errorf("SIDE EFFECT: %s appeared beside the live state db during this run. The write "+
-				"sweep must create NO file next to %s (it snapshots via immutable=1, which creates "+
-				"no -wal/-shm). Before: %v  After: %v",
-				name, path, sortedKeys(before.dir), sortedKeys(after.dir))
+			if isSQLiteSidecar(name, filepath.Base(path)) {
+				sidecars = append(sidecars, "+"+name)
+				continue
+			}
+			fail("SIDE EFFECT: %s appeared beside the live state db during this run, and it is not a "+
+				"sqlite sidecar of %s. Before: %v  After: %v",
+				name, filepath.Base(path), sortedKeys(before.dir), sortedKeys(after.dir))
 		}
 	}
 	for name := range before.dir {
 		if _, still := after.dir[name]; !still {
-			t.Errorf("SIDE EFFECT: %s disappeared from beside the live state db during this run", name)
+			if isSQLiteSidecar(name, filepath.Base(path)) {
+				sidecars = append(sidecars, "-"+name)
+				continue
+			}
+			fail("SIDE EFFECT: %s disappeared from beside the live state db during this run, and it is "+
+				"not a sqlite sidecar of %s", name, filepath.Base(path))
 		}
 	}
-	if after.size != before.size || !after.modTime.Equal(before.modTime) {
-		// Concurrent pair_loop agents write to this db, so a change is not proof this test did it.
-		// It IS proof the mtime+size assertion can say nothing, so say that rather than pass quietly.
-		t.Logf("NOTE: the live state db changed under us during the run (size %d -> %d, mtime %s -> %s). "+
-			"That is the concurrent pair_loop agents, not this test: this test opens it exactly once, "+
-			"with immutable=1, to VACUUM INTO a snapshot in a temp dir, and never for writing. The "+
-			"directory-listing check above is the assertion that still holds.",
-			before.size, after.size, before.modTime.Format(time.RFC3339Nano), after.modTime.Format(time.RFC3339Nano))
+	if len(sidecars) > 0 {
+		sort.Strings(sidecars)
+		t.Logf("NOTE: the live db's sqlite sidecars came or went during the run (%s). That is the live "+
+			"rest.php server and the pair_loop agents opening and closing it; this run cannot create "+
+			"one, because the only opens that would are the ones the guard refuses outright.",
+			strings.Join(sidecars, " "))
 	}
+	if !os.SameFile(before.stat, after.stat) {
+		fail("SIDE EFFECT: the live state db %s is a DIFFERENT FILE than it was at the start of "+
+			"the run (inode changed) — it was replaced, not just written", path)
+	}
+
+	// ── 4 and 5. what actually changed inside it ─────────────────────────────────────────────────
+	end, err := snapshotLiveContent(path)
+	if err != nil {
+		// A torn immutable read is possible (it does not lock) and is not evidence of a write.
+		t.Logf("NOTE: could not read the live db's end-of-run content (%v), so the schema-delta and "+
+			"marker checks did not run this time. The open ledger above still holds: %d open(s), all "+
+			"barriered, 0 violations.", err, len(opens))
+		return
+	}
+	if !start.ok {
+		t.Logf("NOTE: the live db's start-of-run content was never captured, so the schema-delta and " +
+			"marker checks could not run. The open ledger above still holds.")
+		return
+	}
+
+	if end.marker > 0 {
+		fail("SIDE EFFECT: the live state db contains %d row(s) carrying this test's probe marker "+
+			"%q. Probe rows are seeded ONLY into throwaway forks under the temp dir, so their presence "+
+			"in the live db means an engine or the seeder was pointed at %s. This is the exact failure "+
+			"the whole scratch-db discipline exists to prevent.", end.marker, liveProbeMarker, path)
+	}
+	for k, sql := range start.schema {
+		switch got, ok := end.schema[k]; {
+		case !ok:
+			fail("SIDE EFFECT: %s was DROPPED from the live state db during this run. No route in "+
+				"api_routes performs DDL, so a concurrent pair_loop writer cannot have done this.", k)
+		case got != sql:
+			fail("SIDE EFFECT: %s was ALTERED in the live state db during this run.\n  before: %s\n  after: %s\n"+
+				"No route in api_routes performs DDL, so a concurrent pair_loop writer cannot have done this.", k, sql, got)
+		}
+	}
+	for k := range end.schema {
+		if _, ok := start.schema[k]; !ok {
+			fail("SIDE EFFECT: %s was CREATED in the live state db during this run. No route in "+
+				"api_routes performs DDL, so a concurrent pair_loop writer cannot have done this — "+
+				"this run created it.", k)
+		}
+	}
+
+	// ── 6. mtime+size: reported, and attributed ONLY if 1-5 earned the right to attribute ────────
+	changed := after.size != before.size || !after.modTime.Equal(before.modTime)
+
+	if len(implicated) > 0 {
+		// Something above caught this run red-handed. Whether or not mtime moved, the one thing this
+		// report must NOT do is reassure anybody.
+		t.Errorf("THE LIVE STATE DB IS NOT PROVEN UNTOUCHED BY THIS RUN: %d check(s) above implicate "+
+			"it (%s). mtime/size changed=%v (size %d -> %d). Do NOT attribute this change to the "+
+			"concurrent pair_loop agents — this run cannot be ruled out as its cause.",
+			len(implicated), strings.Join(implicated, " | "), changed, before.size, after.size)
+		return
+	}
+
+	if !changed {
+		t.Logf("LIVE DB UNTOUCHED: %s is byte-identical across the run (size %d, mtime unchanged), its "+
+			"directory listing is unchanged, its schema is unchanged, it carries 0 probe-marker rows, "+
+			"and the guard recorded %d open(s) of it — every one barriered, 0 violations: %v",
+			path, after.size, len(opens), opens)
+		return
+	}
+
+	var moved []string
+	for tbl, n := range end.counts {
+		if was, ok := start.counts[tbl]; ok && was != n {
+			moved = append(moved, fmt.Sprintf("%s %+d", tbl, n-was))
+		}
+	}
+	sort.Strings(moved)
+	what := strings.Join(moved, ", ")
+	if what == "" {
+		what = "no table's row count changed (a concurrent reader's WAL checkpoint rewrites bytes " +
+			"without changing content)"
+	}
+	t.Logf("LIVE DB CHANGED DURING THE RUN, AND THIS RUN IS NOT ITS CAUSE (size %d -> %d, mtime %s -> "+
+		"%s). What moved: %s — that is the pair_loop agents, who write this db concurrently and cannot "+
+		"be stopped, which is why mtime+size alone can never be the verdict here. That THIS run did "+
+		"not contribute is proven rather than assumed: the guard recorded %d open(s) of the live db "+
+		"and refused any without a barrier, both barriers were re-measured this run to reject writes "+
+		"(%v), the schema is unchanged (no route does DDL), and the db carries 0 rows bearing %q. The "+
+		"one thing this cannot see is a write made WITHOUT sqlite (a raw os.Write to the file); "+
+		"nothing in this test opens that path.",
+		before.size, after.size, before.modTime.Format(time.RFC3339Nano),
+		after.modTime.Format(time.RFC3339Nano), what, len(opens), opens, liveProbeMarker)
+}
+
+// isSQLiteSidecar reports whether name is one of sqlite's own auxiliary files for db (the WAL, its
+// shared-memory index, or a rollback journal) — the files any process opening the db may create and
+// remove, and the only names assertLiveDBUntouched attributes rather than fails on.
+func isSQLiteSidecar(name, db string) bool {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if name == db+suffix {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]int64) []string {
@@ -758,14 +1351,15 @@ func sortedKeys(m map[string]int64) []string {
 
 // snapshotLiveDB takes ONE consistent snapshot of the live state db into dst, using `VACUUM INTO`
 // from an immutable=1 handle. immutable=1 is required, not preferred: the live db is in WAL journal
-// mode (measured), and a `mode=ro` open of a WAL db CREATES -wal/-shm sidecars beside it. immutable=1
-// promises sqlite the file will not change, so it reads the committed main-file data with no locking
-// and creates ZERO files. VACUUM INTO only ever writes to dst.
+// mode (measured — its file header's read/write-version bytes are 2), and a `mode=ro` open of a WAL
+// db CREATES -wal/-shm sidecars beside it AND LEAVES THEM THERE (measured). immutable=1 promises
+// sqlite the file will not change, so it reads the committed main-file data with no locking and
+// creates ZERO files. VACUUM INTO only ever writes to dst.
 //
 // The cost of immutable=1 is that it ignores locking, so a snapshot taken while a writer is
 // mid-checkpoint could be torn — hence the quick_check before the snapshot is trusted.
 func snapshotLiveDB(live, dst string) error {
-	d, err := sql.Open("sqlite", "file:"+live+"?immutable=1")
+	d, err := sql.Open("sqlite", immutableDSN(live))
 	if err != nil {
 		return err
 	}
@@ -775,7 +1369,7 @@ func snapshotLiveDB(live, dst string) error {
 		return fmt.Errorf("VACUUM INTO %s: %w", dst, err)
 	}
 
-	s, err := sql.Open("sqlite", "file:"+dst+"?immutable=1")
+	s, err := sql.Open("sqlite", immutableDSN(dst))
 	if err != nil {
 		return err
 	}
@@ -841,9 +1435,11 @@ func seedScratchDB(path string) (seedIDs, error) {
 
 	const seedTS = 1700000000 // fixed, so the seed carries no wall-clock
 
+	// Every seeded row carries liveProbeMarker so the live-db marker sweep can bite (see
+	// assertion 4 of the LIVE-DB GUARD, and assertMarkerSweepBites).
 	if _, err := d.Exec(
 		`INSERT OR REPLACE INTO agents (agent_id, parent, prompt, tools, status, ts)
-		 VALUES (?, NULL, '#451 route-equivalence probe (scratch db only)', '[]', 'active', ?)`,
+		 VALUES (?, NULL, 't451-equiv probe: #451 route equivalence (scratch db only)', '[]', 'active', ?)`,
 		seededAgentID, seedTS); err != nil {
 		return ids, fmt.Errorf("seed agent: %w", err)
 	}
@@ -851,17 +1447,17 @@ func seedScratchDB(path string) (seedIDs, error) {
 	newTicket := func(title string) (int64, error) {
 		res, err := d.Exec(
 			`INSERT INTO tickets (ts, updated, component, title, severity, status, body, meta, kind)
-			 VALUES (?, ?, 'congruency-go', ?, 'info', 'REQUESTED', '#451 route-equivalence probe', NULL, NULL)`,
+			 VALUES (?, ?, 'congruency-go', ?, 'info', 'REQUESTED', 't451-equiv probe: #451 route equivalence', NULL, NULL)`,
 			seedTS, seedTS, title)
 		if err != nil {
 			return 0, err
 		}
 		return res.LastInsertId()
 	}
-	if ids.ticketA, err = newTicket("#451 equivalence probe ticket A (scratch db only)"); err != nil {
+	if ids.ticketA, err = newTicket("t451-equiv probe ticket A (scratch db only)"); err != nil {
 		return ids, fmt.Errorf("seed ticket A: %w", err)
 	}
-	if ids.ticketB, err = newTicket("#451 equivalence probe ticket B (scratch db only)"); err != nil {
+	if ids.ticketB, err = newTicket("t451-equiv probe ticket B (scratch db only)"); err != nil {
 		return ids, fmt.Errorf("seed ticket B: %w", err)
 	}
 
@@ -1516,12 +2112,29 @@ func runWriteSweep(t *testing.T) {
 	if err != nil {
 		t.Skipf("NAMED SKIP (whole write sweep): cannot stat the live state db %s: %v", live, err)
 	}
-	t.Cleanup(func() { assertLiveDBUntouched(t, live, before) })
+	// Prove the barriers before relying on them, then capture what the live db held at the start.
+	// Both must happen before the harness opens anything.
+	assertLiveBarriersHold(t)
+	start, err := snapshotLiveContent(live)
+	if err != nil {
+		t.Logf("NOTE: could not capture the live db's start-of-run content (%v); the schema-delta and "+
+			"marker checks will report that they could not run. The open ledger is unaffected.", err)
+	}
+	t.Cleanup(func() { assertLiveDBUntouched(t, live, before, start) })
 
 	h, why := newWriteHarness(t, live, php, boot)
 	if why != "" {
+		// A torn immutable read is a legitimate, named skip. A READONLY error is not: the snapshot
+		// path only ever runs VACUUM INTO, so the only way it can be told it may not write is that
+		// something tried to WRITE the live db through it. That is the thing this test exists to
+		// forbid, and it fails rather than skipping quietly.
+		if strings.Contains(strings.ToLower(why), "readonly") {
+			t.Fatalf("SIDE EFFECT: a WRITE was attempted against the live state db %s and the barrier "+
+				"refused it (%s). The snapshot path is a pure VACUUM INTO; nothing on it may write.", live, why)
+		}
 		t.Skip("NAMED SKIP (whole write sweep): " + why)
 	}
+	assertMarkerSweepBites(t, h.seedPath)
 
 	t.Logf("live state db (snapshotted, never written): %s", live)
 	t.Logf("php engine: %s driving %s/rest.php (ephemeral server at %s)", php, boot, h.php.base)
@@ -2016,6 +2629,12 @@ func assertSpineProven(t *testing.T, proven, attempted []string) {
 // against throwaway scratch dbs. The two halves are guarded independently, so the write proofs still
 // run when the live server is down (and vice versa).
 func TestRouteEquivalence(t *testing.T) {
+	// Arm the live-db guard BEFORE either half opens a database: from here on, every sqlite
+	// connection this process makes to the live state db must carry a proven write barrier or the
+	// driver refuses it. See the LIVE-DB GUARD block above assertLiveDBUntouched.
+	if live, why := resolveLiveDB(); why == "" {
+		installLiveGuard(live)
+	}
 	t.Run("read_GET_routes", runGetSweep)
 	t.Run("write_POST_routes", runWriteSweep)
 }
