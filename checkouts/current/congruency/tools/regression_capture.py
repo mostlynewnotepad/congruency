@@ -104,14 +104,29 @@ ANTI-GAMING:
 
 TOGGLE — DEFAULT OFF, and OFF is a byte-for-byte no-op:
 
-    --regression-capture off   (THE DEFAULT) capture is off. Nothing is read, executed or written;
-                               capture() returns immediately with {"enabled": False}. --selftest
-                               proves this with a before/after tree snapshot.
-    --regression-capture on    forced on, whatever registry.json says.
+    --regression-capture off   (THE DEFAULT) capture is off. Nothing is read, executed or written —
+                               not even registry.json; capture() returns immediately with
+                               {"enabled": False}. --selftest proves this with a before/after tree
+                               snapshot.
+    --regression-capture on    forced on, whatever registry.json says (and without reading it).
     --regression-capture auto  registry.json's {"regression_capture": {"enabled": true|false}}
                                decides; absent or false means off. This is the key's live setting:
                                `auto` is what lets an A/B flip capture with no code edit and no flag
                                change. An explicit `on`/`off` outranks the registry.
+
+  THE REGISTRY SHAPE IS EXACT, AND A NEAR-MISS IS REFUSED RATHER THAN GUESSED. `auto` is the A/B
+  path, so it is the path an operator HAND-EDITS, so it is where every plausible near-miss lands:
+  `{"regression_capture": true}` is the natural shorthand to write and used to raise AttributeError
+  straight out of pair_loop's round loop, and `{"enabled": "false"}` used to turn capture ON, because
+  bool("false") is True. Neither is honored now: the section must be an object and `enabled` a real
+  JSON boolean, or registry_flag() raises Unexpected naming what to write — exactly as a bad
+  --regression-capture MODE always has. Absent or null, at either level, means "not configured",
+  which is off. Nothing is coerced. `--toggle-status` resolves the live registry and prints it.
+
+  AND A MALFORMED TOGGLE CANNOT KILL A ROUND. The hook sites resolve through capture_state(), which
+  never raises and FAILS CLOSED to off — today's behavior — with capture() journaling the reason. An
+  additive floor has no authority over the round (requirement 5), and that must include its own
+  misconfiguration: this feature may decline to run, never end the run.
 
 USAGE — this module is a LIBRARY with a self-proving CLI. It is called by pair_loop through a thin
 hook: two one-line calls (guard() before the commit, capture() after a fail verdict) plus an import,
@@ -124,6 +139,7 @@ both toggle states:
     python3 regression_capture.py --selftest        # prove the method; no network, no db, no repo writes
     python3 regression_capture.py --verify-scope    # re-prove the scoping claims above against pair_loop
     python3 regression_capture.py --print-hook      # the exact pair_loop.py patch, and why each line
+    python3 regression_capture.py --toggle-status   # how the live registry.json resolves the A/B toggle
 
 --selftest builds a THROWAWAY synthetic unit (a tiny original with a known bug and a repro) plus a
 THROWAWAY git repo, and proves: red-on-buggy, green-on-original, mutation-resistance, bogus-capture
@@ -161,8 +177,9 @@ and every one of them was invisible to a selftest that looked complete:
     next guard() journaling the harness's own write as worker tampering.
 
 Exit codes:
-    0  every check passed (--selftest) / the scope report printed (--verify-scope, --print-hook)
-    1  at least one check FAILED
+    0  every check passed (--selftest) / the report printed (--verify-scope, --print-hook,
+       --toggle-status)
+    1  at least one check FAILED (--selftest), or the toggle is malformed (--toggle-status)
     2  unexpected — a Variant-A bug report was filed to the registry's bug_reports sink
 """
 import argparse
@@ -331,12 +348,62 @@ def module_dir_parts(deliverable, package=None):
     return dp[len(root): -1]
 
 
+def registry_flag(registry=None):
+    """registry.json's `regression_capture.enabled`, as a real bool. Raises Unexpected if the
+    operator wrote something this schema does not define. Only `auto` consults it.
+
+    THE SHAPE IS EXACT, and it is one rule: the section is OPTIONAL — absent, or an explicit null,
+    both mean "not configured", which is off, which is DEFAULT_MODE. Anything else must be an object
+    whose `enabled` is a real JSON boolean. Nothing here is coerced or guessed.
+
+    IT IS VALIDATED BECAUSE THIS IS THE HAND-EDITED PATH. Requirement 6 wants the A/B flip to be
+    "instant and require no code edits", which means a human editing registry.json — so every
+    plausible near-miss lands here, and the two failure modes of NOT checking were both real:
+
+        {"regression_capture": true}               `.get("enabled")` on a bool -> AttributeError, a
+                                                   traceback out of pair_loop's round loop, where an
+                                                   unexpected exception is not a round outcome: it is
+                                                   a Variant-A bug report and exit 2.
+        {"regression_capture": {"enabled":"false"}} bool("false") is True -> capture silently turns ON
+                                                   for the operator who wrote "false". A toggle that
+                                                   guesses is worse than one that refuses.
+
+    A bad --regression-capture MODE has always been refused with a clean Unexpected naming the legal
+    values (see capture_enabled()). The registry value gets exactly the same treatment; there was no
+    principle behind the asymmetry, only an unchecked `.get()`.
+    """
+    reg = REGISTRY if registry is None else registry
+    sec = (reg or {}).get(REGISTRY_KEY)
+    if sec is None:                       # absent, or an explicit null: not configured
+        return False
+    if not isinstance(sec, dict):
+        raise Unexpected(
+            'registry.json %s must be an object like {"enabled": true}, not %s (%r). The toggle is '
+            "not guessed from a near-miss; write the object, or pass --regression-capture on|off, "
+            "which outranks the registry entirely." % (REGISTRY_KEY, type(sec).__name__, sec))
+    val = sec.get("enabled")
+    if val is None:                       # absent, or an explicit null: not configured
+        return False
+    if not isinstance(val, bool):         # bool is an int subclass, so 0/1 land here, as they should
+        raise Unexpected(
+            "registry.json %s.enabled must be the JSON boolean true or false, not %s (%r). It is "
+            'not coerced: bool("false") is True, so a coercing toggle would capture for an operator '
+            "who wrote false." % (REGISTRY_KEY, type(val).__name__, val))
+    return val
+
+
 def capture_enabled(mode=DEFAULT_MODE, registry=None):
     """Is capture on? The toggle, in three explicit states (see TOGGLE in the module docstring).
 
     "off" (the default) is off whatever registry.json says, and "on" is on whatever it says: an
-    explicit flag outranks the file. "auto" is the state in which the registry key is live, so an A/B
-    can flip capture by editing registry.json alone — no code edit, no flag change.
+    explicit flag outranks the file, and neither state READS the registry at all — so a malformed
+    registry cannot change what off or on do. "auto" is the state in which the registry key is live,
+    so an A/B can flip capture by editing registry.json alone — no code edit, no flag change.
+
+    RAISES Unexpected on a mode this module does not define, or (under `auto` only) on a malformed
+    registry section — see registry_flag(). That is the right contract for a human at the CLI and for
+    a library caller: the toggle is refused, never guessed. It is NOT the right contract for a
+    pair_loop hook site, which must not raise into the round loop — those call capture_state().
     """
     if mode not in MODES:
         raise Unexpected("regression-capture mode %r is not one of %s" % (mode, "|".join(MODES)))
@@ -344,8 +411,34 @@ def capture_enabled(mode=DEFAULT_MODE, registry=None):
         return True
     if mode == "off":
         return False
-    reg = REGISTRY if registry is None else registry
-    return bool((reg.get(REGISTRY_KEY) or {}).get("enabled", False))
+    return registry_flag(registry)
+
+
+def capture_state(mode=DEFAULT_MODE, registry=None):
+    """The toggle resolved for a HOOK CALL SITE: `(enabled, complaint)`. NEVER raises. FAIL-CLOSED.
+
+    capture_enabled() raises on a toggle it cannot read, which is correct where a human or a caller
+    can act on it. pair_loop's round loop is not such a place: an exception there is not a round
+    outcome, it is a Variant-A bug report and exit 2. A capture feature whose own MISCONFIGURATION
+    kills the round would be precisely what requirement 5 forbids — an ADDITIVE FLOOR has no
+    authority over the round, and that has to include its failure modes. So every hook-facing entry
+    (capture(), guard(), auditor_repro_schema(), and HOOK_PATCH site 4) resolves the toggle here.
+
+    FAIL-CLOSED, and closed is not arbitrary: OFF is the documented default and is byte-for-byte
+    today's behavior, so an unreadable toggle degrades to "the harness this ticket has not changed
+    yet" rather than to a half-configured capture. Failing OPEN would turn a typo into a feature the
+    operator never enabled. `complaint` carries capture_enabled()'s exact message, which names what to
+    write instead, and capture() journals it (see _note()) rather than swallowing it — the refusal is
+    quiet in the round, never silent in the record.
+
+    THE COMPLAINT IS REACHABLE ONLY UNDER `auto`: off and on never read the registry, so they return
+    ("", no complaint) even against a malformed one. An operator who wants to see the resolution
+    without waiting for a round to fail runs `--toggle-status` (toggle_status()).
+    """
+    try:
+        return capture_enabled(mode, registry), ""
+    except Unexpected as e:
+        return False, str(e)
 
 
 # ── 1. the structured repro schema (backward compatible: prose findings still mint nothing) ──────
@@ -454,8 +547,13 @@ def auditor_repro_schema(mode=DEFAULT_MODE, registry=None):
     today (--selftest checks that identity against pair_loop's REAL template). Nothing asks for a
     repro while capture is off, which is also why the opt-in schema can never reach the join in
     site 4 with capture off.
+
+    A HOOK SITE, so it resolves the toggle through capture_state(): a malformed registry.json leaves
+    the adversary's prompt exactly as it is today rather than raising into pair(). capture() journals
+    the complaint in the same round; this site stays quiet because the adversary's prompt is not a
+    place to report the operator's typo.
     """
-    return AUDITOR_REPRO_SCHEMA if capture_enabled(mode, registry) else ""
+    return AUDITOR_REPRO_SCHEMA if capture_state(mode, registry)[0] else ""
 
 
 def _example_verdict(text=None):
@@ -1084,8 +1182,12 @@ def guard(worktree, tid, mode=DEFAULT_MODE, registry=None, ledger=None):
 
     Restoring is not erasing. Only the harness's own artifact is rewritten, from the harness's own
     ledger; the worker's module is never touched.
+
+    A HOOK SITE (patch site 3, whose return value pair_loop discards), so it resolves the toggle
+    through capture_state() and a malformed registry.json makes it the no-op it already is when
+    capture is off, rather than an exception immediately before the round's commit.
     """
-    if not capture_enabled(mode, registry):
+    if not capture_state(mode, registry)[0]:
         return {"enabled": False, "checked": 0, "intact": [], "tampered": [], "restored": []}
     led = ledger or Ledger(ledger_dir(worktree), tid)
     out = _restore(worktree, tid, led)
@@ -1221,11 +1323,20 @@ def capture(worktree, tid, deliverable, package, ticket_body, verdict, rnd=1, mo
     OFF is a byte-for-byte no-op: it returns before reading the body, the ledger or the worktree, and
     creates nothing. Not "creates nothing important" — nothing; --selftest proves it with a
     before/after tree snapshot of both the worktree and the ledger directory.
+
+    It also never raises on a malformed toggle: the toggle resolves through capture_state(), so a
+    hand-edited registry.json under `auto` leaves capture off — today's behavior — and the reason is
+    JOURNALED here, in the one note pair_loop already files for this hook. That is the only site that
+    reports the operator's typo, because it is the only hook site with a journal to report it in.
     """
     out = {"enabled": False, "mode": mode, "minted": [], "rejected": [], "stage": [],
            "guard": {"enabled": False, "checked": 0, "intact": [], "tampered": [], "restored": []},
            "note": ""}
-    if not capture_enabled(mode, registry):
+    on, complaint = capture_state(mode, registry)
+    if not on:
+        if complaint:
+            out["note"] = _note(out, "the toggle is MALFORMED, so capture stayed OFF and this round "
+                                     "is byte-for-byte today's behavior — %s" % complaint)
         return out
     out["enabled"] = True
     if (verdict or {}).get("verdict") != "fail":
@@ -1343,7 +1454,7 @@ its own ticket. `--verify-scope` reports whether it is installed in the live pai
    In pair_loop a TypeError is not a round outcome: it is an unexpected crash, a Variant-A bug report
    and exit 2. Patching only (5) would ship a schema whose third spelling kills the harness:
 
-   + rc_on = regression_capture.capture_enabled(a.regression_capture)
+   + rc_on = regression_capture.capture_state(a.regression_capture)[0]
      rest("ticket.progress", {"ticket_id": tid, "agent_id": auditor,
                               "note": "round %d verdict: %s%s" % (rnd, vres.get("verdict"),
    -                                 ("; findings: " + "; ".join(vres.get("findings", [])))
@@ -1352,6 +1463,11 @@ its own ticket. `--verify-scope` reports whether it is installed in the live pai
    +                                     else vres.get("findings", [])))
                                       if vres.get("findings") else ""),
                               "steps_remaining": 1 if vres.get("verdict") == "pass" else 3})
+
+   capture_state() rather than capture_enabled() at every one of these four sites (3, 4, 5, 6): it
+   returns `(enabled, complaint)` and never raises, so a hand-edited registry.json cannot throw an
+   exception into this loop, where one is not a round outcome but a Variant-A bug report and exit 2.
+   A malformed toggle resolves to OFF — today's behavior — and capture() (site 5) journals why.
 
    The `if rc_on else vres.get("findings", [])` arm is deliberate and load-bearing for the toggle.
    With capture OFF this line evaluates the ORIGINAL expression, character for character — so OFF
@@ -1750,6 +1866,72 @@ def selftest():  # noqa: C901 — one linear proof; splitting it would hide the 
             ck("an unknown mode is refused, not guessed", False, "no raise")
         except Unexpected:
             ck("an unknown mode is refused, not guessed", True)
+
+        # THE REGISTRY VALUE GETS THE SAME TREATMENT AS THE MODE. `auto` is requirement 6's A/B path,
+        # i.e. the path a HUMAN hand-edits, so every near-miss below is something an operator really
+        # writes. Each used to be a defect: the non-object shapes raised AttributeError out of
+        # pair_loop's round loop (`(reg.get(KEY) or {}).get(...)` assumed a dict), and the string
+        # "false" turned capture ON because bool("false") is True.
+        loose = [b for b in (True, False, "on", "off", "true", ["enabled"], 0, 1, 1.5)
+                 if _not_refused(lambda: capture_enabled("auto", {REGISTRY_KEY: b}))]
+        ck("a %s section that is not an object is REFUSED with a clean Unexpected, not guessed at "
+           "and not crashed on (`true` is the natural shorthand to hand-edit in)" % REGISTRY_KEY,
+           loose == [], "not cleanly refused (guessed at, or crashed): %r" % (loose,))
+        coerced = [b for b in ("false", "true", "yes", "no", "", 0, 1, [], {})
+                   if _not_refused(lambda: capture_enabled("auto", {REGISTRY_KEY: {"enabled": b}}))]
+        ck("...and `enabled` must be a REAL JSON bool, never coerced — bool(\"false\") is True, so a "
+           "coercing toggle captures for the operator who wrote false",
+           coerced == [], "not cleanly refused (coerced, or crashed): %r" % (coerced,))
+        ck("...while absent or null, at EITHER level, means not-configured, which is off",
+           capture_enabled("auto", {}) is False
+           and capture_enabled("auto", {REGISTRY_KEY: None}) is False
+           and capture_enabled("auto", {REGISTRY_KEY: {}}) is False
+           and capture_enabled("auto", {REGISTRY_KEY: {"enabled": None}}) is False)
+        why_sec, e1 = _probe(lambda: capture_state("auto", {REGISTRY_KEY: True})[1])
+        why_flag, e2 = _probe(lambda: capture_state("auto", {REGISTRY_KEY: {"enabled": "false"}})[1])
+        ck("...and the refusal names the key and what to write instead (a blind operator can act on "
+           "it), like the mode refusal already does",
+           why_sec and all(s in why_sec for s in (REGISTRY_KEY, '{"enabled": true}',
+                                                  "--regression-capture"))
+           and why_flag and all(s in why_flag for s in (REGISTRY_KEY + ".enabled", "true or false")),
+           "; ".join(e for e in (e1, e2) if e) or "%s / %s" % (why_sec, why_flag))
+
+        # ...but a malformed toggle must not END A ROUND either. An additive floor has no authority
+        # over the round (requirement 5), and that includes its own misconfiguration: in pair_loop an
+        # unexpected exception is not a round outcome, it is a Variant-A bug report and exit 2.
+        # Every call below goes through _probe(): if the fail-closed property regresses these sites
+        # RAISE, and an unguarded call would abort the selftest with a traceback instead of printing
+        # the FAIL that names the regression. See _probe().
+        bad_reg = {REGISTRY_KEY: True}
+        st, st_err = _probe(lambda: capture_state("auto", bad_reg))
+        ck("capture_state() FAILS CLOSED on a malformed toggle and never raises",
+           st is not None and st[0] is False and "must be an object" in st[1], st_err or repr(st))
+        md, md_err = _probe(lambda: capture_state("maybe"))
+        ck("...and on a malformed MODE too (the same site, the same closed default)",
+           md is not None and md[0] is False and "is not one of" in md[1], md_err or repr(md))
+        cap_bad, cb_err = _probe(lambda: capture(tmp, 440, "x/y.py", "x", "",
+                                                 {"verdict": "fail", "findings": ["f"]}, 1, "auto",
+                                                 bad_reg))
+        sch, sch_err = _probe(lambda: auditor_repro_schema("auto", bad_reg))
+        grd, grd_err = _probe(lambda: guard(tmp, 440, "auto", bad_reg))
+        ck("...so ALL FOUR hook sites resolve a malformed registry.json to OFF instead of raising "
+           "into pair_loop's round loop (sites 3, 4, 5, 6)",
+           sch == "" and (grd or {}).get("enabled") is False and (cap_bad or {}).get("enabled") is False
+           and (cap_bad or {}).get("minted") == [] and (cap_bad or {}).get("stage") == []
+           and st is not None and st[0] is False,
+           "; ".join(e for e in (sch_err, grd_err, cb_err, st_err) if e) or "resolved, but not to OFF")
+        ck("...and capture() JOURNALS the refusal rather than swallowing it — a quiet round, never a "
+           "silent record",
+           cap_bad is not None and "MALFORMED" in cap_bad["note"]
+           and "must be an object" in cap_bad["note"] and "OFF" in cap_bad["note"],
+           cb_err or (cap_bad or {}).get("note", ""))
+        off, off_err = _probe(lambda: (capture_state("off", bad_reg), capture_state("on", bad_reg),
+                                       capture(tmp, 440, "x/y.py", "x", "", {"verdict": "fail"}, 1,
+                                               "off", bad_reg)["note"]))
+        ck("OFF and ON never READ the registry, so a malformed one cannot change what they do (and "
+           "cannot complain about a key OFF was never going to consult)",
+           off is not None and off[0] == (False, "") and off[1] == (True, "") and off[2] == "",
+           off_err or repr(off))
 
         # ── 2. the oracle: parse_original over every case the owner emits ──
         print("-- 2. the oracle = the ticket's embedded ORIGINAL SOURCE")
@@ -2517,6 +2699,45 @@ def _strip_anchored(body):
     return "\n".join(lines[b + 1:e]) if e is not None else ""
 
 
+def _probe(fn):
+    """`(fn(), "")`, or `(None, "RAISED ...")` if it raised anything. For --selftest's fail-closed checks.
+
+    Those checks assert that a hook site RESOLVES a malformed toggle instead of raising. If that
+    property ever regresses, the site raises — and an UNGUARDED call here would abort the whole
+    selftest with a traceback (exit 2, plus main()'s handler filing a bug report into this repo's own
+    sink, which the isolation checks at the end would then never get to run) instead of printing the
+    FAIL line that names the regression. Measured, not assumed: reverting capture_state() to re-raise
+    turns these checks from a clean FAIL into exactly that traceback when the calls are unguarded.
+    A check that CRASHES on the defect it hunts is not a check — the same discipline as _not_refused().
+    """
+    try:
+        return fn(), ""
+    except Exception as e:  # noqa: BLE001 — a raise here IS the defect under test
+        return None, "RAISED %s: %s" % (type(e).__name__, e)
+
+
+def _not_refused(fn):
+    """True if `fn()` did NOT refuse with a clean Unexpected — used by --selftest's toggle checks.
+
+    Two different defects share this return, on purpose, because both are the same failure of the
+    same contract and a check that caught only one would go green on the other:
+      * fn() RETURNED — the toggle guessed at a shape this module does not define;
+      * fn() raised something else — e.g. the AttributeError that `(reg.get(KEY) or {}).get(...)`
+        used to raise on `{"regression_capture": true}`, which is the original defect.
+    Only a clean Unexpected is the fix, so only a clean Unexpected returns False. Catching the
+    AttributeError here rather than letting it fly is what makes a REVERT of that fix show up as a
+    clean FAIL line instead of a selftest traceback (exit 2), which is the discipline every other
+    mutation check in this file follows.
+    """
+    try:
+        fn()
+        return True
+    except Unexpected:
+        return False
+    except Exception:  # noqa: BLE001 — an AttributeError here IS the defect under test
+        return True
+
+
 def _ledger_refuses(led, rel):
     try:
         led.add({"path": rel, "sha256": _sha("different"), "source": "different"})
@@ -2542,6 +2763,37 @@ def _ledger_dir_linked(tmp):
     return ledger_dir(wt) == os.path.join(repo, ".git", LEDGER_DIRNAME)
 
 
+# ── --toggle-status: resolve the live toggle for an operator, before a round depends on it ───────
+def toggle_status(mode):
+    """Print how `--regression-capture MODE` resolves against THIS checkout's registry.json. -> exit.
+
+    Requirement 6 asks that on/off be "instant and require no code edits, so we can A/B capture-on vs
+    capture-off". This is how the operator who just hand-edited registry.json confirms the flip
+    actually landed, instead of inferring it from a round that mints nothing — and it is the one
+    place a malformed section is reported to a human, since the hook sites fail closed and only
+    capture() journals, and capture() runs only after a FAIL verdict.
+
+    Read-only and side-effect free: registry.json was already read at import (find_registry()), no db
+    is opened, no file is written.
+
+    Exits 0 (the toggle resolves) or 1 (the toggle is malformed; capture would stay off).
+    """
+    on, complaint = capture_state(mode)
+    have = REGISTRY.get(REGISTRY_KEY, "\0")
+    print("registry.json:  %s" % os.path.join(ROOT, "registry.json"))
+    print('  "%s": %s' % (REGISTRY_KEY, "(absent — not configured)" if have == "\0"
+                          else json.dumps(have)))
+    print("--regression-capture %s  ->  capture is %s%s"
+          % (mode, "ON" if on else "OFF",
+             "" if mode == "auto" else "  (an explicit flag outranks the registry, and does not read it)"))
+    if complaint:
+        print("\nMALFORMED: %s" % complaint)
+        print("The hook FAILS CLOSED: capture stays off, the round is byte-for-byte today's "
+              "behavior,\nand capture() journals this on the next fail verdict. Nothing crashes.")
+        return 1
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="regression_capture (#440): a CONFIRMED auditor finding's structured repro "
@@ -2558,19 +2810,26 @@ def main():
                          "pair_loop's deliverable/worker scoping enforces this')" % TESTS_DIR)
     ap.add_argument("--print-hook", action="store_true",
                     help="print the exact pair_loop.py patch that installs the hook, and why each line")
+    ap.add_argument("--toggle-status", nargs="?", const="auto", choices=MODES, metavar="ON|OFF|AUTO",
+                    help="resolve the toggle against this checkout's registry.json and print whether "
+                         "capture would be on (default: auto, the A/B path). Exits 1 if the "
+                         'registry\'s "%s" section is malformed. Read-only.' % REGISTRY_KEY)
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.toggle_status:
+        return toggle_status(a.toggle_status)
     if a.verify_scope:
         return verify_scope()
     if a.print_hook:
         print(HOOK_PATCH)
         return 0
     ap.print_help()
-    print("\nThis module is a LIBRARY: pair_loop calls capture()/guard()/worker_findings() through "
-          "the hook printed by --print-hook. Capture is OFF unless pair_loop is run with "
-          "--regression-capture on, or with auto and registry.json's "
-          '{"%s": {"enabled": true}}.' % REGISTRY_KEY)
+    print("\nThis module is a LIBRARY: pair_loop calls capture()/guard()/worker_findings()/"
+          "capture_state() through the hook printed by --print-hook. Capture is OFF unless pair_loop "
+          "is run with --regression-capture on, or with auto and registry.json's "
+          '{"%s": {"enabled": true}} — exactly that shape; --toggle-status resolves the live one and '
+          "says so if it is malformed." % REGISTRY_KEY)
     return 0
 
 
