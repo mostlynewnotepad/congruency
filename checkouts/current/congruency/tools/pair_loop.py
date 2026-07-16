@@ -2567,13 +2567,16 @@ def selftest(install_check_too=False):
             skip("#457 GATE: a git blob sha does not route to the forge-artifacts probe", rpath)
         else:
             rsrc = open(rpath).read()
-            ck("#457 GATE (a): resolver.py holds NO reference to `ticket_artifacts` — the table "
-               "artifact.record writes — so a stamped row is invisible to it. Its forge-artifacts "
-               "probe reads forge.db's `artifacts` (sha256) instead. FAIL here = resolver.py changed; "
-               "re-read THE DIRECTORY-SERVICE GATE in this docstring and close #457's gate.",
-               "ticket_artifacts" not in rsrc
-               and "SELECT filename FROM artifacts WHERE lower(sha256) = ?" in rsrc,
-               "resolver.py now mentions ticket_artifacts=%s" % ("ticket_artifacts" in rsrc))
+            ck("#457 GATE (a): resolver.py DOES reference `ticket_artifacts` — the table "
+               "artifact.record writes — so a stamped row is now a REAL match, not an invisible one. "
+               "#461 (DONE, merged) CLOSED the directory-service gap this gate once pinned open: "
+               "minting_tickets() reads `ticket_artifacts` in the congruency state db and joins it on "
+               "the sha256 content address, so the tether from resolver.py to the mint table is "
+               "CLOSED. FAIL here = resolver.py was silently UNWIRED from `ticket_artifacts`; re-read "
+               "THE DIRECTORY-SERVICE GATE in this docstring — #461 must stay closed.",
+               "ticket_artifacts" in rsrc
+               and "SELECT id, ticket_id, kind FROM ticket_artifacts WHERE lower(forge_sha) = ?" in rsrc,
+               "resolver.py no longer references ticket_artifacts=%s" % ("ticket_artifacts" not in rsrc))
             ck("#457 GATE (b): forge_sha is a 40-hex git blob sha, which resolver routes to kind "
                "`git-blob`, whose fan-out has no forge-artifacts probe (that probe fires only for a "
                "64-hex sha256). FAIL here = the fan-out changed; re-check the gate.",
