@@ -67,20 +67,51 @@ classification that come back. Two consequences worth stating plainly, because b
     usage error that STOPS the run, never a silent NOT-SAFE that blames git for a typo.
 
 OMNI IS BLACK-BOXED — THIS TOOL NEVER OPENS IT, AND THAT IS ENFORCED IN CODE.
-config/forge/archives/omni.git is NOT a git repository: it is a TOOL MADE OF GITS (an archive of
-many repos' refs), and every ordinary git command against it fails — `rev-parse --abbrev-ref HEAD`
-prints the literal string "HEAD", `ls-tree HEAD` says "fatal: Not a valid object name HEAD", and
-`log -1` says "fatal: your current branch 'master' has no commit". It also does not cover the
-forge: 264 forge bare repos vs 145 repos in omni, of which only 29 overlap — omni covers 11% and
-MISSES 235 of the forge's repos. (The "~86%" figure quoted elsewhere is BLOB coverage in the `occ`
-index, not repo coverage. The two are not the same measurement and must not be conflated.)
-Therefore config/forge/remotes/*.git is the ONLY authority here: this tool does not walk
-refs/archives/*, does not read omni.git, and never treats it as a source of dates or provenance.
-Those omni facts above are QUOTED FROM THE TICKET, NOT RE-MEASURED — re-measuring them would mean
-running git against omni, which is the very thing that is forbidden. The prohibition is mechanical,
-not a promise: `_guard_store()` refuses any store named omni.git or sitting under an archives/
-directory, it is called by the single git entry point every read in this file goes through, and
---selftest asserts that it fires. A future omni interface is a separate tool with its own contract.
+The black box stands on TWO facts, and only these two. Both are true; neither is about how much of
+the forge omni holds.
+
+  LEG 1 — OMNI IS NOT A GIT. config/forge/archives/omni.git is a TOOL MADE OF GITS (an archive of
+  many repos' refs under refs/gitlab/*, refs/archives/*, refs/tarball/*) — a DEDUPLICATION DEVICE,
+  and it was a TEST, not an archive of record. Every ordinary git command against it fails:
+  `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` each exit 128 while PRINTING the literal
+  string "HEAD" on stdout, `ls-tree HEAD` says "fatal: Not a valid object name HEAD", and `log -1`
+  says "fatal: your current branch 'master' does not have any commits yet". There is nothing here
+  that could read it correctly even if it were allowed to.
+  LEG 2 — OMNI IS STALE AND INCOMPLETE. It does not hold the forge's current work: it is MISSING
+  agent_tools_suite.git's tip 888d3447c6 — the very family this tool works through below — and 67
+  other tips besides. What it does hold therefore cannot be trusted as current.
+
+HOW MUCH OF THE FORGE OMNI HOLDS — MEASURED BY OBJECT, AND ONLY BY OBJECT (ticket #462). Of the
+264 bare repos in config/forge/remotes, 261 have a resolvable tip (3 have no refs at all); omni
+CONTAINS 193 of those 261 tips and is missing 68. Omni covers 74% of the forge's tips.
+
+  THE METHOD IS THE POINT: A BY-NAME JOIN DOES NOT WORK HERE AND MUST NOT BE USED. Omni's refs are
+  shaped `refs/gitlab/<slug>/heads/<branch>` while the forge's bare repos are named
+  `gitlab__<slug>.git`. The two naming conventions do not align, so matching omni's repos to the
+  forge's BY NAME matches almost nothing, and the coverage that falls out of it is an artifact of
+  the mismatch rather than a measurement of anything. An earlier by-name attempt was reported as
+  fact and propagated into this file in three places; ticket #462 exists to remove it. The
+  name-independent method is the only one that holds, and it is re-runnable: take each forge repo's
+  tip as Part 1 resolves it (from refs/heads, NEVER from HEAD) and ask
+  `git -C config/forge/archives/omni.git cat-file -e <tip>` — a tip omni can name, omni has. A
+  naming convention can disagree with another naming convention; an object id cannot.
+  A THIRD NUMBER IS QUOTED ELSEWHERE AND ANSWERS A THIRD QUESTION: the "~86%" is BLOB coverage in
+  the `occ` index — not repo coverage, and not the tip coverage above. Three different numbers
+  measuring three different things; do not conflate them.
+
+THE COVERAGE FIGURE IS NOT WHY THE BLACK BOX EXISTS, AND 74% DOES NOT SOFTEN IT. Legs 1 and 2 are
+exactly as true at 74% as at any other number, and they are the whole justification. Therefore
+config/forge/remotes/*.git is the ONLY authority here: this tool does not walk refs/archives/*,
+does not read omni.git, and never treats it as a source of dates or provenance.
+EVERY OMNI FACT ABOVE IS QUOTED, NOT RE-MEASURED BY THIS TOOL — and none of them can be re-measured
+here. The not-a-git legs come from #452 and the 193-of-261 coverage from #462, each established by
+a one-off probe run OUTSIDE this file, because measuring any of them means running git against
+omni, which is the very thing this tool is forbidden to do. Re-deriving 193/261 in this file would
+break the guarantee the guard exists to make; if you want the number again, run the cat-file probe
+yourself. The prohibition is mechanical, not a promise: `_guard_store()` refuses any store named
+omni.git or sitting under an archives/ directory, it is called by the single git entry point every
+read in this file goes through, and --selftest asserts that it fires. A future omni interface is a
+separate tool with its own contract.
 
 CONTENT IDENTITY — THE MODULE-SHA. Identity is not the git blob sha1: two copies of a module that
 differ only in whitespace or comments are the SAME module and must count as contained, while a
@@ -234,13 +265,18 @@ SOURCE_EXT = (".py", ".php", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".sh"
 PY_EXT = (".py",)
 
 # Stores this tool refuses to open, mapped to why. omni.git is not a git — it is a TOOL MADE OF
-# GITS — and ticket #452 §2 black-boxes it. See the module docstring; _guard_store enforces this.
+# GITS — and ticket #452 §2 black-boxes it on two legs: it is not a git, and it is stale. Coverage
+# is NOT one of the legs (#462): omni holds 74% of the forge's tips, which changes nothing here.
+# See the module docstring; _guard_store enforces this.
 BLACK_BOXED = {
     "omni.git": "omni.git is NOT a git repository — it is a tool made of gits (an archive of many "
-                "repos' refs), every ordinary git command against it fails, and it covers only 11% "
-                "of the forge (29 of 264 repos). Ticket #452 §2 black-boxes it: "
-                "config/forge/remotes/*.git is the only authority. Reading omni is a separate tool "
-                "with its own contract.",
+                "repos' refs), so every ordinary git command against it fails; and it is STALE — "
+                "measured BY OBJECT (a by-name join does not work: omni's refs are refs/gitlab/"
+                "<slug> while the forge's repos are gitlab__<slug>.git) it holds 193 of the "
+                "forge's 261 resolvable tips (74%) and is MISSING 68 of them, including "
+                "agent_tools_suite.git's tip 888d3447c6. Ticket #452 §2 black-boxes it on those "
+                "two facts and #462 leaves the box exactly as it is: config/forge/remotes/*.git is "
+                "the only authority. Reading omni is a separate tool with its own contract.",
 }
 ARCHIVES_DIR = "archives"       # config/forge/archives/ — where omni.git lives; never opened here
 
@@ -2314,8 +2350,11 @@ def main(argv=None):
                "have an unresolvable HEAD (a symref to a branch that does not exist), for which "
                "`git rev-parse HEAD` prints the literal string 'HEAD' on stdout — so a caller that "
                "ignores the exit status passes the word 'HEAD' on as if it were a sha. omni.git is "
-               "BLACK-BOXED (#452 §2) — it is not a git, it covers 11% of the forge, and this tool "
-               "refuses to open it. config/forge/remotes/*.git is the only authority.")
+               "BLACK-BOXED (#452 §2) on two facts — it is NOT a git (every ordinary git command "
+               "against it fails), and it is STALE (measured BY OBJECT, never by name, it holds "
+               "193 of the forge's 261 resolvable tips — 74% — and is missing 68, including "
+               "agent_tools_suite.git's tip 888d3447c6). This tool refuses to open it; "
+               "config/forge/remotes/*.git is the only authority.")
     ap.add_argument("--remotes", help="the bare-repo directory (default: whatever Part 1 reports; "
                                       "it finds config/forge/remotes by walking up)")
     ap.add_argument("--family-json", metavar="PATH",
