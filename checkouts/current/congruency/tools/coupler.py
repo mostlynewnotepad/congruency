@@ -37,12 +37,15 @@ THE LOOP, per module:
 
   1. LOWER      the original -> one `Blank` per top-level function (signature, docstring, and the
                 original body kept back as the hidden oracle).
-  2. STRUCTURE  FIRST: every signature is laid down via `add_function` BEFORE any body is filled,
+  2. ORACLE     for each blank, mechanically derive the body a PERFECT junior would emit and run
+                it through the gate. A blank whose oracle cannot pass is UNREACHABLE — the loop
+                says so and never spends a junior on it (see THE FRAME below).
+  3. STRUCTURE  FIRST: every signature is laid down via `add_function` BEFORE any body is filled,
                 so a body may call any sibling regardless of fill order. No topological sort.
-  3. FILL       one function at a time. The junior is handed EXACTLY: its own signature and
+  4. FILL       one function at a time. The junior is handed EXACTLY: its own signature and
                 docstring, the sibling signatures (names and args only, no bodies), and the
                 module's imports and constants. Nothing else.
-  4. GATE       cheapest first: parse -> then `critic` for PRESERVE functions. `critic` is a
+  5. GATE       cheapest first: parse -> then `critic` for PRESERVE functions. `critic` is a
                 MECHANICAL PROOF of behaviour preservation, not an auditor's prose opinion.
 
                 WHICH WAY THE PROOF RUNS, exactly — because the difference decides how every
@@ -50,14 +53,14 @@ THE LOOP, per module:
                 _ast_norm-identical to the original, so a PASS *proves* behaviour is preserved:
                 comments, formatting and whitespace cannot fool it, and a changed constant or a
                 dropped branch cannot survive it. The converse does NOT hold. A FAIL means "not
-                the same code", NOT "wrong code": measured on pilot_pure.py, a junior answered
-                `fib` with `if n < 2: return n` + a loop over `range(n - 1)` accumulating via its
-                sibling `add(a, b)` — a correct Fibonacci that fails critic against an original
-                spelled `a, b = (0, 1)` + a loop over `range(n)`. So critic is
-                SOUND (no wrong body passes) but not COMPLETE (right bodies fail). That is the
-                right bias for a refactor gate, and it is why the benchmark reports `reproduced`
-                and `works` as two separate numbers instead of one "score".
-  5. RETRY      per FUNCTION, never per module: a gate failure re-prompts that ONE function with
+                the same code", NOT "wrong code": measured on pilot_pure.py, the claude junior
+                answered `fib` with `return n if n < 2 else fib(n - 1) + fib(n - 2)` — a correct
+                Fibonacci that fails critic against an original spelled `a, b = 0, 1` + a loop
+                over `range(n)`. So critic is SOUND (no wrong body passes) but not COMPLETE
+                (right bodies fail). That is the right bias for a refactor gate, and it is why the
+                benchmark reports `reproduced` and `works` as two separate numbers instead of one
+                "score".
+  6. RETRY      per FUNCTION, never per module: a gate failure re-prompts that ONE function with
                 the exact error (SyntaxError line N / the _ast_norm mismatch). After --attempts
                 failures that ONE blank escalates to a stronger model. A bad body costs one
                 re-prompt, never a module.
@@ -75,6 +78,69 @@ gate quoted the original body, the junior could copy it and the benchmark below 
 measuring an echo. `--selftest` asserts this.
 
 ────────────────────────────────────────────────────────────────────────────────────────────────
+THE FRAME, and why the machine derives an ORACLE before it calls anyone.
+
+The junior emits its body as it would read with the def at COLUMN 0, and the machine indents that
+text into the function ("Indent as if at the top level of the body" — the prompt says so, and
+model.py's render() does exactly that). Indentation is textual, so a string literal that SPANS
+LINES has its continuation lines shifted with it, and its VALUE changes. That is not a bug in
+render(); it is what re-indenting source code means, and it cuts BOTH ways:
+
+  * a nested `def` whose docstring is multi-line: `ast.unparse` writes that docstring as a real
+    triple-quoted block carrying the ORIGINAL file's indentation, so re-indenting it adds 4 spaces
+    INSIDE the string. The unparse spelling of such a body therefore FAILS the gate — measured:
+    13 of the 1,359 functions in the 65 couplable modules of tools/ + prototype/ (this tool's own
+    source included), in 12 modules. The column-0 (source-frame) spelling of the very same body
+    PASSES all 13.
+  * a literal whose continuation line sits at column 0 (a triple-quoted SQL string whose second
+    line is written flush left): the source-frame spelling cannot be lifted any further left, so
+    re-indenting it changes the value — that spelling FAILS, and the unparse spelling (which
+    escapes the literal to one line, making it indent-immune) PASSES. This trap costs 0 of the
+    1,359 corpus functions today, but it is constructible rather than theoretical: --selftest
+    builds one and asserts each spelling fails where the other works.
+
+Neither spelling is therefore "the" original body, and a tool that picks one and calls it the
+junior's target is wrong about a real fraction of real code. So the machine tries BOTH, mechanically,
+before any model is called:
+
+    ORACLE = the first spelling of the original body that PASSES THE GATE (source-frame, then
+             unparse). Its existence is a PROOF that this blank is fillable: a junior that writes
+             that text passes.
+    UNREACHABLE = neither spelling passes. The body cannot be expressed through a column-0 body
+             channel at all (it takes BOTH traps at once — see --selftest, which builds one). The
+             loop reports it and spends NO junior attempt, NO escalation and NO paid call on it,
+             and the benchmark scores it in neither direction. Measured: 0 of the 1,359 corpus
+             functions are unreachable.
+
+This is what stops the benchmark reporting `reproduced: no` for a junior that wrote THE code, and
+what stops --preserve refusing a module forever for a reason the junior could never fix.
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+THE REBUILT MODULE KEEPS THE ORIGINAL'S TOP-LEVEL ORDER, and that is load-bearing, not cosmetic.
+
+codebean's `Module.render()` emits imports, then classes, then functions — it cannot express where
+a module's own statements sat. Rendering a rebuilt module through it HOISTS every non-function
+statement above every def, which breaks real modules two ways, both measured over the 65 couplable
+modules of tools/ + prototype/:
+
+    31/65  have a top-level statement that CALLS one of the module's own functions
+           (`ROOT, REGISTRY = find_registry(...)`, `COMMANDS = {'block': do_block, ...}`).
+           Hoisted above the defs, importing the rebuilt module dies with NameError.
+    63/65  end with an `if __name__ == '__main__':` tail. Hoisted above the defs, running the
+           rebuilt module as a script dies on the first name it uses.
+
+So `Skeleton.render()` walks the ORIGINAL module's top-level statements in order and substitutes
+each coupled function with the model's own `Function.render()` — the same renderer `critic` proves
+against, and the one that applies the decorators. Everything that is not a coupled function (the
+module docstring, imports, constants, classes, `try:` blocks, the `__main__` tail) is emitted from
+the original source, in place. `Module.render()` is still exercised on every function through
+code_wrapper's `judge`, which is where the born-instrumented artefact rules (R1..R5) live.
+
+`--selftest` proves this end-to-end: it rebuilds a synthetic module shaped like the corpus (an
+import, a constant, a constant that CALLS a function above it, a `__main__` tail), then IMPORTS
+the rebuilt file and calls into it.
+
+────────────────────────────────────────────────────────────────────────────────────────────────
 MODES (exactly one is required):
 
   --selftest                 A throwaway synthetic module, a SCRIPTED junior, no network, no live
@@ -82,14 +148,19 @@ MODES (exactly one is required):
                              body that fails parse is re-prompted; a PRESERVE function that
                              differs semantically FAILS critic; one that differs only in
                              whitespace/comments PASSES; escalation fires after N; the junior is
-                             never handed a path, a tool, or a sibling's body.
+                             never handed a path, a tool, or a sibling's body; the rebuilt module
+                             imports and runs; and each of the two frame traps above, including an
+                             UNREACHABLE function that costs the junior nothing.
 
   --preserve --src M.py      Refill every body under the critic and emit the rebuilt module. It is
-                             emitted ONLY if EVERY function passed the critic against the
+                             emitted ONLY if EVERY coupled function passed the critic against the
                              original; otherwise nothing is emitted and the failures are named.
                              (Falling back to the original body for a function the junior could
                              not reproduce would make "passes critic" true by construction and
-                             therefore worthless.)
+                             therefore worthless.) With --limit N, only the first N functions are
+                             coupled and the REST are emitted verbatim from the original — so the
+                             file is whole and runnable — and they are reported as `not coupled`,
+                             never as critic passes.
 
   --benchmark --src M.py     THE BLANK-AND-REFILL BENCHMARK — how this tool proves itself. Blank
                              every body, have the junior refill it from signature+docstring, and
@@ -113,8 +184,10 @@ MODES (exactly one is required):
                              are taken over the answered functions only. An unanswered blank
                              leaves an empty body that assembles to `pass` — which compiles and
                              passes judge — so scoring it would report a dead backend as a junior
-                             that works perfectly. If nothing was answered, nothing is measured
-                             and the run exits 1.
+                             that works perfectly. An UNREACHABLE blank (see THE FRAME) is printed
+                             as `unreachable` and is likewise outside both rates: no junior was
+                             asked, so no junior is being measured. If nothing was answered,
+                             nothing is measured and the run exits 1.
 
 ENGINES (--engine, default claude). The junior is text-in/text-out on every one of them:
   claude    `claude -p` with --json-schema (stdout is exactly the JSON object), a replaced system
@@ -122,9 +195,15 @@ ENGINES (--engine, default claude). The junior is text-in/text-out on every one 
   cerebras  the litellm proxy's `worker` alias -> cerebras/zai-glm-4.7 (GLM 4.7), via
             ollama_agent.py's openai flavor.
   ollama    a local model over ollama_agent.py's ollama flavor.
+  oracle    NOT A MODEL and not a benchmark subject: the machine answers every blank with its own
+            ORACLE (see THE FRAME). Nothing is sampled and no network is touched, so
+            `--benchmark --engine oracle` measures the LOOP's ceiling rather than a junior's
+            skill — it reproduces 100% of what the channel can express, and anything less is a
+            defect in this tool. It is the free, mechanical way to check a module (or a whole
+            corpus) is couplable before spending a paid model on it.
   cerebras/ollama go through ollama_agent.constrained(), so the JSON-Schema + validate + corrective
   -retry channel is shared verbatim rather than re-implemented here. ollama_agent is imported
-  LAZILY: --selftest never touches it, and so never needs a network or a registry.
+  LAZILY: --selftest and --engine oracle never touch it, and so never need a network or a registry.
 
   ESCALATION MAY CROSS ENGINES, and for cerebras it must — see the ESCALATION table for the
   probe. In short: openai_chat always sends one reasoning param, and every proxy alias except GLM
@@ -136,41 +215,52 @@ ENGINES (--engine, default claude). The junior is text-in/text-out on every one 
 USAGE
     python3 coupler.py --selftest
     python3 coupler.py --benchmark --src <module.py> [--limit N] [--engine claude]
-    python3 coupler.py --benchmark --src <module.py> --engine cerebras --json
+    python3 coupler.py --benchmark --src <module.py> --engine oracle --json
     python3 coupler.py --preserve  --src <module.py> [--limit N] [--out rebuilt.py] [--mature]
 
-MEASURED against the real forge module codebean_mcp/prototype/pilot_pure.py (4 pure, documented
-functions: add, slugify, fib, clamp). Every line below is one observed run, so these commands are
-known to run rather than merely intended to:
-    --benchmark                    reproduced 2/4, works 4/4, first-shot 1/4, 58s
-                                   (claude, the default: sonnet escalating to opus)
-    --benchmark --engine cerebras  reproduced 2/4, works 4/4, first-shot 2/4, 66s (GLM 4.7)
-    --preserve --attempts 6 --escalate-attempts 2
-                                   2/4 pass critic; the module is therefore NOT emitted and the
-                                   run exits 1, naming slugify and fib (claude, 221s)
-    --preserve --limit 1 --mature  1/1 passes critic and the module IS emitted, 3s (claude). The
-                                   emitted `add` was checked AST-identical to the original by a
-                                   plain `ast.dump(ast.parse(...))` comparison OUTSIDE this tool —
-                                   an oracle that is not the code under test.
+MEASURED. Every line below is one observed run of the command as printed, so these are known to
+run rather than merely intended to.
 
-WHICH FUNCTIONS REPRODUCE IS STRUCTURAL, NOT LUCK, and that is the most useful thing this module
-measures. Both engines — Claude and GLM 4.7, independently — reproduced exactly `add` and `clamp`
-and failed exactly `slugify` and `fib`. The two failures are not sampling noise; each has a cause
-that no number of retries can remove:
-  * slugify's original body opens with a function-local `import re`. `re` is NOT among the module's
-    imports, so the junior — correctly reasoning that it may not use an unimported name — wrote a
-    hand-rolled character loop instead. It cannot infer a private import it was never shown.
-  * fib's original is one of several equally idiomatic spellings; the junior wrote another (and
-    reached for its sibling `add`, which is structure-first working exactly as intended).
-Both answers were CORRECT code. Both fail a gate that demands identity — which is the whole of the
-`reproduced` vs `works` distinction above, observed rather than argued: works stayed 4/4 on both
-engines while reproduced stayed 2/4.
+  On the real forge module codebean_mcp/prototype/pilot_pure.py (4 pure, documented functions:
+  add, slugify, fib, clamp):
+    --benchmark                    reproduced 3/4, works 4/4, first-shot 2/4, 38s
+                                   (claude, the default: sonnet escalating to opus). A second,
+                                   identical run: reproduced 3/4, works 4/4, first-shot 1/4, 47s.
+    --benchmark --engine cerebras  reproduced 4/4, works 4/4, first-shot 2/4, 59s (GLM 4.7). One
+                                   of those four (clamp) reached identity only on its 4th attempt,
+                                   which is the escalation to claude/opus — so this row is the
+                                   pair, not GLM alone.
+    --preserve --limit 1 --mature --out
+                                   1/1 coupled functions pass critic; the module IS emitted with
+                                   the other 3 left verbatim, 3s (claude). The result was checked
+                                   OUTSIDE this tool by a plain `ast.dump(ast.parse(...))`
+                                   comparison — an oracle that is not the code under test: the
+                                   emitted file is AST-identical to the original, carries all four
+                                   functions, and imports and runs (add(2,3)=5, slugify('A b!')=
+                                   'a-b', fib(10)=55, clamp(9,0,5)=5).
 
-So read `reproduced` as a LOWER bound on the junior and never as a grade. A module reproduces to
-the extent its original is the obvious spelling of its docstring; where the original hides a quirk
-the docstring does not imply, PRESERVE will refuse it forever, and refusing is the correct
-behaviour — see run 3 above, which named its two failures and emitted nothing. What does NOT move
-is the gate: nothing reaches the output that critic has not proven identical to the original.
+  On the whole tools/ + prototype/ corpus, --engine oracle (mechanical, no model, no network):
+    --benchmark                    reproduced 1359/1359, works 1359/1359 over all 65 modules;
+                                   0 unreachable. Every one of those 65 rebuilt modules was
+                                   compared to its original by the same outside-the-tool
+                                   `ast.dump(ast.parse(...))` oracle: all 65 are AST-identical,
+                                   which is the end-to-end proof that the loop can express real
+                                   code without dropping or reordering it. The 65 include
+                                   coupler.py itself (39/39 functions, rebuild AST-identical).
+
+HOW TO READ `reproduced`: as a LOWER bound on the junior, never as a grade, and never as a fixed
+property of a function. Measured across the runs above, `works` was 4/4 every time while
+`reproduced` moved with the engine and with the sample: claude reproduced 3/4 twice (missing `fib`
+both times, including after escalating to opus), GLM 4.7 + escalation reproduced 4/4. `fib`'s miss
+is the distinction itself, quoted rather than argued: claude answered
+`return n if n < 2 else fib(n - 1) + fib(n - 2)` — correct code, and not the original's iterative
+`a, b = 0, 1` loop, so a gate that demands identity refuses it. The retry loop is what moves the
+rest: `slugify`'s original opens with a function-local `import re` that is NOT among the module's
+imports, and juniors landed it in 1 to 3 attempts across runs rather than never.
+
+What does NOT move is the gate: nothing reaches the output that critic has not proven identical to
+the original. A module reproduces to the extent its original is the obvious spelling of its
+docstring; where it is not, PRESERVE refuses it, and refusing is the correct behaviour.
 
 EXIT CODES: 0 ok / 1 a mode reported failure / 2 a usage or environment error (one line, never a
 traceback).
@@ -208,11 +298,13 @@ BODY_SCHEMA = {"type": "object",
 # What a critic rejection is told back to the junior. Note what it is NOT: it quotes nothing from
 # the original — it is this one CONSTANT string, so it cannot leak the answer no matter which
 # module is being coupled. It exists because "does not round-trip the original" alone is unusable
-# feedback: measured on pilot_pure.py, juniors answered `slugify` with a correct hand-rolled
-# character loop and `fib` with a correct `if n < 2: return n` variant. Both are right, and
-# both fail a gate that demands identity — so the junior has to be told that identity, not
-# equivalence, is the bar. It moves some functions and not others, and it cannot conjure slugify's
-# unshown function-local `import re` (see the module docstring); no honest hint can.
+# feedback: measured on pilot_pure.py, the claude junior answered `fib` with a correct recursive
+# `return n if n < 2 else fib(n - 1) + fib(n - 2)` against an iterative original. That is right,
+# and it fails a gate that demands identity — so the junior has to be told that identity, not
+# equivalence, is the bar. It moves some functions and not others: with it, juniors landed
+# `slugify` (whose original opens with an unshown function-local `import re`) in 1 to 3 attempts,
+# and claude never landed `fib` in any run. No honest hint can do better — a hint that quoted the
+# original would be the answer.
 CRITIC_HINT = ("Your body must be AST-IDENTICAL to the original implementation, not merely "
                "equivalent to it. Emit the single most direct and idiomatic implementation the "
                "docstring describes — where an obvious one-expression form exists, that one, "
@@ -228,6 +320,7 @@ ENGINE_MODELS = {
     "claude":   "sonnet",
     "cerebras": "worker",             # litellm alias -> cerebras/zai-glm-4.7 (GLM 4.7)
     "ollama":   "qwen2.5-coder:7b",   # == ollama_agent.ROLE_MODELS["worker"]
+    "oracle":   "oracle",             # the machine's own answer — no model, no network
 }
 
 # Where ONE blank goes when it has failed --attempts times: (engine, model). Escalation may cross
@@ -247,11 +340,15 @@ ENGINE_MODELS = {
 # note: transient 429s are retried so they do not "escalate the ticket to Claude prematurely").
 # --escalate-engine / --escalate-model override this; --escalate-attempts 0 disables it entirely,
 # which is how to keep a cerebras or ollama run from ever reaching claude.
+#
+# oracle escalates to itself: its answer is deterministic, so a second call cannot differ, and a
+# blank whose oracle fails is UNREACHABLE — which the loop detects before any junior is called.
 ESCALATION = {
     "claude":   ("claude", "opus"),
     "cerebras": ("claude", "opus"),
     "ollama":   ("ollama", "gemma3:27b"),   # == ollama_agent.ROLE_MODELS["adversary"], a bigger
-}                                           # local model of a different family
+    "oracle":   ("oracle", "oracle"),       # local model of a different family
+}
 
 
 class CouplerError(RuntimeError):
@@ -365,6 +462,21 @@ def load_ollama_agent():
         sys.dont_write_bytecode = saved_bc
 
 
+def instrument_import(cw):
+    """The tracer import model.py prepends to an instrumented module, taken FROM model.py rather
+    than copied into this file: a probe Module is rendered with instrument=True and its first line
+    IS that import. Copying the string would let the two drift, and it has already moved once (the
+    retired dz_debug -> code_pipeline; model.py's Module.render says so).
+    """
+    probe = cw.Module("_coupler_probe", functions={"_f": cw.Function("_f")})
+    first = (probe.render(instrument=True).splitlines() or [""])[0]
+    if "debug_decorator" not in first:
+        raise CouplerError("model.py no longer opens an instrumented module with the tracer "
+                           "import (first line is %r) — the instrumented render cannot mirror it"
+                           % first[:60])
+    return first
+
+
 # ── the model: one hole per function ─────────────────────────────────────────────────────────────
 @dataclass
 class Blank:
@@ -376,9 +488,12 @@ class Blank:
     decorators: list
     doc: str                 # the docstring statement as ast.unparse emits it — the SKELETON's
     doc_display: str         # the docstring as it reads in the source — the PROMPT's (see below)
-    rest_body: str           # the original body WITHOUT the docstring — the junior's target
-    original_body: str       # the full original body, docstring included
+    source_frame: str        # the original body, docstring dropped, as it reads at column 0
+    unparsed: str            # the original body, docstring dropped, as ast.unparse spells it
     original_src: str        # ast.unparse(node): the critic's oracle. HIDDEN from the junior.
+    oracle_body: str = ""    # the spelling of the body PROVEN to pass the gate (see THE FRAME)
+    reachable: bool = True   # False iff NEITHER spelling passes — no junior can fill it
+    unreachable_reason: str = ""
 
     def signature(self):
         """`def name(params) -> returns` — no decorators (the machine applies those), no colon."""
@@ -387,6 +502,10 @@ class Blank:
         if self.returns:
             sig += " -> %s" % self.returns
         return sig
+
+    def bodies(self):
+        """Every spelling of this function's original body. NONE of them may reach a prompt."""
+        return [self.source_frame, self.unparsed]
 
 
 @dataclass
@@ -399,20 +518,40 @@ class Fill:
     escalated: bool = False
     first_shot_ok: bool = False
     answered: bool = False        # the junior returned a body at least once
+    reachable: bool = True        # False -> the junior was never asked; see THE FRAME
     reproduced: bool = False      # _ast_norm-equal to the original
     works: bool = False           # compiles AND passes code_wrapper.judge
-    gate: str = ""                # which refused it: "parse" | "critic" | "junior" | ""
+    gate: str = ""                # "parse" | "critic" | "junior" | "unreachable" | ""
     reason: str = ""
     prompts: list = field(default_factory=list)
 
 
+@dataclass
+class Lowered:
+    """The senior's whole mechanical output for one module."""
+    blanks: list
+    imports: str        # the module's imports, for the PROMPT
+    constants: str      # the module's constants, for the PROMPT (long values elided)
+    tree: object        # the parsed original — the skeleton's layout is read from it
+    src_text: str
+
+
 # ── the MOCK SENIOR: lower_functions IS the senior ───────────────────────────────────────────────
+def is_docstring(node):
+    return (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str))
+
+
 def module_header(tree, max_const=800):
     """The module's imports and constants — the only module-wide context the junior is given.
 
     Imports are every top-level import; constants are every top-level assignment. A constant whose
     source exceeds max_const chars is elided to `NAME = ...` (still valid Python to read): the
     junior needs the NAME to call or reference, never a 20KB table's contents.
+
+    This is the PROMPT's spelling and nothing else reads it. The rebuilt module is emitted from the
+    original source (see Skeleton.render), so an elided constant can never reach a file — which it
+    must not, `NAME = ...` being valid Python with the WRONG value.
     """
     imports, consts = [], []
     for n in tree.body:
@@ -428,12 +567,143 @@ def module_header(tree, max_const=800):
     return "\n".join(imports), "\n".join(consts)
 
 
+def stmt_span(node):
+    """(first line, last line) of a top-level statement, 1-based and INCLUSIVE of its decorators.
+
+    `node.lineno` of a decorated class is the `class` line, not the `@`, so slicing from it would
+    silently drop `@dataclass` from a rebuilt module.
+    """
+    start = node.lineno
+    for d in getattr(node, "decorator_list", None) or []:
+        start = min(start, d.lineno)
+    return start, node.end_lineno
+
+
+def module_layout(tree, src_text, coupled):
+    """The module's top-level shape, IN SOURCE ORDER: [("doc"|"stmt", text) | ("fn", name)].
+
+    `coupled` names the functions the skeleton holds; every other top-level statement — including a
+    function NOT being coupled (--limit) — is carried as the original's own source text, so the
+    rebuilt module keeps its imports, constants, classes and `__main__` tail exactly where they
+    were. See the module docstring for why order is load-bearing (31/65 corpus modules break if
+    their statements are hoisted above the defs, 63/65 if their tail is).
+
+    Consecutive non-coupled statements are kept as ONE slice of the original source, so blank lines
+    and comments BETWEEN them survive. The module docstring is its own item because the tracer
+    import has to go after it, not before it.
+    """
+    lines = src_text.splitlines()
+    body = list(tree.body)
+    items = []
+
+    def slice_of(nodes):
+        a = min(stmt_span(n)[0] for n in nodes)
+        b = max(stmt_span(n)[1] for n in nodes)
+        return "\n".join(lines[a - 1:b]).rstrip()
+
+    if body and is_docstring(body[0]):
+        items.append(("doc", slice_of([body[0]])))
+        body = body[1:]
+    run = []
+    for n in body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in coupled:
+            if run:
+                items.append(("stmt", slice_of(run)))
+                run = []
+            items.append(("fn", n.name))
+        else:
+            run.append(n)
+    if run:
+        items.append(("stmt", slice_of(run)))
+    return items
+
+
+def source_frame_body(node, src_text):
+    """The original body, docstring dropped, as it would read with the def at COLUMN 0.
+
+    This is the frame the junior writes in and the machine indents back (see THE FRAME). It is a
+    slice of the real source, so it keeps the body's own comments and formatting — neither of which
+    _ast_norm cares about — and, crucially, its multi-line string literals carry the indentation
+    they had relative to the def, which is what re-indenting restores.
+    """
+    body = [n for n in node.body]
+    if body and is_docstring(body[0]):
+        body = body[1:]
+    if not body:
+        return ""
+    if body[0].lineno == node.lineno:       # `def f(): return 1` — the body has no line of its own
+        return "\n".join(ast.unparse(s) for s in body)
+    lines = src_text.splitlines()
+    return textwrap.dedent("\n".join(lines[body[0].lineno - 1:body[-1].end_lineno]))
+
+
+def unparsed_body(node):
+    """The original body, docstring dropped, as ast.unparse spells it: canonical, comment-free, and
+    with every string literal escaped to one line EXCEPT a nested def/class docstring, which
+    unparse alone emits as a real multi-line block (see THE FRAME)."""
+    body = [n for n in node.body]
+    if body and is_docstring(body[0]):
+        body = body[1:]
+    return "\n".join(ast.unparse(s) for s in body)
+
+
+def split_docstring(node, src_text):
+    """(doc_for_the_skeleton, doc_for_the_prompt), both as source text.
+
+    TWO SPELLINGS OF THE SAME DOCSTRING, and the difference is not cosmetic — it is the multi-line
+    docstring trap that `lower_functions`' own docstring warns about, reached by a second route:
+
+      * THE SKELETON gets `ast.unparse`'s form, which collapses even a multi-line docstring to ONE
+        line with escaped newlines ('a\\n\\n    b\\n    '). model.py's render() indents every body
+        line by 4 — and indenting a one-line literal cannot change the string's VALUE, whereas
+        indenting a REAL triple-quoted block would push 4 spaces INSIDE the string and change it.
+        That is precisely why lower_node keeps docstrings in the body as unparse output, and the
+        critic would catch the alternative as a mismatch.
+      * THE PROMPT gets the original source segment, so the junior reads the docstring as a human
+        wrote it instead of an escaped one-line blob. It never renders, so it cannot corrupt
+        anything, and both spellings encode the identical string value — so _ast_norm is untouched
+        either way.
+    """
+    body = list(node.body)
+    if not (body and is_docstring(body[0])):
+        return "", ""
+    doc = ast.unparse(body[0])
+    # The segment's continuation lines still carry their original indentation, so the prompt
+    # indents only its FIRST line and the block reads exactly as it does in the source.
+    return doc, (ast.get_source_segment(src_text, body[0]) or doc)
+
+
+def prove_oracle(cw, blank):
+    """Derive the body a PERFECT junior would emit, and PROVE it against the same gate the junior
+    faces. Returns (oracle_body, reachable, reason).
+
+    Both spellings of the original body are tried, cheapest interpretation first, because neither
+    is universally right and each fails where the other works (measured — see THE FRAME):
+        source_frame  fails when a literal's continuation line sits left of the body's indent
+        unparsed      fails when a nested def carries a multi-line docstring
+
+    A blank with no passing spelling is UNREACHABLE: its body cannot be expressed through a
+    column-0 body channel, so NO junior can ever fill it, and asking one would burn attempts and
+    escalation (paid calls) on a blank that is unpassable by construction. The loop reports it
+    instead. A docstring-only function has an EMPTY body — an empty hole, which is reachable and
+    filled by answering nothing; inventing a `pass` the original lacks would fail the critic.
+    """
+    reasons = []
+    for spelling in (blank.source_frame, blank.unparsed):
+        ok, which, why = gate(cw, blank, assemble(cw, blank, spelling), preserve=True)
+        if ok:
+            return spelling, True, ""
+        reasons.append("[%s] %s" % (which, why))
+    return "", False, ("no spelling of the original body survives being indented into the def "
+                       "(source-frame: %s; unparse: %s)" % tuple(reasons[:2]))
+
+
 def mock_senior(src_path, cw):
     """The senior, with no LLM in it: `lower_functions` yields every signature + docstring
     mechanically, which for the refactor case IS a senior's entire output.
 
-    Returns (blanks, imports, constants). The blanks carry the original body too — that is the
-    benchmark's ground truth and the critic's oracle, and it is never handed to the junior.
+    Returns a `Lowered`. Its blanks carry the original body too — that is the benchmark's ground
+    truth and the critic's oracle, and it is never handed to the junior.
     """
     src_text = Path(src_path).read_text(encoding="utf-8")
     try:
@@ -449,46 +719,15 @@ def mock_senior(src_path, cw):
 
     blanks = []
     for fn, node in zip(lowered, nodes):
-        doc, doc_display, rest = split_docstring(node, src_text)
-        blanks.append(Blank(
-            name=fn.name, params=fn.params, returns=fn.returns, is_async=fn.is_async,
-            decorators=list(fn.decorators), doc=doc, doc_display=doc_display, rest_body=rest,
-            original_body=fn.body, original_src=ast.unparse(node)))
+        doc, doc_display = split_docstring(node, src_text)
+        b = Blank(name=fn.name, params=fn.params, returns=fn.returns, is_async=fn.is_async,
+                  decorators=list(fn.decorators), doc=doc, doc_display=doc_display,
+                  source_frame=source_frame_body(node, src_text), unparsed=unparsed_body(node),
+                  original_src=ast.unparse(node))
+        b.oracle_body, b.reachable, b.unreachable_reason = prove_oracle(cw, b)
+        blanks.append(b)
     imports, consts = module_header(tree)
-    return blanks, imports, consts
-
-
-def split_docstring(node, src_text):
-    """(doc_for_the_skeleton, doc_for_the_prompt, body_without_the_docstring), all as source text.
-
-    TWO SPELLINGS OF THE SAME DOCSTRING, and the difference is not cosmetic — it is the multi-line
-    docstring trap that `lower_functions`' own docstring warns about, reached by a second route:
-
-      * THE SKELETON gets `ast.unparse`'s form, which collapses even a multi-line docstring to ONE
-        line with escaped newlines ('a\\n\\n    b\\n    '). model.py's render() indents every body
-        line by 4 — and indenting a one-line literal cannot change the string's VALUE, whereas
-        indenting a REAL triple-quoted block would push 4 spaces INSIDE the string and change it.
-        That is precisely why lower_node keeps docstrings in the body as unparse output, and the
-        critic would catch the alternative as a mismatch.
-      * THE PROMPT gets the original source segment, so the junior reads the docstring as a human
-        wrote it instead of an escaped one-line blob. It never renders, so it cannot corrupt
-        anything, and both spellings encode the identical string value — so _ast_norm is untouched
-        either way.
-
-    A docstring-only function yields its docstring and an EMPTY rest — an empty hole. It is left
-    empty rather than filled with `pass`, because the original has no `pass` and inventing one
-    would fail the critic on a function that is already complete.
-    """
-    body = list(node.body)
-    doc = display = ""
-    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)):
-        doc = ast.unparse(body[0])
-        # The segment's continuation lines still carry their original indentation, so the prompt
-        # indents only its FIRST line and the block reads exactly as it does in the source.
-        display = ast.get_source_segment(src_text, body[0]) or doc
-        body = body[1:]
-    return doc, display, "\n".join(ast.unparse(s) for s in body)
+    return Lowered(blanks=blanks, imports=imports, constants=consts, tree=tree, src_text=src_text)
 
 
 # ── the SKELETON: the codebean MCP surface, over code_wrapper's model ─────────────────────────────
@@ -511,12 +750,21 @@ class Skeleton:
     def __init__(self, cw, name):
         self.cw = cw
         self.module = cw.Module(name)
+        self.layout = []
+        self.uncoupled = []      # top-level functions --limit left out: in the layout as source
         self.ops = []
 
     def new_module(self, name):
         self.module = self.cw.Module(name)
         self.ops.append("new_module:%s" % name)
         return self.module
+
+    def set_layout(self, layout):
+        """The module's top-level shape (see module_layout). The codebean Module has no field for
+        it — it renders imports, then classes, then functions — so the skeleton carries it."""
+        self.layout = list(layout)
+        self.ops.append("set_layout:%d" % len(self.layout))
+        return self.layout
 
     def add_function(self, name, params="", body="pass", doc="", decorators=(),
                      returns="", is_async=False):
@@ -535,7 +783,38 @@ class Skeleton:
         return fn
 
     def render(self, instrument=True):
-        return self.module.render(instrument=instrument)
+        """The rebuilt module: the original's top-level statements IN ORDER, each coupled function
+        substituted with the model's own `Function.render()`.
+
+        NOT `Module.render()`, and the module docstring says why at length: that renderer emits
+        imports -> classes -> functions, which hoists every statement above every def. Measured on
+        the tools/ + prototype/ corpus, that breaks `import` for 31 of 65 modules (a constant that
+        calls a function of the module) and `python3 module.py` for 63 of 65 (the `__main__` tail).
+        Function.render() — the renderer `critic` proves against, and the one that stamps the
+        decorators — is used verbatim for every function; only the placement is the skeleton's.
+
+        With instrument=True the tracer import goes in after the module docstring rather than above
+        it (where Module.render puts it), so the rebuilt module keeps its docstring. An instrumented
+        module imports `code_pipeline`; --mature emits the frozen, decorator-free form instead.
+        """
+        items = list(self.layout)
+        if not items:                       # no layout: a bare skeleton renders its functions only
+            items = [("fn", n) for n in self.module.functions]
+        if instrument and self.module.functions:
+            imp = instrument_import(self.cw)
+            if not any(k != "fn" and imp in p for k, p in items):
+                items.insert(1 if items and items[0][0] == "doc" else 0, ("stmt", imp))
+        blocks = []
+        for kind, payload in items:
+            if kind == "fn":
+                fn = self.module.functions.get(payload)
+                if fn is None:
+                    raise CouplerError("render: the layout names %r, which the skeleton has no "
+                                       "function for" % payload)
+                blocks.append(fn.render(instrument=instrument).rstrip())
+            else:
+                blocks.append(payload.rstrip())
+        return "\n\n\n".join(b for b in blocks if b) + "\n"
 
     def structure_first(self):
         """True iff every add_function preceded every set_body."""
@@ -544,12 +823,20 @@ class Skeleton:
         return (not adds or not sets) or max(adds) < min(sets)
 
 
-def lay_down_structure(cw, blanks, module_name):
+def lay_down_structure(cw, lowered, blanks, module_name):
     """STRUCTURE FIRST: EVERY signature via add_function BEFORE any body is filled, so a body may
     call any sibling regardless of fill order and no topological sort is needed. Each function is
-    born holding only its docstring (the senior's output); the bodies are the junior's."""
+    born holding only its docstring (the senior's output); the bodies are the junior's.
+
+    `blanks` is the subset being coupled (--limit takes a prefix); every OTHER top-level statement,
+    including a function that is not being coupled, stays in the layout as the original's own
+    source, so the rebuilt module is whole.
+    """
+    coupled = {b.name for b in blanks}
     sk = Skeleton(cw, module_name)
     sk.new_module(module_name)
+    sk.set_layout(module_layout(lowered.tree, lowered.src_text, coupled))
+    sk.uncoupled = [b.name for b in lowered.blanks if b.name not in coupled]
     for b in blanks:
         sk.add_function(name=b.name, params=b.params, body=b.doc or "pass", doc="",
                         decorators=b.decorators, returns=b.returns, is_async=b.is_async)
@@ -685,7 +972,7 @@ def audit_prompt(prompt, ctx, forbidden=(), bodies=(), own=()):
     would fire on the junior's own words the moment a correct body was re-prompted for any reason.
 
     `bodies` are then checked against what remains: no body — no sibling's, and not this function's
-    own original — may reach the junior from the COUPLER, ever.
+    own original, in EITHER spelling (see Blank.bodies) — may reach the junior from the COUPLER.
     """
     base = prompt
     for o in own:
@@ -727,6 +1014,20 @@ def strip_fences(text):
     if lines and lines[-1].lstrip().startswith("```"):
         lines.pop()
     return "\n".join(lines)
+
+
+def prompt_target(prompt, names):
+    """Which function a prompt is asking for, read back OUT of the prompt.
+
+    The scripted and oracle juniors answer per function, and — like a real junior — they are handed
+    nothing but the prompt. The name is taken from the "--- your function ---" section, never from
+    the sibling list above it.
+    """
+    tail = prompt.split("--- your function ---", 1)[-1]
+    for n in names:
+        if ("def %s(" % n) in tail:
+            return n
+    return None
 
 
 class ClaudeJunior:
@@ -799,6 +1100,35 @@ class ProxyJunior:
         return body
 
 
+class OracleJunior:
+    """The NON-LLM junior: it answers each blank with that blank's ORACLE — the spelling of the
+    original body the machine already PROVED passes the gate (see prove_oracle).
+
+    It is not a benchmark subject and must never be read as one: it knows the answer. What it
+    measures is the LOOP — that structure-first, assembly, the gate and the rebuilt module can
+    carry real code without dropping or reordering it. `--benchmark --engine oracle` on a corpus is
+    therefore a free, network-free, model-free upper bound: anything below 100% reproduced is a
+    defect in THIS tool, not a junior's miss.
+
+    It reads the target function's name out of the prompt exactly as a model would; `bind` is how
+    the loop hands it the run's blanks.
+    """
+
+    def __init__(self):
+        self.by_name = {}
+        self.seen = []
+
+    def bind(self, blanks):
+        self.by_name = {b.name: b.oracle_body for b in blanks if b.reachable}
+
+    def __call__(self, prompt, model=None):
+        name = prompt_target(prompt, self.by_name)
+        self.seen.append((name, prompt, model))
+        if name is None:
+            raise CouplerError("oracle junior: the prompt names no function it was bound to")
+        return self.by_name[name]
+
+
 class ScriptedJunior:
     """--selftest's junior: a dict {function name: [reply, reply, ...]}, popped per attempt. No
     network, no model, no db — the loop under test is the coupler's, not a model's."""
@@ -811,14 +1141,7 @@ class ScriptedJunior:
     def __call__(self, prompt, model=None):
         """A reply that is an Exception is RAISED rather than returned — that is how the selftest
         stages a junior which never answers."""
-        name = None
-        for k in self.script:
-            if ("def %s(" % k) in prompt and "--- your function ---" in prompt:
-                # the function under fill is the one after the "your function" header
-                tail = prompt.split("--- your function ---", 1)[1]
-                if ("def %s(" % k) in tail:
-                    name = k
-                    break
+        name = prompt_target(prompt, self.script)
         self.seen.append((name, prompt, model))
         replies = self.script.get(name)
         if not replies:
@@ -838,7 +1161,10 @@ def make_junior(engine, timeout):
         return ProxyJunior("openai", timeout=timeout)
     if engine == "ollama":
         return ProxyJunior("ollama", timeout=timeout)
-    raise CouplerError("unknown engine %r (choose claude, cerebras or ollama)" % engine)
+    if engine == "oracle":
+        return OracleJunior()
+    raise CouplerError("unknown engine %r (choose %s)"
+                       % (engine, ", ".join(sorted(ENGINE_MODELS))))
 
 
 # ── assembly and the gate ────────────────────────────────────────────────────────────────────────
@@ -942,8 +1268,8 @@ def fill_blank(cw, sk, blank, blanks, imports, constants, junior, *, preserve=Tr
     ESCALATION); it defaults to this one, so escalation is then only a change of model.
     """
     ctx = context_for(blank, blanks, imports, constants)
-    # every body in the module, including this one's: none may ever appear in a prompt
-    bodies = [b.rest_body for b in blanks]
+    # every spelling of every body in the module, including this one's: none may reach a prompt
+    bodies = [s for b in blanks for s in b.bodies()]
     res = Fill(name=blank.name)
     tried = []                       # (the junior's own rejected body, why the gate refused it)
     ej = escalate_junior or junior
@@ -1003,24 +1329,43 @@ def fill_blank(cw, sk, blank, blanks, imports, constants, junior, *, preserve=Tr
 
 def couple(src, junior, *, preserve=True, attempts=3, escalate_attempts=1, model=None,
            escalate_model=None, escalate_junior=None, limit=0, log=None, cw=None):
-    """Lower -> lay every signature down -> fill one body at a time. Returns (skeleton, fills)."""
+    """Lower -> prove each blank's oracle -> lay every signature down -> fill one body at a time.
+
+    Returns (skeleton, fills). An UNREACHABLE blank (see prove_oracle) is reported without calling
+    the junior at all: no model can pass a gate the original body itself cannot.
+    """
     cw = cw or load_code_wrapper()
     src = Path(src)
     if not src.is_file():
         raise CouplerError("no such module: %s" % src)
-    blanks, imports, constants = mock_senior(src, cw)
+    lowered = mock_senior(src, cw)
+    blanks = lowered.blanks
     if not blanks:
         raise CouplerError("%s has no top-level functions to couple" % src)
     if limit:
         blanks = blanks[:limit]
-    sk = lay_down_structure(cw, blanks, src.stem)          # STRUCTURE FIRST — all of it, first
+    sk = lay_down_structure(cw, lowered, blanks, src.stem)   # STRUCTURE FIRST — all of it, first
+    bind = getattr(junior, "bind", None)                     # the oracle junior needs the blanks
+    if bind:
+        bind(blanks)
+    for j in (escalate_junior,):
+        b2 = getattr(j, "bind", None)
+        if b2:
+            b2(blanks)
     forbidden = forbidden_paths(src)
     fills = []
     for b in blanks:
-        fills.append(fill_blank(cw, sk, b, blanks, imports, constants, junior, preserve=preserve,
-                                attempts=attempts, escalate_attempts=escalate_attempts,
-                                model=model, escalate_model=escalate_model,
-                                escalate_junior=escalate_junior,
+        if not b.reachable:
+            if log:
+                log("   × %s: unreachable — %s" % (b.name, b.unreachable_reason))
+            sk.set_body(b.name, b.doc or "pass")
+            fills.append(Fill(name=b.name, reachable=False, gate="unreachable",
+                              reason=b.unreachable_reason))
+            continue
+        fills.append(fill_blank(cw, sk, b, blanks, lowered.imports, lowered.constants, junior,
+                                preserve=preserve, attempts=attempts,
+                                escalate_attempts=escalate_attempts, model=model,
+                                escalate_model=escalate_model, escalate_junior=escalate_junior,
                                 forbidden=forbidden, log=log))
     return sk, fills
 
@@ -1060,34 +1405,52 @@ def run_preserve(a):
                        limit=a.limit, log=(None if a.json else _log), cw=cw)
     ok = [f for f in fills if f.ok]
     bad = [f for f in fills if not f.ok]
+    # functions left verbatim by --limit: emitted from the original, and NEVER counted as passes
+    verbatim = len(sk.uncoupled)
     report = {"mode": "preserve", "src": str(a.src), "engine": a.engine, "model": model,
               "escalate_model": esc, "functions": len(fills), "passed": len(ok),
-              "failed": len(bad), "seconds": round(time.time() - t0, 1),
+              "failed": len(bad), "not_coupled": verbatim,
+              "seconds": round(time.time() - t0, 1),
               "structure_first": sk.structure_first(),
               "results": [{"name": f.name, "critic": f.ok, "attempts": f.attempts,
-                           "escalated": f.escalated, "gate": f.gate, "reason": f.reason}
+                           "escalated": f.escalated, "reachable": f.reachable,
+                           "gate": f.gate, "reason": f.reason}
                           for f in fills]}
     if a.json:
         print(json.dumps(report, indent=2))
     else:
-        print("\n=== PRESERVE %s (engine=%s, model=%s, escalate=%s) ===" % (a.src, a.engine, model, esc))
+        print("\n=== PRESERVE %s (engine=%s, model=%s, escalate=%s) ==="
+              % (a.src, a.engine, model, esc))
         for f in fills:
             print("  %-6s %-28s attempts=%d%s%s"
                   % ("PASS" if f.ok else "FAIL", f.name, f.attempts,
                      " escalated" if f.escalated else "",
                      "" if f.ok else "  [%s] %s" % (f.gate, f.reason)))
-        print("\n%d/%d functions pass critic against the original (%.0fs)"
+        print("\n%d/%d coupled functions pass critic against the original (%.0fs)"
               % (len(ok), len(fills), time.time() - t0))
+        if verbatim:
+            print("%d further function(s) were NOT coupled (--limit %d) and are emitted verbatim "
+                  "from the original — they are not critic passes." % (verbatim, a.limit))
     if bad:
-        _log("\nNOT emitting the module: %d function(s) did not pass the critic (%s)."
-             % (len(bad), ", ".join(f.name for f in bad)))
-        _log("A body the junior could not reproduce is not silently replaced by the original — "
-             "that would make \"passes critic\" true by construction.")
+        # The two refusals are DIFFERENT and are never conflated: one is the junior's miss, the
+        # other is a body this channel cannot express at all (and which no junior was asked for).
+        unproven = [f for f in bad if f.reachable]
+        unreach = [f for f in bad if not f.reachable]
+        _log("\nNOT emitting the module: %d of %d function(s) are unproven." % (len(bad), len(fills)))
+        if unproven:
+            _log("  %d did not pass the critic (%s). A body the junior could not reproduce is not "
+                 "silently replaced by the original — that would make \"passes critic\" true by "
+                 "construction." % (len(unproven), ", ".join(f.name for f in unproven)))
+        if unreach:
+            _log("  %d are UNREACHABLE (%s): no spelling of the ORIGINAL body survives being "
+                 "indented into the def, so no junior was asked and none could pass. See THE FRAME "
+                 "in this tool's docstring." % (len(unreach), ", ".join(f.name for f in unreach)))
         return 1
     out = sk.render(instrument=not a.mature)
     if a.out:
         Path(a.out).write_text(out, encoding="utf-8")
-        _log("\nwrote %s (%d bytes, %s)" % (a.out, len(out), "mature" if a.mature else "instrumented"))
+        _log("\nwrote %s (%d bytes, %s)"
+             % (a.out, len(out), "mature" if a.mature else "instrumented"))
     elif not a.json:
         print("\n=== rebuilt module (%s) ===" % ("mature" if a.mature else "born instrumented"))
         print(out)
@@ -1107,21 +1470,24 @@ def run_benchmark(a):
                        limit=a.limit, log=(None if a.json else _log), cw=cw)
     n = len(fills)
     scored = [f for f in fills if f.answered]
-    mute = [f for f in fills if not f.answered]
+    mute = [f for f in fills if f.reachable and not f.answered]
+    unreach = [f for f in fills if not f.reachable]
     ns = len(scored)
     rep = sum(f.reproduced for f in scored)
     wrk = sum(f.works for f in scored)
     first = sum(f.first_shot_ok for f in scored)
     # The rates are over the functions the junior ANSWERED. A function whose engine never replied
     # measures nothing about a model, so counting it as a miss would report a broken backend as a
-    # bad junior; it is reported on its own line instead, and never silently dropped.
+    # bad junior; an UNREACHABLE one measures nothing either, since no junior was asked. Both are
+    # reported on their own lines instead, and neither is silently dropped.
     report = {"mode": "benchmark", "src": str(a.src), "engine": a.engine, "model": model,
               "escalate_model": esc, "functions": n, "answered": ns, "unanswered": len(mute),
+              "unreachable": len(unreach),
               "reproduced": rep, "works": wrk, "first_shot": first,
               "reproduced_rate": round(rep / ns, 3) if ns else None,
               "works_rate": round(wrk / ns, 3) if ns else None,
               "seconds": round(time.time() - t0, 1),
-              "results": [{"name": f.name, "answered": f.answered,
+              "results": [{"name": f.name, "answered": f.answered, "reachable": f.reachable,
                            "reproduced": f.reproduced if f.answered else None,
                            "works": f.works if f.answered else None,
                            "attempts": f.attempts, "escalated": f.escalated,
@@ -1132,10 +1498,15 @@ def run_benchmark(a):
     print("\n=== BLANK-AND-REFILL BENCHMARK: %s ===" % a.src)
     print("engine=%s model=%s escalate=%s attempts=%d(+%d escalated)"
           % (a.engine, model, esc, a.attempts, a.escalate_attempts))
+    if a.engine == "oracle":
+        print("NOTE: --engine oracle is NOT a model. The machine answers with the original body's\n"
+              "      proven spelling, so this measures THIS TOOL's ceiling, not a junior's skill.")
     print("\n  %-30s %-11s %-9s %s" % ("function", "reproduced", "works", "attempts"))
     print("  " + "-" * 64)
     for f in fills:
-        if f.answered:
+        if not f.reachable:
+            r = w = "unreachable"
+        elif f.answered:
             r, w = ("yes" if f.reproduced else "no"), ("yes" if f.works else "no")
         else:
             r = w = "no answer"
@@ -1154,6 +1525,12 @@ def run_benchmark(a):
               % (len(mute), n, ns, ", ".join(f.name for f in mute)))
         print("  that is an engine/transport failure, not a model result — e.g. %s"
               % (mute[0].reason or "(no reason recorded)")[:110])
+    if unreach:
+        print("  %d of %d function(s) are UNREACHABLE and were never put to the junior (no "
+              "attempt, no escalation, no cost): %s"
+              % (len(unreach), n, ", ".join(f.name for f in unreach)))
+        print("  no spelling of the ORIGINAL body passes the gate for those, so a junior could "
+              "not either — see THE FRAME in this tool's docstring.")
     print("\n  reproduced = _ast_norm-equal to the original body: it wrote THE code. This measures")
     print("               IDENTITY, not correctness — a right body written differently counts as")
     print("               'no', so this is a LOWER bound on how often the junior was right.")
@@ -1163,6 +1540,11 @@ def run_benchmark(a):
 
 
 # ── --selftest ───────────────────────────────────────────────────────────────────────────────────
+# A throwaway synthetic module, shaped like the real corpus on purpose: a module docstring, a
+# top-level import, a constant, a nested def with a MULTI-LINE docstring (the trap the unparse
+# spelling of a body takes — see THE FRAME), a constant that CALLS a function defined above it (31
+# of 65 corpus modules do this: `ROOT, REGISTRY = find_registry(...)`), and a `__main__` tail (63
+# of 65 do). The last two are what a rebuilt module that hoists its statements gets wrong.
 SELFTEST_SRC = '''"""A throwaway synthetic module. Nothing here is imported or installed."""
 import math
 
@@ -1192,6 +1574,76 @@ def describe(r):
 
 def stub(r):
     """Document a circle of radius r and do nothing else: this body is only a docstring."""
+
+
+def nested(r):
+    """Return the scaled area of a circle of radius r, via a NESTED helper."""
+    def inner(x):
+        """Scale x by SCALE.
+
+        This nested docstring is the second trap: ast.unparse emits it as a REAL
+        triple-quoted block, so the unparse spelling of this body cannot survive
+        being indented into the def.
+        """
+        return x * SCALE
+    return inner(area(r))
+
+
+UNIT = describe(1)
+
+
+if __name__ == '__main__':
+    print(UNIT)
+'''
+
+# The junior's natural answer for `nested`: written at column 0, exactly as the prompt asks. Its
+# nested docstring's continuation lines sit 4 spaces in — so indenting the body into the def puts
+# them at 8, which is where the original has them. This is the spelling a model writes.
+NESTED_ANSWER = '''def inner(x):
+    """Scale x by SCALE.
+
+    This nested docstring is the second trap: ast.unparse emits it as a REAL
+    triple-quoted block, so the unparse spelling of this body cannot survive
+    being indented into the def.
+    """
+    return x * SCALE
+return inner(area(r))'''
+
+# The two frame traps, isolated, plus the one function that takes BOTH and is therefore
+# UNREACHABLE. See prove_oracle.
+TRAPS_SRC = '''"""Three bodies that probe the frame."""
+SCALE = 3
+
+
+def nested_doc(x):
+    """A nested def whose docstring is multi-line: the unparse spelling FAILS the gate."""
+    def inner(y):
+        """Double y.
+
+        A real triple-quoted block, which re-indenting would rewrite.
+        """
+        return y * 2
+    return inner(x)
+
+
+def flush_left(x):
+    """A literal whose continuation line is at column 0: the source-frame spelling FAILS."""
+    sql = """SELECT *
+FROM t"""
+    return sql + str(x)
+
+
+def both(x):
+    """Takes both traps at once: no spelling survives, so this blank is UNREACHABLE."""
+    sql = """SELECT *
+FROM t"""
+    def inner(y):
+        """Double y.
+
+        A real triple-quoted block, which re-indenting would rewrite.
+        """
+        return y * 2
+    return sql + str(inner(x))
 '''
 
 _CHECKS = []
@@ -1243,6 +1695,25 @@ def _diff_snapshots(before, after):
     return out
 
 
+def _import_file(path, name):
+    """Import a module BY PATH, without leaving a .pyc behind or a stale entry in sys.modules."""
+    saved_bc = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        return mod
+    finally:
+        sys.dont_write_bytecode = saved_bc
+        sys.modules.pop(name, None)
+
+
 def selftest(a):
     """Every claim this tool makes, proven on a synthetic module with a scripted junior.
 
@@ -1264,12 +1735,13 @@ def selftest(a):
         td = Path(td)
         src = td / "synthetic.py"
         src.write_text(SELFTEST_SRC, encoding="utf-8")
-        blanks, imports, constants = mock_senior(src, cw)
+        low = mock_senior(src, cw)
+        blanks, imports, constants = low.blanks, low.imports, low.constants
         by = {b.name: b for b in blanks}
 
         # ── the senior ──────────────────────────────────────────────────────────────────────────
         _check("senior lowers every function",
-               [b.name for b in blanks] == ["area", "scaled_area", "describe", "stub"],
+               [b.name for b in blanks] == ["area", "scaled_area", "describe", "stub", "nested"],
                str([b.name for b in blanks]))
         _check("senior keeps the docstring out of the hole",
                "Return the area" in by["area"].doc and "math.pi" not in by["area"].doc,
@@ -1285,31 +1757,113 @@ def selftest(a):
         _check("module header carries imports and constants",
                "import math" in imports and "SCALE = 3" in constants)
 
+        # ── 0. THE FRAME: the oracle, proven before any junior is called ─────────────────────────
+        _check("every blank of a real-shaped module is REACHABLE",
+               all(b.reachable for b in blanks),
+               "; ".join("%s: %s" % (b.name, b.unreachable_reason)
+                         for b in blanks if not b.reachable) or "5/5")
+        _check("the oracle body PASSES the same gate the junior faces",
+               all(gate(cw, b, assemble(cw, b, b.oracle_body))[0] for b in blanks),
+               "a proof that each blank is fillable")
+        # the nested-def multi-line docstring: the filed trap, isolated. The unparse spelling of
+        # THIS body fails, the column-0 spelling passes, and the oracle is therefore the latter.
+        nb = by["nested"]
+        _check("a nested def's multi-line docstring breaks the UNPARSE spelling",
+               not gate(cw, nb, assemble(cw, nb, nb.unparsed))[0],
+               "ast.unparse emits it as a real block; re-indenting rewrites the string")
+        _check("...and the column-0 spelling of that same body PASSES",
+               gate(cw, nb, assemble(cw, nb, nb.source_frame))[0]
+               and nb.oracle_body == nb.source_frame,
+               "so the oracle picks the spelling that survives the frame")
+
+        traps = td / "traps.py"
+        traps.write_text(TRAPS_SRC, encoding="utf-8")
+        tlow = mock_senior(traps, cw)
+        tby = {b.name: b for b in tlow.blanks}
+        _check("trap A (nested multi-line docstring): reachable via the column-0 spelling",
+               tby["nested_doc"].reachable
+               and tby["nested_doc"].oracle_body == tby["nested_doc"].source_frame)
+        _check("trap B (literal flush at column 0): reachable via the UNPARSE spelling",
+               tby["flush_left"].reachable
+               and tby["flush_left"].oracle_body == tby["flush_left"].unparsed
+               and not gate(cw, tby["flush_left"],
+                            assemble(cw, tby["flush_left"], tby["flush_left"].source_frame))[0],
+               "neither spelling is universally right — that is why both are tried")
+        _check("trap C (both at once): UNREACHABLE, and says why",
+               (not tby["both"].reachable) and "no spelling" in tby["both"].unreachable_reason,
+               tby["both"].unreachable_reason[:58])
+
+        never = ScriptedJunior({"both": ["return 0"]})
+        _, fu = couple(traps, never, preserve=True, attempts=3, escalate_attempts=2,
+                       model="base", escalate_model="strong", cw=cw)
+        fboth = [f for f in fu if f.name == "both"][0]
+        _check("an UNREACHABLE blank costs the junior NOTHING",
+               (not fboth.reachable) and fboth.attempts == 0 and fboth.gate == "unreachable"
+               and not any(n == "both" for n, _p, _m in never.seen),
+               "no attempt, no escalation, no paid call on an unpassable blank")
+
         # ── 1. STRUCTURE FIRST ──────────────────────────────────────────────────────────────────
         good = {"area": ["return math.pi * r * r"],
                 "scaled_area": ["marker_zz9 = SCALE\nreturn area(r) * marker_zz9"],
                 "describe": ["return 'r=%s area=%s' % (r, area(r))"],
-                "stub": [""]}
+                "stub": [""],
+                "nested": [NESTED_ANSWER]}
         sk, fills = couple(src, ScriptedJunior(good), preserve=True, attempts=2,
                            escalate_attempts=1, model="base", escalate_model="strong", cw=cw)
         adds = [o for o in sk.ops if o.startswith("add_function:")]
         sets = [o for o in sk.ops if o.startswith("set_body:")]
         _check("structure first: every signature before any body",
-               sk.structure_first() and len(adds) == 4 and len(sets) == 4,
+               sk.structure_first() and len(adds) == 5 and len(sets) == 5,
                " ".join(sk.ops))
         _check("a multi-line docstring survives the round trip (critic proves it)",
                [f.ok and f.reproduced for f in fills if f.name == "describe"] == [True])
+        _check("a junior's natural nested-def body passes (the filed trap, end to end)",
+               [f.ok and f.reproduced for f in fills if f.name == "nested"] == [True],
+               "written at column 0, indented by the machine, _ast_norm-equal")
         _check("a correct junior passes the critic on every function",
                all(f.ok and f.reproduced for f in fills))
         _check("a correct junior is never escalated and needs one attempt",
                all(f.attempts == 1 and not f.escalated for f in fills))
+
+        # ── 1b. THE REBUILT MODULE RUNS ─────────────────────────────────────────────────────────
+        # The codebean Module renders imports -> classes -> functions, which would hoist `import
+        # math`, `SCALE`, `UNIT = describe(1)` and the __main__ tail above every def. Measured on
+        # the corpus: that breaks import for 31/65 modules and `python3 module.py` for 63/65.
+        out = sk.render(instrument=False)                 # --mature
+        _check("the rebuilt module keeps the module docstring, the import and the constant",
+               out.startswith('"""A throwaway synthetic module.')
+               and "import math" in out and "SCALE = 3" in out)
+        _check("the rebuilt module keeps its top-level ORDER",
+               out.index("SCALE = 3") < out.index("def area") < out.index("UNIT = describe(1)")
+               < out.index("if __name__ == '__main__':"),
+               "a constant that CALLS a function must stay BELOW it")
+        _check("the rebuilt module is AST-identical to the original",
+               cw._ast_norm(out) == cw._ast_norm(SELFTEST_SRC),
+               "nothing dropped, nothing reordered, nothing invented")
+        rebuilt = td / "rebuilt.py"
+        rebuilt.write_text(out, encoding="utf-8")
+        try:
+            mod = _import_file(rebuilt, "coupler_selftest_rebuilt")
+            ran, why = abs(mod.area(1) - 3.141592653589793) < 1e-9 and mod.UNIT == "r=1 area=%s" % (
+                3.141592653589793), ""
+        except Exception as e:                            # the finding this replaces: NameError
+            ran, why = False, "%s: %s" % (type(e).__name__, e)
+        _check("the rebuilt module IMPORTS and RUNS", ran, why or "area(1) and UNIT both correct")
+        inst = sk.render(instrument=True)
+        imp = instrument_import(cw)
+        _check("the instrumented render stamps every function and keeps the docstring first",
+               inst.startswith('"""A throwaway synthetic module.')
+               and inst.count("@debug_decorator") == 5
+               and inst.index('"""') < inst.index(imp) < inst.index("import math")
+               < inst.index("def area"),
+               "the tracer import goes UNDER the docstring, above every def")
 
         # ── 2. the junior's isolation ───────────────────────────────────────────────────────────
         prompt = fills[0].prompts[0]
         ctx0 = context_for(by["area"], blanks, imports, constants)
         forbidden = [str(src), str(td), os.getcwd()]
         viol = audit_prompt(prompt, ctx0, forbidden=forbidden,
-                            bodies=[b.rest_body for b in blanks])
+                            bodies=[s for b in blanks for s in b.bodies()])
         _check("prompt audit: no path, no tool, no body", viol == [], "; ".join(viol) or "clean")
         _check("the junior is handed no path", str(src) not in prompt and str(td) not in prompt)
         _check("the junior is handed no tool name",
@@ -1334,7 +1888,7 @@ def selftest(a):
                in audit_prompt(prompt + "\nuse the Bash tool", ctx0, forbidden=forbidden))
         _check("the audit CATCHES a body planted in the scaffold",
                audit_prompt(prompt + "\nreturn math.pi * r * r", ctx0, forbidden=forbidden,
-                            bodies=[b.rest_body for b in blanks]) != [])
+                            bodies=[s for b in blanks for s in b.bodies()]) != [])
 
         # ── 2b. a RELATIVE --src is audited on paths, not on English ────────────────────────────
         # `Path("synthetic.py").parent` is "." — and "." occurs in the scaffold's own fixed prose
@@ -1360,14 +1914,11 @@ def selftest(a):
         finally:
             os.chdir(cwd0)
         _check("`--src M.py` (relative, as --help prints it) runs the whole loop",
-               all(f.ok for f in frel) and len(frel) == 4,
+               all(f.ok for f in frel) and len(frel) == 5,
                "%d/%d filled with no prompt-audit abort" % (sum(f.ok for f in frel), len(frel)))
 
         # ── 3. a body that fails parse is re-prompted ───────────────────────────────────────────
-        j = ScriptedJunior({"area": ["return (", "return math.pi * r * r"],
-                            "scaled_area": ["marker_zz9 = SCALE\nreturn area(r) * marker_zz9"],
-                            "describe": ["return 'r=%s area=%s' % (r, area(r))"],
-                            "stub": [""]})
+        j = ScriptedJunior(dict(good, area=["return (", "return math.pi * r * r"]))
         _, f2 = couple(src, j, preserve=True, attempts=3, escalate_attempts=1,
                        model="base", escalate_model="strong", cw=cw)
         fa = f2[0]
@@ -1377,20 +1928,15 @@ def selftest(a):
         _check("the re-prompt quotes the junior's own rejected attempt back to it",
                "return (" in retry and "attempt 1 emitted:" in retry)
         _check("the re-prompt carries the exact error (SyntaxError line N)",
-               "SyntaxError line" in retry, retry.split("the gate said: ")[-1].splitlines()[0]
-               if "the gate said: " in retry else "(missing)")
+               "SyntaxError line" in retry)
         _check("the re-prompt does not leak the original body",
                "math.pi * r * r" not in retry)
         _check("the re-prompt is still path-free and tool-free",
                audit_prompt(retry, ctx0, forbidden=forbidden) == [])
 
         # ── 3b. a junior that never ANSWERS costs one attempt, not the module ───────────────────
-        stalled = ScriptedJunior({"area": [CouplerError("stalled: no answer"),
-                                           "return math.pi * r * r"],
-                                  "scaled_area": ["marker_zz9 = SCALE\n"
-                                                  "return area(r) * marker_zz9"],
-                                  "describe": ["return 'r=%s area=%s' % (r, area(r))"],
-                                  "stub": [""]})
+        stalled = ScriptedJunior(dict(good, area=[CouplerError("stalled: no answer"),
+                                                  "return math.pi * r * r"]))
         _, f2b = couple(src, stalled, preserve=True, attempts=3, escalate_attempts=1,
                         model="base", escalate_model="strong", cw=cw)
         _check("a junior that never answers costs ONE attempt, not the module",
@@ -1437,7 +1983,8 @@ def selftest(a):
 
         # a docstring-only function is a function whose hole is genuinely EMPTY
         _check("a docstring-only function's hole is empty (nothing to fill)",
-               by["stub"].rest_body == "", repr(by["stub"].rest_body))
+               by["stub"].source_frame == "" and by["stub"].oracle_body == "",
+               repr(by["stub"].source_frame))
         _check("a junior returning nothing reproduces a docstring-only function",
                gate(cw, by["stub"], assemble(cw, by["stub"], ""))[0])
         _check("an invented `pass` FAILS critic on a docstring-only function",
@@ -1445,8 +1992,7 @@ def selftest(a):
                "the machine adds no statement the original lacks")
 
         # ── 5. escalation fires after N ─────────────────────────────────────────────────────────
-        always_bad = ScriptedJunior({"area": ["return 0"], "scaled_area": ["return 0"],
-                                     "describe": ["return 0"], "stub": ["return 0"]})
+        always_bad = ScriptedJunior({k: ["return 0"] for k in good})
         _, f3 = couple(src, always_bad, preserve=True, attempts=2, escalate_attempts=1,
                        model="base", escalate_model="strong", cw=cw)
         fb = f3[0]
@@ -1487,14 +2033,41 @@ def selftest(a):
                all("math.pi * r * r" not in p for f in f3 for p in f.prompts),
                "ground truth stays hidden or the benchmark measures an echo")
 
-        # ── 6. measurement ──────────────────────────────────────────────────────────────────────
-        rep_ok, works_ok = measure(cw, by["area"], assemble(cw, by["area"], "return math.pi * r * r"))
+        # ── 6. measurement, and the oracle engine ───────────────────────────────────────────────
+        rep_ok, works_ok = measure(cw, by["area"],
+                                   assemble(cw, by["area"], "return math.pi * r * r"))
         rep_no, works_no2 = measure(cw, by["area"], assemble(cw, by["area"], "return 0"))
         _check("benchmark: a faithful refill measures reproduced AND works", rep_ok and works_ok)
         _check("benchmark: a wrong refill measures not-reproduced but may still work",
                (not rep_no) and works_no2, "reproduced and works are independent")
 
-        # ── 7. no writes outside the temp dir ───────────────────────────────────────────────────
+        oj = OracleJunior()
+        sk_o, fo = couple(src, oj, preserve=True, attempts=1, escalate_attempts=0, cw=cw)
+        _check("--engine oracle refills every blank first-shot",
+               all(f.ok and f.reproduced and f.works and f.attempts == 1 for f in fo)
+               and len(fo) == 5, "the loop's ceiling: %d/%d" % (sum(f.ok for f in fo), len(fo)))
+        _check("the oracle junior is handed only a prompt, like any junior",
+               all(audit_prompt(p, context_for(by[f.name], blanks, imports, constants),
+                                forbidden=forbidden) == []
+                   for f in fo for p in f.prompts),
+               "it answers from what the machine bound, never from the prompt")
+        _check("--engine oracle rebuilds a module AST-identical to the original",
+               cw._ast_norm(sk_o.render(instrument=False)) == cw._ast_norm(SELFTEST_SRC))
+
+        # ── 7. --limit leaves the rest of the module verbatim, not dropped ───────────────────────
+        sk_l, fl = couple(src, ScriptedJunior(good), preserve=True, attempts=1,
+                          escalate_attempts=0, limit=1, cw=cw)
+        outl = sk_l.render(instrument=False)
+        _check("--limit couples the first N and leaves the REST verbatim",
+               len(fl) == 1 and fl[0].name == "area"
+               and all(("def %s(" % n) in outl for n in ("area", "scaled_area", "describe",
+                                                         "stub", "nested")),
+               "a partial rebuild is still a whole module")
+        _check("--limit's rebuilt module is AST-identical to the original",
+               cw._ast_norm(outl) == cw._ast_norm(SELFTEST_SRC),
+               "the uncoupled functions come from the original source, untouched")
+
+        # ── 8. no writes outside the temp dir ───────────────────────────────────────────────────
         after = _snapshot(watched)
         drift = _diff_snapshots(before, after)
         _check("no writes outside the temp dir (no __pycache__, no artefacts)",
@@ -1526,7 +2099,8 @@ def main(argv=None):
     m.add_argument("--preserve", action="store_true", help="refill a module under the critic")
     p.add_argument("--src", type=Path, help="the module to couple (--benchmark / --preserve)")
     p.add_argument("--engine", default="claude", choices=sorted(ENGINE_MODELS),
-                   help="which junior (default: claude)")
+                   help="which junior (default: claude; `oracle` is the machine's own answer, "
+                        "not a model — it measures this tool's ceiling)")
     p.add_argument("--model", help="override the junior's base model for the engine")
     p.add_argument("--escalate-engine", choices=sorted(ENGINE_MODELS),
                    help="override the engine ONE blank escalates to (default: claude for "
