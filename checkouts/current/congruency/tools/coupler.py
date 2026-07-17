@@ -631,13 +631,48 @@ def render_junior_prompt(ctx, tried=()):
     return "\n".join(p)
 
 
+def forbidden_paths(src):
+    """The path strings `audit_prompt` must not find in the coupler's OWN scaffold.
+
+    A candidate is kept only if it is path-SHAPED: it contains a directory separator, or it names a
+    `.py` file. Dropping the rest is not a weakening of the check — it is what makes the check
+    possible at all.
+
+    `--src gpl_stamp.py` — the natural spelling from the `tools/` directory the corpus modules live
+    in, and the one this tool's own docstring and `--help` print — has
+    `Path("gpl_stamp.py").parent == Path(".")`. A bare `'.'` is a substring of the scaffold's own
+    fixed prose ("Fill in ONE Python function body."), so checking it made the audit fire on the
+    coupler's constant text and killed every `--benchmark`/`--preserve` run with a relative `--src`
+    at exit 2, before the junior was ever called. The same trap is latent for any relative parent
+    that is an ordinary word: `--src sub/mod.py` would otherwise check the token `'sub'` against
+    English prose. A word is not evidence of a path.
+
+    Nothing real is lost. The scaffold is a CONSTANT with no path interpolated into it; the audit
+    exists to catch a future edit that interpolates one, and any such edit would carry a path's full
+    spelling — the module's own filename, its absolute path, its absolute parent, or the cwd. All of
+    those are still checked. `--selftest` asserts both halves: a planted path is still caught, and a
+    bare relative `--src` audits clean.
+    """
+    src = Path(src)
+    seps = [s for s in (os.sep, os.altsep) if s]
+    out = []
+    for c in (str(src), str(src.resolve()), str(src.parent), str(src.resolve().parent),
+              os.getcwd()):
+        if c in out or c in ("", os.curdir, os.pardir) or c in seps:
+            continue
+        if any(s in c for s in seps) or c.endswith(".py"):
+            out.append(c)
+    return out
+
+
 def audit_prompt(prompt, ctx, forbidden=(), bodies=(), own=()):
     """Prove the junior was handed nothing it must not have. Returns a list of violation strings.
 
     The check is SUBTRACTIVE, and that is the point: every component text of `ctx` is removed from
     the prompt, and what remains is the coupler's OWN scaffold. Only the scaffold is searched for
-    tool names and for `forbidden` tokens (the module's path, the cwd). This distinguishes the two
-    cases a naive grep conflates:
+    tool names and for `forbidden` tokens (the module's path, the cwd — see `forbidden_paths`,
+    which is what a caller should build this list with). This distinguishes the two cases a naive
+    grep conflates:
       * the coupler handing the junior a path or a tool                 -> a violation;
       * a module's own docstring or constant happening to contain a path (`DEFAULT = Path.home() /
         "x/y.py"`) -> NOT a violation. That text is the senior's output, mechanically lowered from
@@ -979,8 +1014,7 @@ def couple(src, junior, *, preserve=True, attempts=3, escalate_attempts=1, model
     if limit:
         blanks = blanks[:limit]
     sk = lay_down_structure(cw, blanks, src.stem)          # STRUCTURE FIRST — all of it, first
-    forbidden = [str(src), str(src.resolve()), str(src.parent), str(src.resolve().parent),
-                 os.getcwd()]
+    forbidden = forbidden_paths(src)
     fills = []
     for b in blanks:
         fills.append(fill_blank(cw, sk, b, blanks, imports, constants, junior, preserve=preserve,
@@ -1289,6 +1323,45 @@ def selftest(a):
                and "SCALE = 3" in prompt)
         _check("the prompt is a pure function of the context",
                prompt == render_junior_prompt(ctx0))
+
+        # The audit must be able to FAIL, or it proves nothing. Both halves are planted here, into
+        # the SCAFFOLD (not the context), which is the only place either would be a real leak.
+        _check("the audit CATCHES a path planted in the scaffold",
+               ("the coupler's scaffold names a path: %r" % str(src))
+               in audit_prompt(prompt + "\nsee " + str(src), ctx0, forbidden=forbidden))
+        _check("the audit CATCHES a tool name planted in the scaffold",
+               "the coupler's scaffold names a tool: 'Bash'"
+               in audit_prompt(prompt + "\nuse the Bash tool", ctx0, forbidden=forbidden))
+        _check("the audit CATCHES a body planted in the scaffold",
+               audit_prompt(prompt + "\nreturn math.pi * r * r", ctx0, forbidden=forbidden,
+                            bodies=[b.rest_body for b in blanks]) != [])
+
+        # ── 2b. a RELATIVE --src is audited on paths, not on English ────────────────────────────
+        # `Path("synthetic.py").parent` is "." — and "." occurs in the scaffold's own fixed prose
+        # ("Fill in ONE Python function body."). Checking that token made the audit fire on the
+        # coupler's own constant text, so every --benchmark/--preserve with a relative --src died
+        # at exit 2 before the junior was ever called. See forbidden_paths.
+        rel = forbidden_paths("synthetic.py")
+        _check("forbidden_paths drops the degenerate '.' parent of a bare --src",
+               "." not in rel and "" not in rel, str(rel))
+        _check("forbidden_paths keeps every real spelling of a bare --src",
+               "synthetic.py" in rel and str(Path("synthetic.py").resolve()) in rel
+               and os.getcwd() in rel, "filename, absolute path, absolute parent, cwd")
+        _check("a bare relative --src audits CLEAN against the scaffold",
+               audit_prompt(prompt, ctx0, forbidden=rel) == [],
+               "; ".join(audit_prompt(prompt, ctx0, forbidden=rel)) or "no violation")
+        # and the end-to-end proof of the same thing: the documented `--src M.py` form, run with
+        # the cwd holding the module, must couple rather than exit 2.
+        cwd0 = os.getcwd()
+        try:
+            os.chdir(td)
+            _, frel = couple("synthetic.py", ScriptedJunior(good), preserve=True, attempts=2,
+                             escalate_attempts=1, model="base", escalate_model="strong", cw=cw)
+        finally:
+            os.chdir(cwd0)
+        _check("`--src M.py` (relative, as --help prints it) runs the whole loop",
+               all(f.ok for f in frel) and len(frel) == 4,
+               "%d/%d filled with no prompt-audit abort" % (sum(f.ok for f in frel), len(frel)))
 
         # ── 3. a body that fails parse is re-prompted ───────────────────────────────────────────
         j = ScriptedJunior({"area": ["return (", "return math.pi * r * r"],
